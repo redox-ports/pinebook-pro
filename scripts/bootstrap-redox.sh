@@ -91,6 +91,11 @@ EOF
 mkdir -p "$REDOX_DIR/config/aarch64/pinebook-pro"
 cp -f "$OVERLAY_SRC" "$REDOX_DIR/config/aarch64/pinebook-pro/minimal.toml"
 
+# Prefer the GitHub mirrors for recipe sources: the Redox GitLab instance is
+# often slow/unreachable and stalls `repo cook`. base and ca-certificates
+# stay on GitLab (no mirror exists); scripts/github-mirrors.sh is idempotent.
+"$REPO_ROOT/scripts/github-mirrors.sh" --dir "$REDOX_DIR"
+
 if [ "$MODE" = "native" ]; then
     echo "==> installing native build dependencies via upstream native_bootstrap.sh (uses sudo)"
     # Upstream ends with an optional emulator block (qemu-kvm and friends).
