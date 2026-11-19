@@ -1,0 +1,62 @@
+diff --git a/src/os/uefi/arch/aarch64.rs b/src/os/uefi/arch/aarch64.rs
+index daab811..322eccc 100644
+--- a/src/os/uefi/arch/aarch64.rs
++++ b/src/os/uefi/arch/aarch64.rs
+@@ -35,6 +35,22 @@ unsafe fn dump_page_tables(table_phys: u64, table_virt: u64, table_level: u64) {
+     }
+ }
+ 
++// TEMPORARY bring-up instrumentation: emit one byte on the RK3399 debug UART
++// (UART2 @ 0xff1a0000, identity-mapped here) without EFI or the console.
++// Also disables loopback mode in case it was left enabled.
++unsafe fn raw_marker(byte: u8) {
++    unsafe {
++        let base = 0xff1a_0000usize;
++        core::ptr::write_volatile((base + 0x10) as *mut u32, 0x03); // MCR: DTR|RTS, loopback off
++        for _ in 0..100_000 {
++            if core::ptr::read_volatile((base + 0x14) as *const u32) & (1 << 5) != 0 {
++                break; // THR empty
++            }
++        }
++        core::ptr::write_volatile(base as *mut u32, u32::from(byte));
++    }
++}
++
+ unsafe extern "C" fn kernel_entry(
+     page_phys: usize,
+     stack: u64,
+@@ -42,8 +58,10 @@ unsafe extern "C" fn kernel_entry(
+     args: *const KernelArgs,
+ ) -> ! {
+     unsafe {
++        raw_marker(b'0');
+         // Read memory map and exit boot services
+         memory_map().exit_boot_services();
++        raw_marker(b'1');
+ 
+         let currentel: u64;
+         asm!(
+@@ -127,6 +145,7 @@ unsafe extern "C" fn kernel_entry(
+                 asm!("wfi");
+             }
+         }
++        raw_marker(b'2');
+ 
+         // Disable MMU
+         asm!(
+@@ -187,11 +206,15 @@ unsafe extern "C" fn kernel_entry(
+             out(reg) _,
+         );
+ 
++        raw_marker(b'3');
++
+         // Set stack
+         asm!("mov sp, {}", in(reg) stack);
++        raw_marker(b'4');
+ 
+         // Call kernel entry
+         let entry_fn: extern "C" fn(*const KernelArgs) -> ! = mem::transmute(func);
++        raw_marker(b'5');
+         entry_fn(args);
+     }
+ }

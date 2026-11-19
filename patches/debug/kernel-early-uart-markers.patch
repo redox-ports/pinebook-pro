@@ -1,0 +1,132 @@
+diff --git a/src/arch/aarch64/start.rs b/src/arch/aarch64/start.rs
+index ee6f9cf0..dc68e4f5 100644
+--- a/src/arch/aarch64/start.rs
++++ b/src/arch/aarch64/start.rs
+@@ -24,11 +24,35 @@ struct StackAlign<T>(T);
+ static STACK: SyncUnsafeCell<StackAlign<[u8; 128 * 1024]>> =
+     SyncUnsafeCell::new(StackAlign([0; 128 * 1024]));
+ 
++/// TEMPORARY bring-up instrumentation: emit one byte on the RK3399 debug UART
++/// (UART2 @ 0xff1a0000) through the physmap, bypassing the serial driver and
++/// logger. Also disables loopback mode in case a failed UART self-test left it
++/// enabled.
++unsafe extern "C" fn early_marker(byte: u8) {
++    unsafe {
++        let base = 0xFFFF_8000_FF1A_0000usize;
++        core::ptr::write_volatile((base + 0x10) as *mut u32, 0x03); // MCR: DTR|RTS, loopback off
++        for _ in 0..100_000 {
++            if core::ptr::read_volatile((base + 0x14) as *const u32) & (1 << 5) != 0 {
++                break; // THR empty
++            }
++        }
++        core::ptr::write_volatile(base as *mut u32, u32::from(byte));
++    }
++}
++
+ // FIXME use extern "custom"
+ #[unsafe(naked)]
+ #[unsafe(no_mangle)]
+ extern "C" fn kstart() {
+     naked_asm!("
++        // TEMP: preserve the KernelArgs pointer (x0) across marker calls
++        mov x19, x0
++
++        // TEMP: 'A' on entry, before touching BSS/data
++        mov w0, #65
++        bl {marker}
++
+         // BSS should already be zero
+         adrp x9, {bss_test_zero}
+         ldr x9, [x9, :lo12:{bss_test_zero}]
+@@ -46,6 +70,11 @@ extern "C" fn kstart() {
+         ldr x9, =exception_vector_base
+         msr vbar_el1, x9
+ 
++        // TEMP: 'B' before entering Rust
++        mov w0, #66
++        bl {marker}
++        mov x0, x19
++
+         mov lr, 0
+         b {start}
+ 
+@@ -58,17 +87,21 @@ extern "C" fn kstart() {
+         stack = sym STACK,
+         stack_size = const size_of_val(&STACK),
+         start = sym start,
++        marker = sym early_marker,
+     );
+ }
+ 
+ /// The entry to Rust, all things must be initialized
+ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
+     unsafe {
++        early_marker(b'C');
+         let bootstrap = {
+             let args = args_ptr.read();
++            early_marker(b'D');
+ 
+             // Set up graphical debug
+             graphical_debug::init(args.env());
++            early_marker(b'E');
+ 
+             // Get hardware descriptor data
+             //TODO: use env {DTB,RSDT}_{BASE,SIZE}?
+@@ -82,20 +115,25 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
+             };
+ 
+             let dtb_res = args.dtb();
++            early_marker(if dtb_res.is_ok() { b'F' } else { b'f' });
+ 
+             // Try to find serial port prior to logging
+             if let Ok((dtb, _)) = &dtb_res {
+                 dtb::serial::init_early(dtb);
+             }
++            early_marker(b'G');
+ 
+             info!("Redox OS starting...");
+             args.print();
++            early_marker(b'H');
+ 
+             // Initialize RMM
+             let bump_allocator = crate::startup::memory::init(&args, None, None);
++            early_marker(b'I');
+ 
+             // Initialize paging
+             paging::init();
++            early_marker(b'J');
+ 
+             let mut mapper = rmm::PageMapper::current(rmm::TableKind::Kernel, bump_allocator);
+             #[cfg(feature = "acpi")]
+@@ -105,14 +143,18 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
+             }
+ 
+             crate::memory::init_mm(mapper.allocator_mut());
++            early_marker(b'K');
+ 
+             crate::arch::misc::init(crate::cpu_set::LogicalCpuId::new(0));
++            early_marker(b'L');
+ 
+             // Setup kernel heap
+             allocator::init();
++            early_marker(b'M');
+ 
+             // Activate memory logging
+             crate::log::init();
++            early_marker(b'N');
+ 
+             // Initialize devices
+             match dtb_res {
+@@ -131,9 +173,12 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
+                 }
+             }
+ 
++            early_marker(b'O');
+             args.bootstrap()
+         };
+ 
++        early_marker(b'P');
++
+         // TODO: use stack
+         crate::startup::kmain(
+             bootstrap,

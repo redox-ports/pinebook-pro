@@ -1,0 +1,139 @@
+diff --git a/src/arch/aarch64/device/generic_timer.rs b/src/arch/aarch64/device/generic_timer.rs
+index 4eeec257..393e8b50 100644
+--- a/src/arch/aarch64/device/generic_timer.rs
++++ b/src/arch/aarch64/device/generic_timer.rs
+@@ -51,7 +51,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+         return;
+     };
+     let irq_index = if use_virtual { 2 } else { 1 };
+-    let Some(irq) = get_interrupt(&node, irq_index) else {
++    let Some(irq) = get_interrupt(fdt, &node, irq_index) else {
+         error!("architected timer is missing interrupt index {}", irq_index);
+         return;
+     };
+diff --git a/src/arch/aarch64/device/irqchip/irq_bcm2835.rs b/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
+index ed9a9b2e..6e975882 100644
+--- a/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
++++ b/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
+@@ -74,7 +74,7 @@ impl Bcm2835ArmInterruptController {
+             return Err(Error::new(EINVAL));
+         }
+     }
+-    unsafe fn parse_inner(fdt: &Fdt, node: &FdtNode) -> Result<(usize, usize, Option<usize>)> {
++    unsafe fn parse_inner<'a>(fdt: &Fdt<'a>, node: &FdtNode<'a>) -> Result<(usize, usize, Option<usize>)> {
+         unsafe {
+             //assert address_cells == 0x1, size_cells == 0x1
+             let mem = node
+@@ -90,7 +90,7 @@ impl Bcm2835ArmInterruptController {
+ 
+             if let Some(interrupt_parent) = node.raw_property("interrupt-parent") {
+                 let phandle = PHandle::new(interrupt_parent.as_value::<u32>().unwrap());
+-                let irq = get_interrupt(node, 0).unwrap();
++                let irq = get_interrupt(fdt, node, 0).unwrap();
+                 let ic_idx = IRQ_CHIP.phandle_to_ic_idx(phandle).unwrap();
+                 //PHYS_NONSECURE_PPI only
+                 let virq = IRQ_CHIP.irq_chip_list.chips[ic_idx]
+diff --git a/src/arch/aarch64/device/serial.rs b/src/arch/aarch64/device/serial.rs
+index 122c5411..dfcc4a94 100644
+--- a/src/arch/aarch64/device/serial.rs
++++ b/src/arch/aarch64/device/serial.rs
+@@ -32,7 +32,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+             error!("diagnostic serial port not found in devicetree");
+             return;
+         };
+-        let Some(irq) = get_interrupt(&node, 0) else {
++        let Some(irq) = get_interrupt(fdt, &node, 0) else {
+             error!("diagnostic serial port interrupt not found");
+             return;
+         };
+diff --git a/src/arch/riscv64/device/serial.rs b/src/arch/riscv64/device/serial.rs
+index f0981529..a71c0ab9 100644
+--- a/src/arch/riscv64/device/serial.rs
++++ b/src/arch/riscv64/device/serial.rs
+@@ -29,7 +29,7 @@ impl InterruptHandler for Com1Irq {
+ pub unsafe fn init(fdt: &Fdt) -> Option<()> {
+     unsafe {
+         if let Some(node) = fdt.all_compatible(&["ns16550a", "snps,dw-apb-uart"]).next() {
+-            let intr = get_interrupt(&node, 0).unwrap();
++            let intr = get_interrupt(fdt, &node, 0).unwrap();
+             let interrupt_parent = interrupt_parent(fdt, node)?;
+             let phandle = interrupt_parent.property::<PHandle>()?;
+             let ic_idx = IRQ_CHIP.phandle_to_ic_idx(phandle)?;
+diff --git a/src/dtb/mod.rs b/src/dtb/mod.rs
+index 8c3e79f2..fcfad742 100644
+--- a/src/dtb/mod.rs
++++ b/src/dtb/mod.rs
+@@ -594,16 +594,63 @@ pub fn interrupt_parent<'a>(fdt: &Fdt<'a>, node: FdtNode<'a>) -> Option<FdtNode<
+ }
+ 
+ #[cfg(dtb)]
+-pub fn get_interrupt(node: &FdtNode, idx: usize) -> Option<IrqCell> {
+-    let interrupts = node.property::<Interrupts>()?;
+-    match interrupts {
+-        Interrupts::Legacy(interrupts) => interrupts
+-            .iter()
+-            .nth(idx)
+-            .and_then(IrqCell::from_interrupt_specifier),
+-        Interrupts::Extended(interrupts) => interrupts.iter().nth(idx).and_then(|interrupt| {
+-            IrqCell::from_interrupt_specifier(interrupt.interrupt_specifier())
+-        }),
++fn inherited_interrupt_parent<'a>(fdt: &Fdt<'a>, node: FdtNode<'a>) -> Option<FdtNode<'a>> {
++    // The DT spec makes `interrupt-parent` inheritable. Walk up until a node
++    // declares it, then resolve the phandle to the interrupt controller.
++    // (The fdt crate stops at the immediate parent instead of following the
++    // inherited controller, which breaks nodes like /timer on RK3399 where
++    // only the root node carries `interrupt-parent = <&gic>`.)
++    let mut current = Some(node);
++    while let Some(node) = current {
++        if let Some(raw) = node.raw_property("interrupt-parent") {
++            let phandle = raw.as_value::<u32>().ok()?;
++            return fdt.root().resolve_phandle(PHandle::new(phandle));
++        }
++        current = node.parent();
++    }
++    None
++}
++
++#[cfg(dtb)]
++pub fn get_interrupt<'a>(fdt: &Fdt<'a>, node: &FdtNode<'a>, idx: usize) -> Option<IrqCell> {
++    // `interrupts-extended` carries a parent phandle per entry, so the fdt
++    // crate can parse it without resolving an inherited parent.
++    if node.raw_property("interrupts-extended").is_some() {
++        let interrupts = node.property::<Interrupts>()?;
++        return match interrupts {
++            Interrupts::Extended(interrupts) => interrupts.iter().nth(idx).and_then(|interrupt| {
++                IrqCell::from_interrupt_specifier(interrupt.interrupt_specifier())
++            }),
++            Interrupts::Legacy(_) => None,
++        };
++    }
++
++    // Legacy `interrupts`: resolve the inherited parent ourselves so that the
++    // specifier width comes from the real controller's #interrupt-cells.
++    let raw = node.raw_property("interrupts")?;
++    let parent = inherited_interrupt_parent(fdt, *node)?;
++    let interrupt_cells = parent.property::<InterruptCells>()?.0;
++    if !(1..=4).contains(&interrupt_cells) {
++        return None;
++    }
++
++    let stride = interrupt_cells * 4;
++    let start = idx.checked_mul(stride)?;
++    let chunk = raw
++        .value
++        .get(start..start.checked_add(stride)?)?;
++    let word = |i: usize| -> Option<u32> {
++        Some(u32::from_be_bytes(
++            chunk.get(i * 4..i * 4 + 4)?.try_into().ok()?,
++        ))
++    };
++
++    match interrupt_cells {
++        1 => Some(IrqCell::L1(word(0)?)),
++        2 => Some(IrqCell::L2(word(0)?, word(1)?)),
++        // GICv3 has a fourth PPI-partition cell; ignored for now.
++        3 | 4 => Some(IrqCell::L3(word(0)?, word(1)?, word(2)?)),
++        _ => None,
+     }
+ }
+ 

@@ -1,0 +1,23 @@
+diff --git a/src/dtb/irqchip.rs b/src/dtb/irqchip.rs
+index b320d1f6..004462c6 100644
+--- a/src/dtb/irqchip.rs
++++ b/src/dtb/irqchip.rs
+@@ -130,7 +130,17 @@ impl IrqChipList {
+                     }
+                 }
+ 
+-                if let Some(interrupts) = node.property::<Interrupts>() {
++                // The fdt crate resolves a missing `interrupt-parent` to the
++                // immediate parent node instead of following the inherited
++                // controller, so parsing `interrupts` on a root controller
++                // panics with MissingRequiredProperty("interrupt-cells").
++                // Only cascade controllers declare an explicit parent (or use
++                // interrupts-extended), so restrict parsing to those.
++                let has_explicit_parent = node.raw_property("interrupt-parent").is_some()
++                    || node.raw_property("interrupts-extended").is_some();
++                if has_explicit_parent
++                    && let Some(interrupts) = node.property::<Interrupts>()
++                {
+                     match interrupts {
+                         Interrupts::Legacy(interrupts) => {
+                             let parent_phandle =
