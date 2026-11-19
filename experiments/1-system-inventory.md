@@ -11,7 +11,8 @@ is visible to Linux.
 
 ## Actions
 
-Run everything below and keep the full output in Results.
+Run everything below **inside the installed Linux system** (boot normally and do not
+stop autoboot at the U-Boot prompt). Keep the full output in Results.
 
 ```sh
 uname -a
@@ -31,6 +32,10 @@ If `fw_printenv` exists, also run:
 ```sh
 sudo fw_printenv | head -40
 ```
+
+`fw_printenv` is a Linux user-space tool (Manjaro package `uboot-tools`) and may require
+`/etc/fw_env.config` pointing at the SPI environment area. If it fails or is missing,
+record the error message — that is a valid result.
 
 Identify the block devices explicitly (the eMMC usually reports a model name, SD cards
 report the card name; this also tells you which `mmcblkX` is which):

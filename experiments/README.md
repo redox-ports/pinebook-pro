@@ -21,19 +21,19 @@ separate file named `<number>-<slug>.md`, numbered in execution order.
 
 ## Device information
 
-| Field                                                         | Value     |
-| ------------------------------------------------------------- | --------- |
-| Pinebook Pro batch / version (v2.1, ANSI/ISO, eMMC size, RAM) | `FILL IN` |
-| OS currently on eMMC (name + version)                         | `FILL IN` |
-| Kernel version (`uname -r`)                                   | `FILL IN` |
-| microSD card model / capacity                                 | `FILL IN` |
-| USB-UART adapter model (chip: CH340 / CP2102 / FT232 / other) | `FILL IN` |
-| Host OS used for the serial console (macOS / Linux)           | `FILL IN` |
+| Field                                                         | Value                                                                  |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Pinebook Pro batch / version (v2.1, ANSI/ISO, eMMC size, RAM) | `FILL IN`                                                              |
+| OS currently on eMMC (name + version)                         | Manjaro ARM (inferred from the U-Boot banner; confirm in experiment 1) |
+| Kernel version (`uname -r`)                                   | `FILL IN`                                                              |
+| microSD card model / capacity                                 | `FILL IN`                                                              |
+| USB-UART adapter model (chip: CH340 / CP2102 / FT232 / other) | `FILL IN`                                                              |
+| Host OS used for the serial console (macOS / Linux)           | `FILL IN`                                                              |
 
 ## Index
 
-| #   | File                                           | Goal                                                                      | Status  |
-| --- | ---------------------------------------------- | ------------------------------------------------------------------------- | ------- |
-| 0   | [0-serial-console.md](0-serial-console.md)     | Verify the UART console at 1500000 8N1 and capture the current boot chain | pending |
-| 1   | [1-system-inventory.md](1-system-inventory.md) | Inventory OS, kernel drivers, block devices, SPI exposure                 | pending |
-| 2   | [2-raw-sectors.md](2-raw-sectors.md)           | Verify idbloader/U-Boot sector offsets and SPI blankness                  | pending |
+| #   | File                                           | Goal                                                                      | Status                |
+| --- | ---------------------------------------------- | ------------------------------------------------------------------------- | --------------------- |
+| 0   | [0-serial-console.md](0-serial-console.md)     | Verify the UART console at 1500000 8N1 and capture the current boot chain | **done** (2026-11-19) |
+| 1   | [1-system-inventory.md](1-system-inventory.md) | Inventory OS, kernel drivers, block devices, SPI exposure                 | pending               |
+| 2   | [2-raw-sectors.md](2-raw-sectors.md)           | Verify idbloader/U-Boot sector offsets and SPI blankness                  | pending               |

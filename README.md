@@ -45,6 +45,24 @@ graph TD
 Mainline U-Boot supports the board as `pinebook-pro-rk3399_defconfig` (DT: `rk3399-pinebook-pro.dts`).
 [TOW-Boot](https://github.com/Tow-Boot/Tow-Boot) (an opinionated U-Boot distribution with a friendly boot menu) ships the board as **`pine64-pinebookPro`**.
 
+### Verified on the actual device (2026-11-19)
+
+Full log and analysis: [`experiments/0-serial-console.md`](experiments/0-serial-console.md).
+
+- UART2 console works at **1500000 8N1** (complete, ungarbled boot log).
+- Current firmware: **U-Boot 2021.07-1 (Manjaro ARM)**, EFI distro boot with the default
+  environment — `boot_targets=usb0 mmc1 mmc0 nvme0 pxe dhcp sf0`; autoboot is
+  interruptible and the `=>` console is available.
+- SPI NOR is detected (`gd25q128`, 16 MiB); the U-Boot environment there is invalid
+  (`bad CRC`), so the built-in default environment is used.
+- Runtime MMC mapping: `mmc0` = eMMC (SDHCI `fe330000`), `mmc1` = microSD (DW MMC
+  `fe320000`), `mmc2` = SDIO/Wi-Fi (`fe310000`).
+- eMMC holds the baseline OS (GPT; first partition at LBA 62500, i.e. 32 MiB, leaving
+  room for an embedded U-Boot at 8 MiB) — it stays untouched.
+- Practical consequence: the existing firmware can boot a Redox `BOOTAA64.EFI` from the
+  microSD ESP **without flashing anything**; manual `bootefi` from the U-Boot prompt
+  enables fast iteration.
+
 ---
 
 ## 2. Redox OS aarch64: current state (research summary)
@@ -171,7 +189,8 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 
 ### Phase 3 — Hardware bring-up: serial console (milestone = parity with RPi 3 B+)
 
-- [ ] Prep device: UART cable (3.3 V) @ **1500000 8N1**; optionally flash TOW-Boot to SPI
+- [x] Verify UART console at **1500000 8N1** (experiment 0)
+- [ ] Choose firmware path: boot the ESP with the installed Manjaro U-Boot first; optionally flash TOW-Boot to SPI
 - [ ] Boot SD image: `BOOTAA64.EFI` banner visible on UART
 - [ ] Kernel entered at EL1, DTB discovered (`DTB_ADDR` env honored), UART bound (`snps,dw-apb-uart`)
 - [ ] GIC-400 (GICv2) + generic timer initialized
@@ -203,7 +222,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 | 2   | U-Boot must pass FDT via EFI config table and provide GOP for display | FDT: standard U-Boot `efi_loader` behavior, and Redox bootloader consumes it (`OsHwDesc::DeviceTree`). GOP: verify on device; worst case serial-only console initially |
 | 3   | No storage driver for DW MMC/SDHCI upstream on aarch64                | Known gap (RPi 3 B+ precedent). Phase 4; expect kernel/userspace driver work in `redox-os/drivers` or kernel `dtb` devices                                             |
 | 4   | Build time/disk on free CI runners                                    | Measure in Phase 1; mitigations: minimal config, `REPO_BINARY=1`, caching, pruning runner disk                                                                         |
-| 5   | UART baud 1500000 unusual for some USB-UART dongles                   | Use CP2102/FT232/CH340-class adapter; bootloader/kernel must not re-init UART to another rate (DTB `stdout-path` baud respected by kernel DTB serial)                  |
+| 5   | UART baud 1500000 unusual for some USB-UART dongles                   | **Verified (experiment 0):** console works at 1500000 8N1 with the test adapter. Remaining: ensure bootloader/kernel keep the baud (DTB `stdout-path`).                |
 | 6   | eMMC-only units (no SD) / SPI-bricked devices                         | Document maskrom + `rkdeveloptool` recovery in flashing docs                                                                                                           |
 | 7   | aarch64 package binaries on Redox repo server                         | Verify availability; else build all from source                                                                                                                        |
 
