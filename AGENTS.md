@@ -65,7 +65,7 @@ fix(ci): prune runner disk before redox build
 
 - Bootloader (UEFI, `BOOTAA64.EFI`): drops EL2→EL1, builds page tables, reads EFI memory map, **passes DTB to kernel via env `DTB_ADDR`/`DTB_SIZE`**, framebuffer via `FRAMEBUFFER_ADDR/WIDTH/HEIGHT/STRIDE`, RedoxFS via `REDOXFS_UUID`/`REDOXFS_BLOCK`.
 - Kernel serial driver is DTB-driven and supports `snps,dw-apb-uart` (16550 with u32 MMIO) → RK3399 UART2 works out of the box.
-- IRQ: `gic.rs` = GICv2 (RK3399 GIC-400 compatible). Timer: ARM generic timer. PSCI supported.
+- IRQ: RK3399 is **GICv3** (`arm,gic-v3`, GIC-500) — not GICv2/GIC-400. `gicv3.rs` exists; `irqchip::init_ap` (secondary CPUs) currently supports only the GICv2 memory-mapped interface, so expect single-CPU until extended. Timer: ARM generic timer. PSCI 1.1 (SMC conduit) works.
 - Precedent: Raspberry Pi 3 B+ (ARM64, U-Boot) boots to UART serial console; storage drivers are the missing piece everywhere on aarch64.
 
 ### Device state (verified 2026-11-19)
@@ -91,6 +91,12 @@ fix(ci): prune runner disk before redox build
   bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
+- **Redox bring-up status (2026-11-20, experiment 4):** the kernel boots to initfs
+  userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
+  `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
+  the panel). Root RedoxFS mount is blocked: no microSD (DW MMC) driver, so `init` cannot
+  switchroot. `pcid` panics on aarch64 (PCI 3.0 port-I/O fallback is `todo!()`); secondary
+  CPUs stay offline (GICv3 `init_ap` gap); RK808 RTC/entropy drivers missing.
 
 ### Target SD image layout (produced by our repack)
 
