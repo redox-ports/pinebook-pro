@@ -38,3 +38,4 @@ separate file named `<number>-<slug>.md`, numbered in execution order.
 | 1   | [1-system-inventory.md](1-system-inventory.md)         | Inventory OS, kernel drivers, block devices, SPI exposure                  | **done** (2026-11-19)                                 |
 | 2   | [2-raw-sectors.md](2-raw-sectors.md)                   | Verify idbloader/U-Boot sector offsets and SPI blankness                   | **done** (2026-11-19)                                 |
 | 3   | [3-emmc-boot-partitions.md](3-emmc-boot-partitions.md) | Locate the first stage: user area LBA 64 vs eMMC boot0/boot1; read EXT_CSD | **done** (2026-11-19) — idbloader at user-area LBA 64 |
+| 4   | [4-first-redox-boot.md](4-first-redox-boot.md)         | Boot the local Redox image from microSD via the eMMC U-Boot, capture UART  | pending                                               |
