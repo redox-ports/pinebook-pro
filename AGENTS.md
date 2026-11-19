@@ -56,6 +56,7 @@ fix(ci): prune runner disk before redox build
 - Primary upstream: `https://gitlab.redox-os.org/redox-os/redox` (GitHub = mirror).
 - Key vars: `ARCH` (`aarch64`), `CONFIG_NAME`, `BOARD` (empty for us), `FILESYSTEM_CONFIG` (path, default `config/$ARCH/$BOARD/$CONFIG_NAME.toml`), `FILESYSTEM_SIZE`, `PODMAN_BUILD`, `CI=1`, `REPO_BINARY`, `REPO_OFFLINE`, `COOKBOOK_MAKE_JOBS`.
 - Output: `build/$ARCH/$CONFIG_NAME/harddrive.img`.
+- Local loop: `scripts/bootstrap-redox.sh` → `scripts/build-image.sh` → `scripts/flash-sd.sh` → `scripts/serial-log.sh`; build tree in `build/redox` (upstream clone, never forked; config overlay injected), image at `build/redox/build/aarch64/minimal/harddrive.img`. Host needs rustup/cargo even in Podman mode (fstools). `REPO_BINARY=1` is not the default (aarch64 binary packages unverified).
 - Board config template: `config/aarch64/raspi3bp/minimal.toml` → copy as `config/aarch64/pinebook-pro/minimal.toml`, adjust `include = ["../../minimal.toml"]`, `filesystem_size`, `efi_partition_size`.
 - QEMU smoke test path: `mk/qemu.mk` aarch64 = `-M virt` + UEFI (AAVMF/edk2) + ramfb; disk default `nvme`.
 - Podman build is the "always works" mode; native build requires the Ubuntu package list from `native_bootstrap.sh`.
@@ -111,7 +112,7 @@ LICENSE
 .gitignore
 experiments/         # chronological hardware experiment logs (append-only)
 .github/workflows/   # build.yml (Phase 1+)
-scripts/             # repack-pbp.sh, qemu-smoke.sh, deps install helpers (Phase 1+)
+scripts/             # local loop: bootstrap-redox.sh, build-image.sh, flash-sd.sh, serial-log.sh; later: repack-pbp.sh, qemu-smoke.sh
 config/              # filesystem config overlay for the redox build (Phase 2+)
 patches/             # upstream patches, only if unavoidable
 ```
@@ -125,7 +126,7 @@ patches/             # upstream patches, only if unavoidable
 
 ## Local development notes
 
-- Primary development happens through GitHub Actions on Linux runners; local macOS cannot run the Redox build natively (Linux-only; Podman machine may work but is not the supported path).
+- Primary development happens through GitHub Actions on Linux runners; local Linux builds are supported via `scripts/bootstrap-redox.sh` + `scripts/build-image.sh` (see README §4 "Local build, flash and serial loop"); macOS cannot run the Redox build natively (Linux-only; Podman machine may work but is not the supported path).
 - Hardware-facing milestones (Phase 3+) need a physical Pinebook Pro + UART cable; CI can only validate up to image composition + QEMU smoke tests.
 
 ## Quick links

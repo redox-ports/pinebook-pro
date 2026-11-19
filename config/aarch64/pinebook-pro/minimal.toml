@@ -1,0 +1,15 @@
+# Pinebook Pro minimal filesystem configuration.
+#
+# Mirrors the upstream board template (config/aarch64/raspi3bp/minimal.toml):
+# the board file only tunes sizes, the shared package set comes from the
+# base config. This file is copied into the Redox build tree by
+# scripts/bootstrap-redox.sh; upstream Redox is never forked.
+
+include = ["../../minimal.toml"]
+
+# General settings
+[general]
+# Filesystem size in MiB
+filesystem_size = 256
+# EFI partition size in MiB
+efi_partition_size = 128

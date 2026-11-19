@@ -9,5 +9,6 @@
 
 # Tooling
 /work/
+/logs/
 *.swp
 .DS_Store

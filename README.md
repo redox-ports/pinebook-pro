@@ -181,6 +181,27 @@ make all   # -> build/aarch64/pinebook-pro/harddrive.img
 | Helper                         | `./build.sh -A <target>` (`-A` = aarch64), e.g. `./build.sh -A aarch64 -c pinebook-pro all`                                                       |
 | Boot test (virtual)            | `make qemu` on aarch64 uses AAVMF + `-M virt`; U-Boot raspi3bp flow uses `-kernel u-boot.bin` + `disk=sdcard`                                     |
 
+### Local build, flash and serial loop (no CI required)
+
+First hardware milestone: build the **stock** aarch64 image, write it to the microSD,
+and boot it with the **U-Boot already on the eMMC** (its distro boot scans the microSD
+ESP at sector 2048, so no repacking is needed yet):
+
+```sh
+scripts/bootstrap-redox.sh   # clone upstream (GitHub mirror) into build/redox, write .config, inject our config overlay
+scripts/build-image.sh       # make all -> build/redox/build/aarch64/minimal/harddrive.img
+scripts/flash-sd.sh          # write to the microSD (auto-detects the SU32G card, refuses the eMMC)
+scripts/serial-log.sh        # UART console at 1500000 8N1, log under logs/
+```
+
+| Fact                     | Value                                                                                                                                                           |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Build modes              | Podman (default, `.config` gets `PODMAN_BUILD?=1`) or `--native` (runs upstream `native_bootstrap.sh -d -y`)                                                    |
+| Host requirement (both)  | rustup/cargo — `fstools` (installer + redoxfs) always build on the host, even in Podman mode (`FSTOOLS_IN_PODMAN=0`)                                            |
+| Binary packages          | `REPO_BINARY=1` is **not** the default: aarch64 binary availability on the Redox server is unverified (risk 7); `scripts/build-image.sh --repo-binary` tries it |
+| First-build expectations | long (container image, prefix, full package set); later builds are incremental; output ≈ 384 MiB (256 MiB RedoxFS + 128 MiB ESP)                                |
+| What you should see      | U-Boot banner → EFI boot of `BOOTAA64.EFI` from the SD ESP → Redox bootloader/kernel output on UART2; serial login is the success signal                        |
+
 ---
 
 ## 5. CI plan (GitHub Actions)
@@ -206,6 +227,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [x] Study Redox build system (vars, image targets, fs configs)
 - [x] Study Redox aarch64 kernel/bootloader state (DTB path, UART compatibles, IRQ chips, UEFI flow)
 - [x] Study Pinebook Pro hardware, BootROM, flash offsets, serial console
+- [x] Local build/flash/serial loop scripts (`scripts/bootstrap-redox.sh`, `scripts/build-image.sh`, `scripts/flash-sd.sh`, `scripts/serial-log.sh`)
 - [x] Write `README.md` (this file) and `AGENTS.md`
 
 ### Phase 1 — CI builds upstream aarch64 image (board-independent)
@@ -219,7 +241,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 
 ### Phase 2 — Pinebook Pro image composition (still no hardware required)
 
-- [ ] Board fs config `config/aarch64/pinebook-pro/minimal.toml` (start from raspi3bp/minimal.toml)
+- [x] Board fs config `config/aarch64/pinebook-pro/minimal.toml` (start from raspi3bp/minimal.toml)
 - [ ] Confirm installer GPT layout assumptions (ESP at sector 2048; `efi_partition_size` honored)
 - [ ] `scripts/repack-pbp.sh`: ESP → sector 32768, embed U-Boot at 64/16384, zstd; verify with `sgdisk -p` + `mtools -l`
 - [ ] U-Boot built from source in CI (pinned ATF + U-Boot, `pinebook-pro-rk3399_defconfig`)
