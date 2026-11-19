@@ -45,6 +45,12 @@ graph TD
 Mainline U-Boot supports the board as `pinebook-pro-rk3399_defconfig` (DT: `rk3399-pinebook-pro.dts`).
 [TOW-Boot](https://github.com/Tow-Boot/Tow-Boot) (an opinionated U-Boot distribution with a friendly boot menu) ships the board as **`pine64-pinebookPro`**.
 
+On SD/eMMC the first stage begins with a 512-byte **Rockchip v1 header** at sector 64.
+The header is **RC4-encoded** with a fixed key (`tools/rkcommon.c`), so its plaintext
+signature `0x0ff0aa55` is not visible on disk; the payload starts at `+0x800` with the
+4-byte marker `RK33` (RK3399). `RKNS` is the **v2** header magic used by newer Rockchip
+SoCs (RK3568/RK3588 class) — do not use it to verify an RK3399 image.
+
 ### Verified on the actual device (2026-11-19)
 
 Full log and analysis: [`experiments/0-serial-console.md`](experiments/0-serial-console.md).
@@ -74,11 +80,14 @@ Full log and analysis: [`experiments/0-serial-console.md`](experiments/0-serial-
 - Internal keyboard is a USB HID device (`258a:001e`) on a USB 2.0 bus behind the
   Genesys Logic hub (`05e3:0608`); the webcam is `0c45:6321`.
 - Serial login over `ttyS2` verified (`console=ttyS2,1500000` in the kernel cmdline).
-- SPI NOR is **blank/erased**: sector 64 reads `0xFF` and there is no `RKNS`/`U-Boot`
-  signature anywhere in the 16 MiB (full backup + SHA256 recorded in experiment 2).
-- U-Boot proper is on the **eMMC user area at sector 16384**; the first stage is **not**
-  at user-area sector 64 → the shipped chain uses an eMMC hardware boot partition
-  (`boot0`/`boot1`, 4 MiB each, not write-protected) — to be confirmed in experiment 3.
+- SPI NOR is **blank/erased**: sector 64 reads `0xFF` (so no v1 header can be present)
+  and there are no `U-Boot` strings anywhere in the 16 MiB (full backup + SHA256 recorded
+  in experiment 2).
+- The shipped boot chain is the standard RK3399 one, in the **eMMC user area**: idbloader
+  at **sector 64** and U-Boot proper at **sector 16384**. The first-stage header is the
+  RC4-encoded v1 format (magic `0x0ff0aa55`), not ASCII `RKNS`; the eMMC hardware boot
+  partitions (`boot0`/`boot1`, 4 MiB each) contain no bootloader and are unused
+  (experiment 3).
 - The microSD contains **no bootloader remnants** (zeros at sector 64, nothing at
   8 MiB) and can be safely overwritten.
 - U-Boot `mmc info`: eMMC = MMC 5.1, High Speed 52 MHz, 8-bit; microSD = SD 3.0,
@@ -132,12 +141,14 @@ Final image layout (512-byte sectors):
 | 32768        | 264191     | ~113 MiB  | ESP, FAT32: `/EFI/BOOT/BOOTAA64.EFI` (Redox UEFI bootloader)   |
 | 264192       | end        | remainder | RedoxFS (root filesystem with `/usr/lib/boot/{kernel,initfs}`) |
 
-> **Note (2026-11-19, experiments 2–3):** the factory eMMC installation does **not**
-> follow this layout — its U-Boot proper sits at user-area 8 MiB while the first stage
-> is expected in an eMMC hardware boot partition (SPI is blank, microSD has no
-> bootloader). See `experiments/2-raw-sectors.md` and
-> `experiments/3-emmc-boot-partitions.md`. This does not affect the target SD layout
-> above, which follows the standard RK3399 BootROM contract.
+> **Note (2026-11-19, experiments 2–3):** the factory eMMC installation follows the same
+> contract — idbloader at user-area **sector 64** and U-Boot proper at **8 MiB**; the eMMC
+> hardware boot partitions contain no bootloader. The `RKNS` search in experiment 2 was a false
+> negative: RK3399 uses the RC4-encoded v1 header (magic `0x0ff0aa55`, payload marker
+> `RK33`), while `RKNS` is the v2 magic of newer SoCs. See
+> `experiments/2-raw-sectors.md` and `experiments/3-emmc-boot-partitions.md`. The target
+> SD layout above is unchanged; both bootloader offsets are now confirmed on the working
+> eMMC install.
 
 An alternative deployment mode (no image repacking needed): flash U-Boot/TOW-Boot once into the **SPI NOR** (it ships empty), then boot any stock-layout Redox image from microSD. This is documented as a fallback; the CI deliverable is the self-contained microSD image above.
 
@@ -244,16 +255,17 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 
 ## 7. Risks & open questions
 
-| #   | Risk / question                                                       | Status / mitigation                                                                                                                                                    |
-| --- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | ESP offset fixed at sector 2048 collides with `u-boot.itb` @ 16384    | Solved by design: repack step (recreate ESP at 32768). Verify installer behavior in Phase 2                                                                            |
-| 2   | U-Boot must pass FDT via EFI config table and provide GOP for display | FDT: standard U-Boot `efi_loader` behavior, and Redox bootloader consumes it (`OsHwDesc::DeviceTree`). GOP: verify on device; worst case serial-only console initially |
-| 3   | No storage driver for DW MMC/SDHCI upstream on aarch64                | Known gap (RPi 3 B+ precedent). Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`) and `sdhci` (eMMC `fe330000`); Phase 4 driver work.                     |
-| 4   | Build time/disk on free CI runners                                    | Measure in Phase 1; mitigations: minimal config, `REPO_BINARY=1`, caching, pruning runner disk                                                                         |
-| 5   | UART baud 1500000 unusual for some USB-UART dongles                   | **Verified (experiment 0):** console works at 1500000 8N1 with the test adapter. Remaining: ensure bootloader/kernel keep the baud (DTB `stdout-path`).                |
-| 6   | eMMC-only units (no SD) / SPI-bricked devices                         | Document maskrom + `rkdeveloptool` recovery in flashing docs                                                                                                           |
-| 7   | aarch64 package binaries on Redox repo server                         | Verify availability; else build all from source                                                                                                                        |
-| 8   | USB2 host (DWC2) driver missing for internal input devices            | Keyboard/touchpad are USB2 HID behind a hub (not DWC3/xHCI). Needs a DWC2 host driver or an alternate input path; Phase 4.                                             |
+| #   | Risk / question                                                       | Status / mitigation                                                                                                                                                                                                                             |
+| --- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | ESP offset fixed at sector 2048 collides with `u-boot.itb` @ 16384    | Solved by design: repack step (recreate ESP at 32768). Verify installer behavior in Phase 2                                                                                                                                                     |
+| 2   | U-Boot must pass FDT via EFI config table and provide GOP for display | FDT: standard U-Boot `efi_loader` behavior, and Redox bootloader consumes it (`OsHwDesc::DeviceTree`). GOP: verify on device; worst case serial-only console initially                                                                          |
+| 3   | No storage driver for DW MMC/SDHCI upstream on aarch64                | Known gap (RPi 3 B+ precedent). Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`) and `sdhci` (eMMC `fe330000`); Phase 4 driver work.                                                                                              |
+| 4   | Build time/disk on free CI runners                                    | Measure in Phase 1; mitigations: minimal config, `REPO_BINARY=1`, caching, pruning runner disk                                                                                                                                                  |
+| 5   | UART baud 1500000 unusual for some USB-UART dongles                   | **Verified (experiment 0):** console works at 1500000 8N1 with the test adapter. Remaining: ensure bootloader/kernel keep the baud (DTB `stdout-path`).                                                                                         |
+| 6   | eMMC-only units (no SD) / SPI-bricked devices                         | Document maskrom + `rkdeveloptool` recovery in flashing docs                                                                                                                                                                                    |
+| 7   | aarch64 package binaries on Redox repo server                         | Verify availability; else build all from source                                                                                                                                                                                                 |
+| 8   | USB2 host (DWC2) driver missing for internal input devices            | Keyboard/touchpad are USB2 HID behind a hub (not DWC3/xHCI). Needs a DWC2 host driver or an alternate input path; Phase 4.                                                                                                                      |
+| 9   | Verifying Rockchip boot images by an ASCII magic                      | **Resolved (experiment 3):** RK3399 uses the RC4-encoded **v1** header (`0x0ff0aa55`; payload marker `RK33` at `+0x800`). `RKNS` is the **v2** magic of RK35xx-class SoCs. Do not grep for `RKNS`; decode the header or check `RK33` at LBA 68. |
 
 ---
 

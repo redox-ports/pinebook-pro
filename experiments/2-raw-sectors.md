@@ -1,13 +1,14 @@
 # Experiment 2 — Raw sector verification
 
-**Status:** done (2026-11-19) — follow-up in experiment 3
+**Status:** done (2026-11-19) — first-stage conclusion corrected in experiment 3
 **Related:** README §3 (target image layout), §7 risk 1
 
 ## Goal
 
 Empirically confirm the RK3399 layout this repo relies on:
 
-- idbloader at **byte 32768 (sector 64)** — expect the ASCII magic `RKNS`;
+- idbloader at **byte 32768 (sector 64)** — expected the ASCII magic `RKNS` (wrong for
+  RK3399; corrected in experiment 3);
 - U-Boot proper at **sector 16384 (8 MiB)** — expect `U-Boot 20xx.xx` strings;
 - resolve which medium hosts the running U-Boot (SPI NOR / eMMC / microSD);
 - inspect the SPI NOR first-stage area and search the whole 16 MiB flash.
@@ -68,11 +69,19 @@ U-Boot `mmc0` = eMMC, `mmc1` = microSD, `mmc2` = SDIO; Linux `mmc0` = SDIO,
 
 ## Results
 
+> **Correction (2026-11-19, experiment 3):** the expected ASCII `RKNS` magic is wrong for
+> RK3399. The BootROM header (U-Boot `tools/rkcommon.c`, `struct header0_info`) sits at
+> SD/MMC block 64 and is **RC4-encoded**; its plaintext signature is `0x0ff0aa55`, and the
+> payload marker is `RK33` at `+0x800`. The eMMC dump below decodes to exactly this
+> header — the idbloader **is** at sector 64. `RKNS` is the v2 header magic for newer
+> Rockchip SoCs. See `experiments/3-emmc-boot-partitions.md`.
+
 ### Linux: idbloader hexdump (sector 64)
 
-Expected: the first bytes contain `RKNS`.
+Expected (as written before the run): the first bytes contain `RKNS`. **Wrong for
+RK3399** — see the correction note above.
 
-eMMC (`/dev/mmcblk2`) — **non-zero data, no `RKNS` magic**:
+eMMC (`/dev/mmcblk2`) — **non-zero, RC4-encoded v1 header (no ASCII magic by design)**:
 
 ```
 00000000  3b 8c dc fc be 9f 9d 51  eb 30 34 ce 24 51 1f 98  |;......Q.04.$Q..|
@@ -187,23 +196,24 @@ dffab0dd410657cb30c7b2fd7f2586a4792e8472e58882b3532581f8111a646d  /home/user/spi
 
 ### Observations
 
-| Question                                            | Answer                                                                                                                                                                                    |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RKNS` magic at sector 64 (eMMC / microSD / SPI)?   | **No on all three.** eMMC: non-zero data without `RKNS`; microSD: all zeros; SPI: all `0xFF`                                                                                              |
-| U-Boot version at sector 16384 (eMMC / microSD)?    | eMMC: yes (`U-Boot` strings; version from experiment 0: `U-Boot 2021.07-1 Manjaro ARM`). microSD: nothing                                                                                 |
-| U-Boot strings anywhere in the SPI NOR?             | No                                                                                                                                                                                        |
-| Which medium hosts the running U-Boot?              | **eMMC** — `u-boot.itb` is in the user area at 8 MiB; SPI is blank and microSD is empty. The first stage is not at user-area sector 64 → follow-up in experiment 3 (eMMC boot partitions) |
-| SPI NOR: blank / env only / full bootloader / other | **Blank (erased)**: `0xFF` at sector 64, no `RKNS`/`U-Boot` signatures in the whole 16 MiB; backup SHA256 recorded                                                                        |
+| Question                                            | Answer                                                                                                                                                                                                                |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RKNS` magic at sector 64 (eMMC / microSD / SPI)?   | **No on all three** — but `RKNS` is not the RK3399 magic: eMMC sector 64 holds a valid RC4-encoded v1 header (`0x0ff0aa55`), i.e. the idbloader **is** there. microSD: zeros; SPI: `0xFF` (corrected in experiment 3) |
+| U-Boot version at sector 16384 (eMMC / microSD)?    | eMMC: yes (`U-Boot` strings; version from experiment 0: `U-Boot 2021.07-1 Manjaro ARM`). microSD: nothing                                                                                                             |
+| U-Boot strings anywhere in the SPI NOR?             | No                                                                                                                                                                                                                    |
+| Which medium hosts the running U-Boot?              | **eMMC** — idbloader at user-area sector 64 (RC4-encoded v1 header) and `u-boot.itb` at 8 MiB; SPI is blank and microSD is empty (first-stage location corrected in experiment 3)                                     |
+| SPI NOR: blank / env only / full bootloader / other | **Blank (erased)**: `0xFF` at sector 64 (no v1 header possible) and no `U-Boot` strings in the whole 16 MiB; backup SHA256 recorded                                                                                   |
 
 ### Notes (facts extracted from the run)
 
 - **U-Boot `mmc info`:** eMMC (`sdhci@fe330000`) is MMC 5.1, High Speed (52 MHz), 8-bit,
   58.2 GiB, boot areas 4 MiB each (both **not write-protected**) and RPMB 16 MiB;
   microSD (`mmc@fe320000`) is SD 3.0, High Speed (50 MHz), 4-bit, 29.7 GiB.
-- **The first stage is not in the eMMC user area at sector 64.** The user area there
-  holds arbitrary non-zero data (no boot header). Since the `U-Boot` proper image is
-  present at user-area 8 MiB, the BootROM/SPL first stage must come from an eMMC
-  hardware boot partition (boot0/boot1) — experiment 3 checks this.
+- **The first stage is in the eMMC user area at sector 64.** The dump is not arbitrary
+  data: it is the RC4-encoded Rockchip v1 header (`magic 0x0ff0aa55`, `disable_rc4=1`,
+  `init_offset=4`) of the format produced by U-Boot's `mkimage -T rksd`; the payload
+  starts with `RK33` at LBA 68. The original `RKNS` check produced a false negative
+  (corrected in experiment 3).
 - **microSD is clean:** sector 64 is zeroed and there is no U-Boot at 8 MiB, so the
   card contains no bootloader remnants and can be overwritten by our image.
 - **SPI NOR is blank:** this matches the factory state described by the PINE64 wiki.
@@ -217,9 +227,10 @@ dffab0dd410657cb30c7b2fd7f2586a4792e8472e58882b3532581f8111a646d  /home/user/spi
 
 ### Verdict
 
-SPI NOR is blank (factory state), the microSD contains no bootloader, and U-Boot proper
-lives on the eMMC user area at 8 MiB. The idbloader is **not** at user-area sector 64, so
-the shipped system must boot its first stage from an eMMC hardware boot partition
-(confirmed next in experiment 3). This does not change the deliverable: the
-self-contained SD image will place idbloader at sector 64 and `u-boot.itb` at 16384, and
-the BootROM will boot it whenever the eMMC is disabled, absent, or unbootable.
+SPI NOR is blank (factory state), the microSD contains no bootloader, and the eMMC holds
+the complete boot chain in its user area: idbloader at sector 64 (Rockchip RC4-encoded v1
+header, payload `RK33`) and U-Boot proper at 8 MiB. The earlier "first stage is not at
+sector 64" conclusion was a false negative caused by expecting the v2 `RKNS` magic
+(corrected in experiment 3). This matches the target layout: the self-contained SD image
+places idbloader at sector 64 and `u-boot.itb` at 16384, and the BootROM boots it whenever
+the eMMC is disabled, absent, or unbootable.

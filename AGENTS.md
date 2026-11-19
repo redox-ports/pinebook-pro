@@ -44,7 +44,7 @@ fix(ci): prune runner disk before redox build
 
 ### Pinebook Pro / RK3399
 
-- Boot ROM loads next stage at **byte 32768 (sector 64)**; U-Boot proper goes at **sector 16384 (8 MiB)**. Boot order: SPI NOR → eMMC → microSD → USB OTG. NVMe (PCIe) is **not** ROM-bootable.
+- Boot ROM loads next stage at **byte 32768 (sector 64)**; U-Boot proper goes at **sector 16384 (8 MiB)**. The on-disk RK3399 header is the **v1** format (512 bytes, RC4-encoded, plaintext magic `0x0ff0aa55`); the payload starts at `+0x800` with `RK33`. ASCII `RKNS` is the **v2** magic (RK3568/RK3588 class), **not** RK3399. Boot order: SPI NOR → eMMC → microSD → USB OTG. NVMe (PCIe) is **not** ROM-bootable.
 - Serial console = **UART2, 1500000 baud 8N1, 3.3 V**, via headphone jack (internal switch). Compatible string in DT: `snps,dw-apb-uart` / `rockchip,rk3399-uart`.
 - Storage controllers: microSD = **DW MMC**; eMMC = **SDHCI (arasan)** @ `fe330000`; both lack upstream Redox drivers (biggest gap).
 - Keyboard + touchpad are internal **USB HID** devices (behind a hub) → need USB host + HID stack, not PS/2/I2C.
@@ -82,12 +82,12 @@ fix(ci): prune runner disk before redox build
 - Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`, SDIO `fe310000`) and
   `sdhci`/`sdhci-pltfm` (eMMC `fe330000`, ADMA, HS200).
 - SPI NOR `gd25q128` (16 MiB) is exposed as `/dev/mtd0` (`"spi0.0"`) and is
-  **blank/erased**: `0xFF` at sector 64 and no `RKNS`/`U-Boot` signatures in 16 MiB
-  (backup + SHA256 recorded). Flashing TOW-Boot to SPI remains an option.
-- eMMC: U-Boot proper at user-area sector 16384; the first stage is **not** at
-  user-area sector 64 → the shipped boot chain uses an eMMC hardware boot partition
-  (`boot0`/`boot1`, 4 MiB each, not write-protected; experiment 3 pending).
-  **Never write to the eMMC boot partitions.**
+  **blank/erased**: `0xFF` at sector 64 (no v1 header possible) and no `U-Boot` strings
+  in 16 MiB (backup + SHA256 recorded). Flashing TOW-Boot to SPI remains an option.
+- eMMC boot chain (standard RK3399 layout, experiments 2–3): **idbloader at user-area
+  sector 64** (RC4-encoded v1 header; payload marker `RK33` at LBA 68) and **U-Boot proper
+  at sector 16384**. The hardware boot partitions (`boot0`/`boot1`, 4 MiB each) contain no
+  bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
 
