@@ -10,14 +10,16 @@
 #                     (verified by register dumps) but never delivered:
 #                     with affinity routing an SPI whose IROUTER entry does
 #                     not select the running CPU is held pending forever.
-#                     The patch marks every SPI non-secure Group 1 and routes
-#                     every SPI to the boot CPU (affinity 0.0.0.0). Both are
-#                     harmless on GICv2 (IGROUPR/IROUTER RAZ/WI) and on a
-#                     single-security-state GIC.
+#                     The patch marks every SPI non-secure Group 1, routes
+#                     every SPI to the boot CPU (affinity 0.0.0.0), and
+#                     switches GICD_CTLR to read-modify-write so the
+#                     firmware-owned mode bits (ARE and friends) are not
+#                     wiped. All of this is harmless on GICv2 (IGROUPR/
+#                     IROUTER RAZ/WI) and on a single-security-state GIC.
 #
 # Apply from src (repo root):  git apply <this file>
 diff --git a/src/arch/aarch64/device/irqchip/gic.rs b/src/arch/aarch64/device/irqchip/gic.rs
-index a89befc1..b2636c45 100644
+index a89befc1..1b49f268 100644
 --- a/src/arch/aarch64/device/irqchip/gic.rs
 +++ b/src/arch/aarch64/device/irqchip/gic.rs
 @@ -23,8 +23,10 @@ static GICD_ICPENDR: u32 = 0x280;
@@ -31,10 +33,12 @@ index a89befc1..b2636c45 100644
  
  static GICC_EOIR: u32 = 0x0010;
  static GICC_IAR: u32 = 0x000c;
-@@ -351,6 +353,24 @@ impl GicDistIf {
+@@ -351,8 +353,32 @@ impl GicDistIf {
                  self.write(GICD_IPRIORITY + irq, 0xa0a0_a0a0);
              }
  
+-            // Enable IRQ group 0 and group 1 non-secure distribution
+-            self.write(GICD_CTLR, 0x3);
 +            // Mark all SPIs as non-secure Group 1 interrupts. On a single
 +            // security state GIC these registers are RAZ/WI, but where
 +            // firmware left SPIs in Group 0 they are signalled as FIQ (to
@@ -53,6 +57,14 @@ index a89befc1..b2636c45 100644
 +                self.write(GICD_IROUTER + irq * 8, 0);
 +            }
 +
-             // Enable IRQ group 0 and group 1 non-secure distribution
-             self.write(GICD_CTLR, 0x3);
++            // Enable IRQ group 0 and group 1 non-secure distribution.
++            // Read-modify-write: GICD_CTLR holds firmware-owned mode bits
++            // (e.g. ARE for affinity routing on GICv3/GIC-500); overwriting
++            // the whole register with 0x3 dropped them and left Group 1 SPIs
++            // pending at the distributor forever.
++            let ctlr = self.read(GICD_CTLR);
++            self.write(GICD_CTLR, ctlr | 0x3);
++            info!("gic: GICD_CTLR {:#x} -> {:#x}", ctlr, ctlr | 0x3);
          }
+     }
+ 
