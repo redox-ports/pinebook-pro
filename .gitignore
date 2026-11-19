@@ -1,0 +1,13 @@
+# Redox build outputs
+/build/
+*.img
+*.img.zst
+*.iso
+
+# Redox build system local config (generated, never committed)
+.config
+
+# Tooling
+/work/
+*.swp
+.DS_Store
