@@ -91,12 +91,15 @@ fix(ci): prune runner disk before redox build
   bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
-- **Redox bring-up status (2026-11-20, experiment 4):** the kernel boots to initfs
+- **Redox bring-up status (2026-11-20, experiments 4–5):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
   the panel). Root RedoxFS mount is blocked: no microSD (DW MMC) driver, so `init` cannot
   switchroot. `pcid` panics on aarch64 (PCI 3.0 port-I/O fallback is `todo!()`); secondary
-  CPUs stay offline (GICv3 `init_ap` gap); RK808 RTC/entropy drivers missing.
+  CPUs stay offline (GICv3 `init_ap` gap); RK808 RTC/entropy drivers missing. Interim
+  console: `patches/base-initfs-debug-console.patch` adds the `debugsh` initfs daemon
+  (kernel debug scheme over UART) and gates `pcid-spawner` to x86 — on-device run pending
+  (experiment 5).
 
 ### Target SD image layout (produced by our repack)
 
