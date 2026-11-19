@@ -1,11 +1,14 @@
 # Experiment 5 — Interim serial console (`debugsh`) in the initfs phase
 
-**Status:** iteration 3 (diagnostics) ready to flash (2026-11-20). Iteration 1: banner+prompt
-OK, no input, `pcid` panic. Iteration 2: `pcid` panic and the `IER=0` bug are gone, **still
-no input**. **The board reboots by itself** after `init: switchroot to /usr /etc` (device
-owner confirmed: no manual reset). Iteration 3 instruments the UART and GICv3 distributor
-state and adds the Group 1 SPI routing, plus a U-Boot-side watchdog check.
-**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `patches/debug/kernel-serial-irq-dump.patch`
+**Status:** iteration 5 ready to flash (2026-11-20). Iteration 4 (tick dumps) proved
+bytes physically reach the UART2 FIFO (`LSR` bit 0 set while typing) and the SPI is
+grouped/enabled — yet stays **pending at the distributor forever** (ISPENDR4 bit set,
+zero `debug: irq`). Root cause: nobody programmed `GICD_IROUTER` — with affinity
+routing an SPI whose routing entry does not select a running CPU is never forwarded.
+Iteration 5 routes every SPI to the boot CPU. Also: the earlier "spontaneous reboot"
+turned out to be two separate capture files glued together (raw logs show no reset —
+closed in README risk #11); the DW watchdog check in U-Boot found it disarmed.
+**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `patches/debug/kernel-serial-irq-dump.patch`, `scripts/github-mirrors.sh`
 
 ## Iteration 1 results (2026-11-20)
 
@@ -53,7 +56,7 @@ Hypotheses for the missing input, to be distinguished by iteration 3:
    or ISENABLER not set);
 3. the UART receives no bytes at all (pinmux/RX wiring in this boot stage).
 
-## Iteration 3 — actions (diagnostics)
+## Iteration 3 — diagnostics build and results (2026-11-20)
 
 Kernel changes in this build:
 
@@ -64,26 +67,78 @@ Kernel changes in this build:
   `IER/IIR/MCR/LSR/MSR` and GICD `CTLR/IGROUPR4/ISENABLER4/ISPENDR4/ICFGR8` at
   serial-init and on the first three serial interrupts.
 
-Device-owner steps:
+Capture (`logs/serial-20261120-013658.log`) printed:
 
-1. Flash the new image and capture a normal boot; type a few keys at the `debugsh>`
-   prompt.
-2. Power-cycle, and at `Hit any key to stop autoboot` press a key to stop U-Boot:
-   - if the key press does not stop autoboot, UART RX is dead already in U-Boot;
-   - else wait 3–4 minutes at the prompt: if the board resets by itself, the
-     watchdog is armed before the OS (confirm the hypothesis);
-   - also run `md 0xff830000 8` twice (DW watchdog registers: CR/TORR/CCVR/CRR/…; a
-     counting `CCVR` or `CR` bit 0 means the watchdog is armed).
+```
+debug: init uart ier=0x1 iir=0xc1 mcr=0x3 lsr=0x0 msr=0x0
+debug: init gicd ctlr=0x3 igroupr4=0xffffffff isenabler4=0x10 ispender4=0x0 icfgr8=0x55555555
+```
 
-What to look for in the capture:
+- `IER=0x1`: receive interrupt enabled in the UART;
+- `MCR=0x3`: loopback off (OUT1/OUT2 cleared by the temporary marker helper, which
+  does not affect interrupts on this UART);
+- `ISENABLER4=0x10`: IRQ 132 enabled in the GIC; `IGROUPR4=0xffffffff`: all SPIs
+  are Group 1 non-secure; `ICFGR8=0x55555555`: level-triggered, as in the DT;
+- **no `debug: irq` lines** after typing at the `debugsh>` prompt.
 
-| Line                                   | Meaning                                                  |
-| -------------------------------------- | -------------------------------------------------------- |
-| `debug: init uart ier=0x1 mcr=0xf ...` | IER/MCR are correct after serial init                    |
-| `debug: init gicd ... isenabler4=...`  | bit 4 of `isenabler4` set (IRQ 132 enabled)              |
-| `debug: irq ...` lines                 | the UART interrupt does fire when keys are typed         |
-| `igroupr4` bits                        | SPI group routing (bit 4 = IRQ 132)                      |
-| no `debug: irq` at all                 | either RX data never arrives or the SPI is not delivered |
+Conclusion: configuration is correct on both sides; the UART never raises the
+receive interrupt. Likely cause: `uart_16550::init()` sets `FCR=0xC7`, i.e. a
+**14-byte receive FIFO trigger** — one keystroke never reaches 14 bytes, and this
+UART does not provide a usable character-timeout interrupt (the Linux `8250`
+driver uses a one-character trigger for exactly this reason).
+
+## Iteration 4 — FIFO threshold fix, tick dumps, results (2026-11-20)
+
+Changes:
+
+- `patches/kernel-uart-16550-rx-irq.patch`: `FCR` now `0x07` (one-character receive
+  threshold) — single keystrokes must raise a receive interrupt.
+- `patches/debug/kernel-serial-irq-dump.patch`: additionally dumps the UART/GIC state
+  every ~2 s from the timer interrupt (tag `tick`), so it is visible whether bytes
+  physically arrive (`LSR` bit 0) even if the receive interrupt still does not fire.
+
+Capture: `logs/serial-20261120-015309.log`. Both changes worked; typed bytes are now
+observable:
+
+- before typing: `tick ... iir=0xc1 lsr=0x60` (THRE|TEMT, FIFO empty), `ispender4=0x0`;
+- after typing: `tick ... iir=0xc4 lsr=0x61` (bit 0 = **data in RX FIFO**),
+  `ispender4=0x10` — **SPI 100 pending at the distributor**;
+- still zero `debug: irq` lines: the interrupt never reaches the CPU.
+
+Conclusion: UART fine (data arrives, interrupt raised), GIC distributor fine
+(pending registered) — delivery to the CPU fails. `GicDistIf::init()` never writes
+`GICD_IROUTER`; with GICv3 affinity routing an SPI routed to a non-running peer is
+held pending indefinitely. Fixed in `patches/kernel-gicv3-spi-group1.patch`:
+`IROUTER<n> = 0` (boot CPU, affinity 0.0.0.0) for every SPI (this iteration). The
+tick dump was extended with `typer`, `irouter132`, `gicr_waker` for confirmation.
+
+Also closed this iteration:
+
+- **No spontaneous reboot.** The raw capture files (`logs/serial-20261120-013658.log`,
+  `014830.log`) end with `picocom Terminating` and contain no second boot and no
+  reset: the "reboot loops" seen earlier were two separate capture sessions glued
+  together in chat. README risk #11 resolved; the U-Boot `md 0xff830000` check
+  confirmed the DW watchdog is disarmed (`CR` bit 0 = 0, `CCVR` static).
+
+## Build-tree note: GitHub mirrors
+
+Repeated `repo cook` runs stalled fetching recipe sources from gitlab.redox-os.org.
+`scripts/github-mirrors.sh` retargets the mirrored recipe repos (12 of 14; `base`
+and `ca-certificates` have no mirror and stay on GitLab) to github.com/redox-os/*
+(same commit SHAs, official mirrors); `bootstrap-redox.sh` calls it automatically.
+Notably the GitHub kernel mirror sits at `719e8f5c` — exactly the base of our
+patches — while GitLab had moved ahead to `d698f668`.
+
+## Iteration 5 — actions
+
+Flash the image rebuilt at 02:04 (IROUTER fix + extended tick dump). Expected:
+
+- typing echoes immediately; `debug: irq` lines appear on the first three keystrokes
+  (irouter132=0x0, gicr_waker shows an awake redistributor);
+- then the console is fully usable: `help`, `ls /scheme`, `cat`, `exec hwd`;
+- afterwards remove the temporary instrumentation and proceed to the DW MMC storage
+  driver (the real Phase 4 blocker).
+
 
 ## Goal
 
