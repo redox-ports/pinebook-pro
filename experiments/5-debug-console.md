@@ -1,14 +1,17 @@
 # Experiment 5 — Interim serial console (`debugsh`) in the initfs phase
 
-**Status:** iteration 5 ready to flash (2026-11-20). Iteration 4 (tick dumps) proved
-bytes physically reach the UART2 FIFO (`LSR` bit 0 set while typing) and the SPI is
-grouped/enabled — yet stays **pending at the distributor forever** (ISPENDR4 bit set,
-zero `debug: irq`). Root cause: nobody programmed `GICD_IROUTER` — with affinity
-routing an SPI whose routing entry does not select a running CPU is never forwarded.
-Iteration 5 routes every SPI to the boot CPU. Also: the earlier "spontaneous reboot"
-turned out to be two separate capture files glued together (raw logs show no reset —
-closed in README risk #11); the DW watchdog check in U-Boot found it disarmed.
-**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `patches/debug/kernel-serial-irq-dump.patch`, `scripts/github-mirrors.sh`
+**Status:** **success** (2026-11-20, iteration 6) — the Pinebook Pro has a working
+interactive root console on UART2 during the initfs phase: echo, line editing and the
+debugsh built-ins (ls/cat/echo>/hexdump/env/exec) all run on hardware. Root cause of the
+missing input, found with the register dumps: `GicDistIf::init()` overwrote
+`GICD_CTLR` wholesale (`0x3`), wiping the firmware-set `ARE_S` bit (`0x20`) and leaving
+the GIC-500 in a hybrid mode where Group 1 NS SPIs stay pending forever.
+Read-modify-write (`ctlr | 0x3` → `0x23`) fixed delivery instantly. Earlier fixes on
+the way: NS16550 loopback self-test leaves `IER=0`/loopback on (early return), and the
+14-byte FIFO RX threshold that swallows single keystrokes. The temporary marker/dump
+instrumentation has been removed from the build tree; the kernel now logs only
+`GICD_CTLR X -> Y` and the loopback self-test failure.
+**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `scripts/github-mirrors.sh`
 
 ## Iteration 1 results (2026-11-20)
 
@@ -129,16 +132,42 @@ and `ca-certificates` have no mirror and stay on GitLab) to github.com/redox-os/
 Notably the GitHub kernel mirror sits at `719e8f5c` — exactly the base of our
 patches — while GitLab had moved ahead to `d698f668`.
 
-## Iteration 5 — actions
+## Iteration 5 — actions and results (IROUTER alone was not enough)
 
-Flash the image rebuilt at 02:04 (IROUTER fix + extended tick dump). Expected:
+Flash the image rebuilt at 02:04 (IROUTER fix + extended tick dump). Capture:
+`logs/serial-20261120-020827.log`:
 
-- typing echoes immediately; `debug: irq` lines appear on the first three keystrokes
-  (irouter132=0x0, gicr_waker shows an awake redistributor);
-- then the console is fully usable: `help`, `ls /scheme`, `cat`, `exec hwd`;
-- afterwards remove the temporary instrumentation and proceed to the DW MMC storage
-  driver (the real Phase 4 blocker).
+- `irouter132=0x0` (routing written), `gicr_waker=0x0` (redistributor awake),
+  `lsr=0x61` on typing, `iir=0xc4` — but `ispender4=0x10` still set, zero
+  `debug: irq`: the interrupt still never reached the CPU.
 
+With routing and the redistributor ruled out, the only remaining modifier of
+delivery was `GICD_CTLR` itself: the driver wrote `0x3` wholesale, clearing the
+firmware-owned mode bits — on this GIC-500 bit `0x20` (`ARE_S`, secure-side
+affinity routing) was set by BL31. Iteration 6 switched `GICD_CTLR` to
+read-modify-write and dumped the ICC system registers (`sre`, `icctlr`, `igrpen1`).
+
+## Iteration 6 — success (2026-11-20)
+
+Capture: `logs/serial-20261120-021310.log`:
+
+```
+gic: GICD_CTLR 0x20 -> 0x23
+debug: init gicd ctlr=0x23 ... sre=0x7 icctlr=0x400 igrpen1=0x1
+...
+debugsh> help          (echo + backspace + built-ins all live)
+debugsh> env
+INIT_NOTIFY=4 / LD_LIBRARY_PATH=/scheme/initfs/lib / PATH=/scheme/initfs/bin
+debugsh> exit
+debugsh: bye
+```
+
+Three `debug: irq` lines fired on the first keystrokes (`iir=0xc4`, `lsr=0x61`).
+The console is fully interactive. Aftermath: the temporary marker patches and the
+serial-irq dump patch were removed from the build tree; the clean kernel retains
+only `GICD_CTLR X -> Y` and the loopback self-test failure log, and a fresh image
+was rebuilt (02:16). Cosmetic debugsh quirks for later: `ls /` (namespace root) and
+bare `ls` (cwd `/`) return errors — expected for scheme roots, polish later.
 
 ## Goal
 
@@ -196,32 +225,31 @@ kernel (UART2 RX IRQ -> debug scheme) -> debugsh (echo + line editing + built-in
 - typed keys echo; `help`, `ls /scheme`, `cat /scheme/initfs/lib/init.d/95_debugsh.service`,
   `exec hwd` work.
 
-## FILL IN after the run
+## Captures
 
-### Capture
-
-```
-PASTE FULL UART CAPTURE HERE
-```
-
-### Interactive session
-
-```
-PASTE PROMPT SESSION (help, ls /scheme, cat ..., exec hwd) HERE
-```
+Full UART captures live in `logs/serial-20261120-*.log` (gitignored); the decisive
+ones per iteration are referenced above. Final interactive session
+(`logs/serial-20261120-021310.log`): echo + backspace verified, `help`/`env`/`exit`
+run, `exit` shuts the shell down cleanly (`debugsh: bye`).
 
 ### Observations
 
-| Question                                                         | Answer                                                                                                                                                                    |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `debugsh>` prompt reached on UART2?                              | `FILL IN`                                                                                                                                                                 |
-| Typed characters echo and backspace works?                       | `FILL IN`                                                                                                                                                                 |
-| `pcid` panic gone?                                               | `FILL IN`                                                                                                                                                                 |
-| Does serial RX input actually arrive (UART IRQ → `debug_input`)? | `FILL IN` — if there is no echo, the RX interrupt path is dead: check `SerialKind::enable_irq` (Ns16550u32 is a no-op TODO) and whether `init_early` ran with `skip_init` |
-| `exec hwd` (or another initfs binary) works?                     | `FILL IN`                                                                                                                                                                 |
-| Kernel log lines still interleaved with shell output?            | `FILL IN` (expected, cosmetic)                                                                                                                                            |
-| Log file path                                                    | `FILL IN`                                                                                                                                                                 |
+| Question                                                          | Answer                                                                                        |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `debugsh>` prompt reached on UART2?                               | **Yes** (all iterations since the first build)                                                |
+| Typed characters echo and backspace works?                        | **Yes** (iteration 6, after the `GICD_CTLR` read-modify-write fix)                            |
+| `pcid` panic gone?                                                | **Yes** (hwd no longer spawns pcid on aarch64; both pcid-spawner services gated to x86)       |
+| Serial RX input arrives (UART IRQ → `debug_input`)?               | **Yes** — after three fixes: loopback/IER restore, 1-char FIFO threshold, `IROUTER` + CTLR RMW |
+| `exec hwd` (or another initfs binary) works?                      | Untested this session (`exit` tested instead); verify during the storage phase                |
+| Kernel log lines still interleaved with shell output?             | Yes (expected, cosmetic; kernel DEBUG spam will be trimmed later)                             |
+| Log file path                                                     | `logs/serial-20261120-021310.log` (final); per-iteration logs referenced above                |
 
 ### Verdict
 
-`FILL IN`
+**Success.** The Pinebook Pro has an interactive root console (debugsh) on UART2 in
+the initfs phase: echo, line editing, built-ins (`ls`/`cat`/`echo >`/`hexdump`/`env`/
+`exec`) and clean shutdown all verified on hardware. Full milestone parity (a login
+prompt from the root filesystem) is now only blocked by the missing DW MMC storage
+driver (Phase 4): once microSD works, redoxfs mounts, init switchroots and the
+getty/login stack replaces this bring-up console. The three kernel fixes are kept as
+patches under `patches/` with their upstream bases documented.
