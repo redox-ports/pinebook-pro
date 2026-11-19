@@ -497,7 +497,7 @@ userspace bits (`pcid`).
 2. **Interim console:** disable or fix `pcid` (its aarch64 fallback is `todo!()`), and
    either add `getty` + `login` + a shell to the initfs or make init drop to a debug
    shell when the root mount fails — useful for poking at schemes before storage
-   exists.
+   exists. **Done via the `debugsh` initfs daemon; see experiment 5.**
 3. **Confirm the repeat:** check whether the board reboots by itself after
    `switchroot to /usr /etc` fails (boot loop) or the capture contains a manual power
    cycle.
