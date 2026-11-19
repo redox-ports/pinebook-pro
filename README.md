@@ -256,7 +256,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [x] Kernel entered at EL1, DTB discovered (`DTB_ADDR` env honored), UART bound (`snps,dw-apb-uart`, virq 132)
 - [x] GICv3 (GIC-500) + generic timer initialized (`architected timer virq = 27`)
 - [x] Kernel reaches initfs and starts userspace (`init`, drivers, `vesad` 1920x1080 framebuffer)
-- [x] Interim serial console without storage: `debugsh` initfs daemon on the kernel debug scheme (`patches/base-initfs-debug-console.patch`, experiment 5) — pending on-device confirmation
+- [x] Interim serial console without storage: `debugsh` initfs daemon on the kernel debug scheme (`patches/base-initfs-debug-console.patch`, experiment 5) — banner + prompt confirmed on device; input requires `patches/kernel-uart-16550-rx-irq.patch` (iteration 2 pending)
 - [ ] Serial login prompt — blocked on storage: the root RedoxFS mount needs a microSD DW MMC driver
 
 ### Phase 4 — Storage, input, display
