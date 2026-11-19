@@ -1,0 +1,86 @@
+# redox-os/kernel @ 719e8f5c: keep NS16550 usable when the loopback self-test fails
+#
+# Target repository : https://gitlab.redox-os.org/redox-os/kernel.git
+# Base commit       : 719e8f5c (master, 2026-11)
+# Reason            : RK3399 UART2 (snps,dw-apb-uart, Pinebook Pro console,
+#                     experiment 5). uart_16550::init() performs a loopback
+#                     self-test that fails on this board; the early `return
+#                     Err(())` skipped the final `modem_ctrl = 0x0F` /
+#                     `int_en = 0x01` writes, leaving the port with loopback
+#                     enabled (no output without external re-init) and the
+#                     receive interrupt disabled (no serial input, so the
+#                     initfs debugsh console could not read keystrokes).
+#                     The patch records the test outcome instead of returning
+#                     early, so DTR/RTS/OUT1/OUT2 and IER are always restored
+#                     even when the self-test fails, and implements
+#                     SerialKind::enable_irq for the NS16550 variants (it was
+#                     a documented TODO no-op).
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/devices/serial.rs b/src/devices/serial.rs
+index 1b3435dc..5a2e0bbe 100644
+--- a/src/devices/serial.rs
++++ b/src/devices/serial.rs
+@@ -31,13 +31,12 @@ impl SerialKind {
+ 
+     #[cfg(target_arch = "aarch64")]
+     pub fn enable_irq(&mut self) {
+-        //TODO: implement for NS16550
+         match self {
+             Self::NotPresent => {}
+             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+-            Self::Ns16550Pio(_) => {}
+-            Self::Ns16550u8(_) => {}
+-            Self::Ns16550u32(_) => {}
++            Self::Ns16550Pio(inner) => inner.enable_irq(),
++            Self::Ns16550u8(inner) => inner.enable_irq(),
++            Self::Ns16550u32(inner) => inner.enable_irq(),
+             Self::Meson(inner) => inner.enable_irq(),
+             Self::Pl011(inner) => inner.enable_irq(),
+         }
+diff --git a/src/devices/uart_16550.rs b/src/devices/uart_16550.rs
+index cc0a26c1..a9fff921 100644
+--- a/src/devices/uart_16550.rs
++++ b/src/devices/uart_16550.rs
+@@ -111,6 +111,7 @@ where
+             // Enable loopback
+             self.modem_ctrl.write(0x1E.into());
+             // Perform loopback test with even/odd pattern
++            let mut loopback_ok = true;
+             for &byte in &[0x55, 0xAA] {
+                 // Write loopback byte
+                 self.data.write(byte.into());
+@@ -125,19 +126,31 @@ where
+                 // Read loopback byte
+                 let loopback = self.data.read();
+                 if loopback != byte.into() {
+-                    return Err(());
++                    loopback_ok = false;
+                 }
+             }
+ 
+-            // Enable DTR, RTS, OUT1, and OUT2, disable loopback
++            // Enable DTR, RTS, OUT1, and OUT2, disable loopback. Restore the
++            // modem/interrupt registers even when the self-test failed:
++            // bailing out early left the port with loopback enabled and the
++            // receive interrupt disabled, silencing both output and input.
+             self.modem_ctrl.write(0x0F.into());
+             // Enable receive interrupt
+             self.int_en.write(0x01.into());
++
++            if !loopback_ok {
++                return Err(());
++            }
+         }
+ 
+         Ok(())
+     }
+ 
++    /// Enable the received-data-available interrupt.
++    pub fn enable_irq(&mut self) {
++        self.int_en.write(0x01.into());
++    }
++
+     fn line_sts(&self) -> LineStsFlags {
+         LineStsFlags::from_bits_truncate(
+             (self.line_sts.read() & 0xFF.into()).try_into().unwrap_or(0),

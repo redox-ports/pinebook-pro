@@ -18,10 +18,13 @@
 #   * Cargo.toml, Cargo.lock    workspace member + lock entry
 #   * init.initfs.d/95_debugsh.service        service (aarch64 only)
 #   * init.initfs.d/90_initfs.target          start it with the initfs target
+#   * drivers/hwd/src/main.rs   do not spawn `pcid` from hwd on aarch64:
+#     hwd spawns pcid directly (bypassing init services), and pcid panics on
+#     aarch64 (no PCI configuration space access, experiment 4/5)
 #   * init.initfs.d/40_pcid-spawner-initfs.service, init.d/00_pcid-spawner.service:
 #     gate pcid-spawner to x86/x86_64: pcid's PCI 3.0 configuration-space
-#     fallback is `todo!()` on aarch64 and panics (experiment 4). Rootfs-phase
-#     service gated now so boot does not regress once storage works.
+#     fallback is `todo!()` on aarch64 and panics. Rootfs-phase service gated
+#     now so boot does not regress once storage works.
 #
 # Apply from recipes/core/base/source:  git apply <this file>
 diff --git a/Cargo.lock b/Cargo.lock
@@ -68,6 +71,24 @@ index 6c2970fe..7e9f4e09 100644
  	pcid pcid-spawner rtcd vesad
  INITFS_DRIVERS_BINS = nvmed virtio-blkd virtio-gpud
  BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
+diff --git a/drivers/hwd/src/main.rs b/drivers/hwd/src/main.rs
+index 79360e34..e6e7f53c 100644
+--- a/drivers/hwd/src/main.rs
++++ b/drivers/hwd/src/main.rs
+@@ -37,8 +37,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+ 
+     //TODO: launch pcid based on backend information?
+     // Must launch after acpid but before probe calls /scheme/acpi/symbols
+-    #[allow(deprecated, reason = "we can't yet move this to init")]
+-    daemon::Daemon::spawn(process::Command::new("pcid"));
++    // pcid has no PCI configuration space access on aarch64 yet and panics.
++    if !cfg!(target_arch = "aarch64") {
++        #[allow(deprecated, reason = "we can't yet move this to init")]
++        daemon::Daemon::spawn(process::Command::new("pcid"));
++    }
+ 
+     daemon.ready();
+ 
 diff --git a/init.d/00_pcid-spawner.service b/init.d/00_pcid-spawner.service
 index 8ba6fc6c..65768d55 100644
 --- a/init.d/00_pcid-spawner.service
