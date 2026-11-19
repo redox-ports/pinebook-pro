@@ -1,13 +1,29 @@
 # TEMPORARY bring-up instrumentation (experiment 5), do not upstream
 #
-# Prints the RK3399 UART2 (0xff1a0000) register state and the GICv3
-# distributor state for SPI 100 at serial-init time and on the first three
-# serial interrupts, to find out why the console receives no keystrokes.
+# Prints the RK3399 UART2 (0xff1a0000) register state (IER/IIR/MCR/LSR/MSR)
+# and the GICv3 state for SPI 100 (CTLR/TYPER/IGROUPR4/ISENABLER4/ISPENDR4/
+# ICFGR8/IROUTER132 plus the boot CPU's GICR_WAKER):
+#   * at serial-init time,
+#   * on the first three serial interrupts,
+#   * every ~2 s from the timer interrupt (tag "tick"), so bytes arriving in
+#     the RX FIFO are visible even when no receive interrupt fires.
 #
 # Apply from src (repo root):  git apply <this file>  (after
 # patches/kernel-inherited-interrupt-parent.patch)
+diff --git a/src/arch/aarch64/device/generic_timer.rs b/src/arch/aarch64/device/generic_timer.rs
+index 4eeec257..0ea5fb08 100644
+--- a/src/arch/aarch64/device/generic_timer.rs
++++ b/src/arch/aarch64/device/generic_timer.rs
+@@ -217,6 +217,7 @@ pub(crate) fn handle(hwirq: u32, raw_iar: u32, token: &mut CleanLockToken) -> bo
+     program_current(config);
+ 
+     if cpu_id == crate::cpu_set::LogicalCpuId::BSP {
++        super::serial::debug_tick();
+         timeout::trigger(token);
+ 
+         if let Ok(irq) = u8::try_from(config.virq) {
 diff --git a/src/arch/aarch64/device/serial.rs b/src/arch/aarch64/device/serial.rs
-index 122c5411..30a8bf39 100644
+index 122c5411..b5423b5b 100644
 --- a/src/arch/aarch64/device/serial.rs
 +++ b/src/arch/aarch64/device/serial.rs
 @@ -1,4 +1,5 @@
@@ -16,7 +32,7 @@ index 122c5411..30a8bf39 100644
  
  pub use crate::dtb::serial::COM1;
  use crate::{
-@@ -12,10 +13,50 @@ use crate::{
+@@ -12,10 +13,66 @@ use crate::{
      sync::CleanLockToken,
  };
  
@@ -24,6 +40,7 @@ index 122c5411..30a8bf39 100644
 +/// GIC distributor state relevant to the RK3399 serial interrupt.
 +const DEBUG_UART: usize = 0xFFFF_8000_FF1A_0000;
 +const DEBUG_GICD: usize = 0xFFFF_8000_FEE0_0000;
++const DEBUG_GICR: usize = 0xFFFF_8000_FEF0_0000;
 +
 +static COM1_IRQ_FIRES: AtomicU32 = AtomicU32::new(0);
 +
@@ -43,16 +60,31 @@ index 122c5411..30a8bf39 100644
 +            debug_read(DEBUG_UART + 0x18),
 +        );
 +        // hwirq 132 (SPI 100): igroupr word 4, isenabler word 4, ispender word
-+        // 4, icfgr register 8 (irqs 128..143).
++        // 4, icfgr register 8 (irqs 128..143); irouter132 for affinity
++        // routing; GICR_WAKER of the boot CPU redistributor.
 +        info!(
-+            "debug: {} gicd ctlr={:#x} igroupr4={:#x} isenabler4={:#x} ispender4={:#x} icfgr8={:#x}",
++            "debug: {} gicd ctlr={:#x} typer={:#x} igroupr4={:#x} isenabler4={:#x} ispender4={:#x} icfgr8={:#x} irouter132={:#x} gicr_waker={:#x}",
 +            tag,
 +            debug_read(DEBUG_GICD + 0x0000),
++            debug_read(DEBUG_GICD + 0x0004),
 +            debug_read(DEBUG_GICD + 0x0090),
 +            debug_read(DEBUG_GICD + 0x0110),
 +            debug_read(DEBUG_GICD + 0x0210),
 +            debug_read(DEBUG_GICD + 0x0C20),
++            debug_read(DEBUG_GICD + 0x6100 + 132 * 8),
++            debug_read(DEBUG_GICR + 0x0014),
 +        );
++    }
++}
++
++static DEBUG_TICKS: AtomicU32 = AtomicU32::new(0);
++
++/// TEMPORARY: called from the timer interrupt; every ~2 s print the UART
++/// state, so received bytes are visible even when no receive interrupt fires.
++pub(crate) fn debug_tick() {
++    let ticks = DEBUG_TICKS.fetch_add(1, Ordering::Relaxed);
++    if ticks % 200 == 1 {
++        unsafe { debug_dump_state("tick") }
 +    }
 +}
 +
@@ -67,7 +99,7 @@ index 122c5411..30a8bf39 100644
          COM1.lock().receive(token);
          unsafe {
              // FIXME add_irq accepts a u8 as irq number
-@@ -59,6 +100,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+@@ -59,6 +116,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
          register_irq(virq as u32, Box::new(Com1Irq {}));
          COM1.lock().enable_irq();
          IRQ_CHIP.irq_enable(virq as u32);
