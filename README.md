@@ -256,8 +256,8 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [x] Kernel entered at EL1, DTB discovered (`DTB_ADDR` env honored), UART bound (`snps,dw-apb-uart`, virq 132)
 - [x] GICv3 (GIC-500) + generic timer initialized (`architected timer virq = 27`)
 - [x] Kernel reaches initfs and starts userspace (`init`, drivers, `vesad` 1920x1080 framebuffer)
-- [x] Interim serial console without storage: `debugsh` initfs daemon on the kernel debug scheme (`patches/base-initfs-debug-console.patch`, experiment 5) — banner + prompt confirmed on device; bytes reach the FIFO and the SPI pends at the GIC; IROUTER delivery fix pending on-device confirmation (experiment 5, iteration 5)
-- [ ] Serial login prompt — blocked on storage: the root RedoxFS mount needs a microSD DW MMC driver
+- [x] Interactive serial console without storage: `debugsh` on the kernel debug scheme (experiment 5) — echo/line-editing/built-ins verified on hardware; kernel fixes in `patches/` (NS16550 rx, GICv3 SPI delivery)
+- [ ] Serial login prompt from the rootfs (getty/login) — blocked on storage: the root RedoxFS mount needs a microSD DW MMC driver; the initfs console above is the interim replacement
 
 ### Phase 4 — Storage, input, display
 

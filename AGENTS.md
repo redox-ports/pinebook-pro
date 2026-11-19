@@ -95,11 +95,16 @@ fix(ci): prune runner disk before redox build
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
   the panel). Root RedoxFS mount is blocked: no microSD (DW MMC) driver, so `init` cannot
-  switchroot. `pcid` panics on aarch64 (PCI 3.0 port-I/O fallback is `todo!()`); secondary
-  CPUs stay offline (GICv3 `init_ap` gap); RK808 RTC/entropy drivers missing. Interim
-  console: `patches/base-initfs-debug-console.patch` adds the `debugsh` initfs daemon
-  (kernel debug scheme over UART) and gates `pcid-spawner` to x86 — on-device run pending
-  (experiment 5).
+  switchroot; the system then idles with the interim console (no reboot loop — risk #11
+  resolved). **Interactive root console on UART2 works (experiment 5):** `debugsh`
+  initfs daemon (echo, line editing, ls/cat/echo>/hexdump/env/exec) verified on
+  hardware. Kernel fixes kept under `patches/`: NS16550 rx path (loopback self-test
+  left IER=0 + 14-byte FIFO threshold swallowed keystrokes), GICv3 SPI delivery
+  (`GICD_IGROUPR`/`IROUTER` never programmed; `GICD_CTLR` overwrite wiped the
+  firmware `ARE_S` bit — SPIs pended forever), `pcid` gated to x86 (its aarch64 PCI
+  fallback panics; `hwd` spawned it directly). Secondary CPUs stay offline (GICv3
+  `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
+  instrumentation removed, clean image rebuilt.
 
 ### Target SD image layout (produced by our repack)
 

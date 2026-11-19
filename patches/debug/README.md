@@ -1,14 +1,17 @@
 # Debug instrumentation patches (temporary)
 
-These patches are **not** part of the deliverable. They exist to locate the
+These patches are **not** part of the deliverable. They were used to locate the
 first silent hang of the Redox kernel on the Pinebook Pro (experiment 4) and the
-missing serial-console input (experiment 5).
+missing serial-console input (experiment 5). They are **not applied** to the build
+tree anymore: the underlying issues are fixed (experiment 5, iteration 6), the
+kernel logs `GICD_CTLR X -> Y` and the loopback self-test failure on its own, and a
+clean image was rebuilt. Re-apply if a future bring-up needs them.
 
-| Patch                             | Target repo           | Base commit (local clone) |
-| --------------------------------- | --------------------- | ------------------------- |
-| `kernel-early-uart-markers.patch` | `redox-os/kernel`     | `719e8f5c`                |
-| `bootloader-uart-markers.patch`   | `redox-os/bootloader` | `f3d9261`                 |
-| `kernel-serial-irq-dump.patch`    | `redox-os/kernel`     | `719e8f5c`                |
+| Patch                             | Target repo           | Base commit (local clone) | Status            |
+| --------------------------------- | --------------------- | ------------------------- | ----------------- |
+| `kernel-early-uart-markers.patch` | `redox-os/kernel`     | `719e8f5c`                | removed from tree |
+| `bootloader-uart-markers.patch`   | `redox-os/bootloader` | `f3d9261`                 | removed from tree |
+| `kernel-serial-irq-dump.patch`    | `redox-os/kernel`     | `719e8f5c`                | removed from tree |
 
 ## What they do
 
