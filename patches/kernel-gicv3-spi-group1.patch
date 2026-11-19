@@ -1,0 +1,42 @@
+# redox-os/kernel @ 719e8f5c: route all GICv3 SPIs as non-secure Group 1
+#
+# Target repository : https://gitlab.redox-os.org/redox-os/kernel.git
+# Base commit       : 719e8f5c (master, 2026-11)
+# Reason            : GicDistIf::init() never programs GICD_IGROUPR. On a
+#                     GICv3 where firmware left SPIs in Group 0, the
+#                     distributor signals them as FIQ (to EL3, or unhandled
+#                     at EL1) instead of IRQ, so non-secure drivers never see
+#                     their interrupts (Pinebook Pro serial console bring-up,
+#                     experiment 5). Mark every SPI as non-secure Group 1
+#                     before enabling the distributor. Harmless on a
+#                     single-security-state GIC (the registers are RAZ/WI).
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/arch/aarch64/device/irqchip/gic.rs b/src/arch/aarch64/device/irqchip/gic.rs
+index a89befc1..5033fd2c 100644
+--- a/src/arch/aarch64/device/irqchip/gic.rs
++++ b/src/arch/aarch64/device/irqchip/gic.rs
+@@ -23,6 +23,7 @@ static GICD_ICPENDR: u32 = 0x280;
+ static GICD_ICACTIVER: u32 = 0x380;
+ static GICD_IPRIORITY: u32 = 0x400;
+ static GICD_ITARGETSR: u32 = 0x800;
++static GICD_IGROUPR: u32 = 0x080;
+ static GICD_ICFGR: u32 = 0xc00;
+ static GICD_SGIR: u32 = 0xf00;
+ 
+@@ -351,6 +352,15 @@ impl GicDistIf {
+                 self.write(GICD_IPRIORITY + irq, 0xa0a0_a0a0);
+             }
+ 
++            // Mark all SPIs as non-secure Group 1 interrupts. On a single
++            // security state GIC these registers are RAZ/WI, but where
++            // firmware left SPIs in Group 0 they are signalled as FIQ (to
++            // EL3, or unhandled at EL1) instead of IRQ, so no non-secure
++            // driver would ever observe them.
++            for irq in (32..self.nirqs).step_by(32) {
++                self.write(GICD_IGROUPR + ((irq / 32) * 4), 0xffff_ffff);
++            }
++
+             // Enable IRQ group 0 and group 1 non-secure distribution
+             self.write(GICD_CTLR, 0x3);
+         }

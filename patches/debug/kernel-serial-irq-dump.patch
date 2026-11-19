@@ -1,0 +1,77 @@
+# TEMPORARY bring-up instrumentation (experiment 5), do not upstream
+#
+# Prints the RK3399 UART2 (0xff1a0000) register state and the GICv3
+# distributor state for SPI 100 at serial-init time and on the first three
+# serial interrupts, to find out why the console receives no keystrokes.
+#
+# Apply from src (repo root):  git apply <this file>  (after
+# patches/kernel-inherited-interrupt-parent.patch)
+diff --git a/src/arch/aarch64/device/serial.rs b/src/arch/aarch64/device/serial.rs
+index 122c5411..30a8bf39 100644
+--- a/src/arch/aarch64/device/serial.rs
++++ b/src/arch/aarch64/device/serial.rs
+@@ -1,4 +1,5 @@
+ use alloc::boxed::Box;
++use core::sync::atomic::{AtomicU32, Ordering};
+ 
+ pub use crate::dtb::serial::COM1;
+ use crate::{
+@@ -12,10 +13,50 @@ use crate::{
+     sync::CleanLockToken,
+ };
+ 
++/// TEMPORARY bring-up instrumentation (experiment 5): print the UART and
++/// GIC distributor state relevant to the RK3399 serial interrupt.
++const DEBUG_UART: usize = 0xFFFF_8000_FF1A_0000;
++const DEBUG_GICD: usize = 0xFFFF_8000_FEE0_0000;
++
++static COM1_IRQ_FIRES: AtomicU32 = AtomicU32::new(0);
++
++unsafe fn debug_read(addr: usize) -> u32 {
++    unsafe { (addr as *const u32).read_volatile() }
++}
++
++unsafe fn debug_dump_state(tag: &str) {
++    unsafe {
++        info!(
++            "debug: {} uart ier={:#x} iir={:#x} mcr={:#x} lsr={:#x} msr={:#x}",
++            tag,
++            debug_read(DEBUG_UART + 0x04),
++            debug_read(DEBUG_UART + 0x08),
++            debug_read(DEBUG_UART + 0x10),
++            debug_read(DEBUG_UART + 0x14),
++            debug_read(DEBUG_UART + 0x18),
++        );
++        // hwirq 132 (SPI 100): igroupr word 4, isenabler word 4, ispender word
++        // 4, icfgr register 8 (irqs 128..143).
++        info!(
++            "debug: {} gicd ctlr={:#x} igroupr4={:#x} isenabler4={:#x} ispender4={:#x} icfgr8={:#x}",
++            tag,
++            debug_read(DEBUG_GICD + 0x0000),
++            debug_read(DEBUG_GICD + 0x0090),
++            debug_read(DEBUG_GICD + 0x0110),
++            debug_read(DEBUG_GICD + 0x0210),
++            debug_read(DEBUG_GICD + 0x0C20),
++        );
++    }
++}
++
+ pub struct Com1Irq {}
+ 
+ impl InterruptHandler for Com1Irq {
+     fn irq_handler(&mut self, irq: u32, token: &mut CleanLockToken) {
++        let fires = COM1_IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
++        if fires < 3 {
++            unsafe { debug_dump_state("irq") }
++        }
+         COM1.lock().receive(token);
+         unsafe {
+             // FIXME add_irq accepts a u8 as irq number
+@@ -59,6 +100,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+         register_irq(virq as u32, Box::new(Com1Irq {}));
+         COM1.lock().enable_irq();
+         IRQ_CHIP.irq_enable(virq as u32);
++        debug_dump_state("init");
+     }
+ }
+ 

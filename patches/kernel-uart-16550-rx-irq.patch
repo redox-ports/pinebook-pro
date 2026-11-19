@@ -12,9 +12,9 @@
 #                     initfs debugsh console could not read keystrokes).
 #                     The patch records the test outcome instead of returning
 #                     early, so DTR/RTS/OUT1/OUT2 and IER are always restored
-#                     even when the self-test fails, and implements
-#                     SerialKind::enable_irq for the NS16550 variants (it was
-#                     a documented TODO no-op).
+#                     even when the self-test fails, logs the failure, and
+#                     implements SerialKind::enable_irq for the NS16550
+#                     variants (it was a documented TODO no-op).
 #
 # Apply from src (repo root):  git apply <this file>
 diff --git a/src/devices/serial.rs b/src/devices/serial.rs
@@ -39,7 +39,7 @@ index 1b3435dc..5a2e0bbe 100644
              Self::Pl011(inner) => inner.enable_irq(),
          }
 diff --git a/src/devices/uart_16550.rs b/src/devices/uart_16550.rs
-index cc0a26c1..a9fff921 100644
+index cc0a26c1..496e5064 100644
 --- a/src/devices/uart_16550.rs
 +++ b/src/devices/uart_16550.rs
 @@ -111,6 +111,7 @@ where
@@ -50,7 +50,7 @@ index cc0a26c1..a9fff921 100644
              for &byte in &[0x55, 0xAA] {
                  // Write loopback byte
                  self.data.write(byte.into());
-@@ -125,19 +126,31 @@ where
+@@ -125,19 +126,32 @@ where
                  // Read loopback byte
                  let loopback = self.data.read();
                  if loopback != byte.into() {
@@ -69,6 +69,7 @@ index cc0a26c1..a9fff921 100644
              self.int_en.write(0x01.into());
 +
 +            if !loopback_ok {
++                info!("uart: loopback self-test failed; loopback disabled, receive irq enabled");
 +                return Err(());
 +            }
          }
