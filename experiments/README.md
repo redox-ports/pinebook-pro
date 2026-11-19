@@ -32,8 +32,9 @@ separate file named `<number>-<slug>.md`, numbered in execution order.
 
 ## Index
 
-| #   | File                                           | Goal                                                                      | Status                |
-| --- | ---------------------------------------------- | ------------------------------------------------------------------------- | --------------------- |
-| 0   | [0-serial-console.md](0-serial-console.md)     | Verify the UART console at 1500000 8N1 and capture the current boot chain | **done** (2026-11-19) |
-| 1   | [1-system-inventory.md](1-system-inventory.md) | Inventory OS, kernel drivers, block devices, SPI exposure                 | **done** (2026-11-19) |
-| 2   | [2-raw-sectors.md](2-raw-sectors.md)           | Verify idbloader/U-Boot sector offsets and SPI blankness                  | pending               |
+| #   | File                                                   | Goal                                                                      | Status                |
+| --- | ------------------------------------------------------ | ------------------------------------------------------------------------- | --------------------- |
+| 0   | [0-serial-console.md](0-serial-console.md)             | Verify the UART console at 1500000 8N1 and capture the current boot chain | **done** (2026-11-19) |
+| 1   | [1-system-inventory.md](1-system-inventory.md)         | Inventory OS, kernel drivers, block devices, SPI exposure                 | **done** (2026-11-19) |
+| 2   | [2-raw-sectors.md](2-raw-sectors.md)                   | Verify idbloader/U-Boot sector offsets and SPI blankness                  | **done** (2026-11-19) |
+| 3   | [3-emmc-boot-partitions.md](3-emmc-boot-partitions.md) | Locate the first stage in eMMC boot0/boot1, read EXT_CSD boot config      | pending               |

@@ -74,6 +74,15 @@ Full log and analysis: [`experiments/0-serial-console.md`](experiments/0-serial-
 - Internal keyboard is a USB HID device (`258a:001e`) on a USB 2.0 bus behind the
   Genesys Logic hub (`05e3:0608`); the webcam is `0c45:6321`.
 - Serial login over `ttyS2` verified (`console=ttyS2,1500000` in the kernel cmdline).
+- SPI NOR is **blank/erased**: sector 64 reads `0xFF` and there is no `RKNS`/`U-Boot`
+  signature anywhere in the 16 MiB (full backup + SHA256 recorded in experiment 2).
+- U-Boot proper is on the **eMMC user area at sector 16384**; the first stage is **not**
+  at user-area sector 64 → the shipped chain uses an eMMC hardware boot partition
+  (`boot0`/`boot1`, 4 MiB each, not write-protected) — to be confirmed in experiment 3.
+- The microSD contains **no bootloader remnants** (zeros at sector 64, nothing at
+  8 MiB) and can be safely overwritten.
+- U-Boot `mmc info`: eMMC = MMC 5.1, High Speed 52 MHz, 8-bit; microSD = SD 3.0,
+  High Speed 50 MHz, 4-bit.
 
 ---
 
@@ -122,6 +131,13 @@ Final image layout (512-byte sectors):
 | 16384        | ~18783     | ~1 MiB    | `u-boot.itb` (ATF BL31 + U-Boot proper, EFI-capable)           |
 | 32768        | 264191     | ~113 MiB  | ESP, FAT32: `/EFI/BOOT/BOOTAA64.EFI` (Redox UEFI bootloader)   |
 | 264192       | end        | remainder | RedoxFS (root filesystem with `/usr/lib/boot/{kernel,initfs}`) |
+
+> **Note (2026-11-19, experiments 2–3):** the factory eMMC installation does **not**
+> follow this layout — its U-Boot proper sits at user-area 8 MiB while the first stage
+> is expected in an eMMC hardware boot partition (SPI is blank, microSD has no
+> bootloader). See `experiments/2-raw-sectors.md` and
+> `experiments/3-emmc-boot-partitions.md`. This does not affect the target SD layout
+> above, which follows the standard RK3399 BootROM contract.
 
 An alternative deployment mode (no image repacking needed): flash U-Boot/TOW-Boot once into the **SPI NOR** (it ships empty), then boot any stock-layout Redox image from microSD. This is documented as a fallback; the CI deliverable is the self-contained microSD image above.
 

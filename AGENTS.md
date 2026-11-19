@@ -28,8 +28,8 @@ Every commit message must follow [Conventional Commits](https://en.wikipedia.org
 - **Types:** `feat`, `fix`, `docs`, `ci`, `build`, `refactor`, `test`, `chore`, `revert`.
 - **Scopes used in this repo:** `ci` (GitHub Actions workflow), `scripts`, `config` (filesystem config overlay), `docs`.
 - **Summary:** English, imperative mood ("add", not "added"), no trailing period, keep the first line ≤ 72 characters.
-- Use `!` after the type/scope (or a `BREAKING CHANGE:` footer) when a change breaks the workflow or image format.
-- Body (optional): explain _why_, wrap at ~72 columns.
+- **One line only:** the commit message must be a single line — no body, no footers. Extra context belongs in the PR/MR description or docs.
+- Use `!` after the type/scope when a change breaks the workflow or image format.
 
 Examples:
 
@@ -81,8 +81,13 @@ fix(ci): prune runner disk before redox build
   (root PARTUUID matches the U-Boot-visible GPT GUID) — **never modify it**.
 - Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`, SDIO `fe310000`) and
   `sdhci`/`sdhci-pltfm` (eMMC `fe330000`, ADMA, HS200).
-- SPI NOR `gd25q128` (16 MiB) is exposed as `/dev/mtd0` (`"spi0.0"`); U-Boot env is
-  invalid ("bad CRC") — do not rely on a saved environment, but the flash can be dumped.
+- SPI NOR `gd25q128` (16 MiB) is exposed as `/dev/mtd0` (`"spi0.0"`) and is
+  **blank/erased**: `0xFF` at sector 64 and no `RKNS`/`U-Boot` signatures in 16 MiB
+  (backup + SHA256 recorded). Flashing TOW-Boot to SPI remains an option.
+- eMMC: U-Boot proper at user-area sector 16384; the first stage is **not** at
+  user-area sector 64 → the shipped boot chain uses an eMMC hardware boot partition
+  (`boot0`/`boot1`, 4 MiB each, not write-protected; experiment 3 pending).
+  **Never write to the eMMC boot partitions.**
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
 
