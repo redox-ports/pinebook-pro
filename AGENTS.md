@@ -69,14 +69,22 @@ fix(ci): prune runner disk before redox build
 
 ### Device state (verified 2026-11-19)
 
-- UART2 console verified at **1500000 8N1** (see `experiments/0-serial-console.md`).
+- UART2 console verified at **1500000 8N1** (see `experiments/0-serial-console.md`);
+  serial login works (`console=ttyS2,1500000` in the kernel cmdline).
 - Board runs U-Boot **2021.07-1 (Manjaro ARM)** with EFI distro boot; default env,
   `boot_targets=usb0 mmc1 mmc0 nvme0 pxe dhcp sf0`; autoboot interruptible.
-- U-Boot MMC mapping: `mmc0`=eMMC (`sdhci@fe330000`), `mmc1`=microSD (`mmc@fe320000`),
-  `mmc2`=SDIO/Wi-Fi (`mmc@fe310000`).
-- SPI NOR `gd25q128` (16 MiB) is detected; U-Boot env is invalid ("bad CRC") — do not
-  rely on a saved environment.
-- eMMC holds the baseline OS (GPT, first partition at LBA 62500) — **never modify it**.
+- **MMC numbering differs:** U-Boot `mmc0`=eMMC (`sdhci@fe330000`), `mmc1`=microSD
+  (`mmc@fe320000`), `mmc2`=SDIO/Wi-Fi (`mmc@fe310000`); Linux `mmc0`=SDIO,
+  `mmc1`=microSD, `mmc2`=eMMC. Identify controllers by MMIO address, never by index.
+- Baseline OS: Manjaro ARM, kernel `5.13.4-1-MANJARO-ARM`; eMMC = `DA4064` 58.2 GiB
+  (`mmcblk2`), microSD = `SU32G` 29.7 GiB (`mmcblk1`). eMMC is the boot medium
+  (root PARTUUID matches the U-Boot-visible GPT GUID) — **never modify it**.
+- Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`, SDIO `fe310000`) and
+  `sdhci`/`sdhci-pltfm` (eMMC `fe330000`, ADMA, HS200).
+- SPI NOR `gd25q128` (16 MiB) is exposed as `/dev/mtd0` (`"spi0.0"`); U-Boot env is
+  invalid ("bad CRC") — do not rely on a saved environment, but the flash can be dumped.
+- Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
+  (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
 
 ### Target SD image layout (produced by our repack)
 

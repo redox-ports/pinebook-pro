@@ -62,6 +62,18 @@ Full log and analysis: [`experiments/0-serial-console.md`](experiments/0-serial-
 - Practical consequence: the existing firmware can boot a Redox `BOOTAA64.EFI` from the
   microSD ESP **without flashing anything**; manual `bootefi` from the U-Boot prompt
   enables fast iteration.
+- Baseline OS: **Manjaro ARM, kernel 5.13.4-1-MANJARO-ARM**, hostname `pbp`; DT model
+  `Pine64 Pinebook Pro`, compatible `pine64,pinebook-pro` + `rockchip,rk3399`.
+- Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`, SDIO/Wi-Fi `fe310000`)
+  and `sdhci`/`sdhci-pltfm` (eMMC `fe330000`, ADMA, HS200).
+- **MMC numbering differs between U-Boot** (`mmc0`=eMMC, `mmc1`=microSD, `mmc2`=SDIO)
+  **and Linux** (`mmc0`=SDIO, `mmc1`=microSD, `mmc2`=eMMC) — always identify by
+  controller MMIO address.
+- SPI NOR is exposed to Linux as `/dev/mtd0` (16 MiB, `spi0.0`, `gd25q128`) — it can be
+  dumped for backup/inspection before any write.
+- Internal keyboard is a USB HID device (`258a:001e`) on a USB 2.0 bus behind the
+  Genesys Logic hub (`05e3:0608`); the webcam is `0c45:6321`.
+- Serial login over `ttyS2` verified (`console=ttyS2,1500000` in the kernel cmdline).
 
 ---
 
@@ -201,7 +213,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [ ] Decide driver architecture for platform (non-PCI) devices in current Redox (kernel `dtb` drivers vs userspace daemons) — inspect how raspi3bp handles it
 - [ ] DW MMC driver (microSD) → root filesystem from microSD
 - [ ] SDHCI-arasan driver (eMMC)
-- [ ] USB: DWC3 (xHCI-compatible) host + HID → keyboard/touchpad
+- [ ] USB: DWC2 host (USB 2.0 internal hub + keyboard/touchpad, HID) and DWC3/xHCI (USB 3.0) — internal input devices are on USB 2.0
 - [ ] Display: U-Boot GOP → `FRAMEBUFFER_*` env → console on eDP panel (evaluate whether `pinebook-pro-rk3399` U-Boot ships video/GOP; else enable it)
 - [ ] Optional: PCIe (dw-pcie) + NVMe storage
 
@@ -220,11 +232,12 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 | --- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | ESP offset fixed at sector 2048 collides with `u-boot.itb` @ 16384    | Solved by design: repack step (recreate ESP at 32768). Verify installer behavior in Phase 2                                                                            |
 | 2   | U-Boot must pass FDT via EFI config table and provide GOP for display | FDT: standard U-Boot `efi_loader` behavior, and Redox bootloader consumes it (`OsHwDesc::DeviceTree`). GOP: verify on device; worst case serial-only console initially |
-| 3   | No storage driver for DW MMC/SDHCI upstream on aarch64                | Known gap (RPi 3 B+ precedent). Phase 4; expect kernel/userspace driver work in `redox-os/drivers` or kernel `dtb` devices                                             |
+| 3   | No storage driver for DW MMC/SDHCI upstream on aarch64                | Known gap (RPi 3 B+ precedent). Linux reference drivers: `dwmmc_rockchip` (microSD `fe320000`) and `sdhci` (eMMC `fe330000`); Phase 4 driver work.                     |
 | 4   | Build time/disk on free CI runners                                    | Measure in Phase 1; mitigations: minimal config, `REPO_BINARY=1`, caching, pruning runner disk                                                                         |
 | 5   | UART baud 1500000 unusual for some USB-UART dongles                   | **Verified (experiment 0):** console works at 1500000 8N1 with the test adapter. Remaining: ensure bootloader/kernel keep the baud (DTB `stdout-path`).                |
 | 6   | eMMC-only units (no SD) / SPI-bricked devices                         | Document maskrom + `rkdeveloptool` recovery in flashing docs                                                                                                           |
 | 7   | aarch64 package binaries on Redox repo server                         | Verify availability; else build all from source                                                                                                                        |
+| 8   | USB2 host (DWC2) driver missing for internal input devices            | Keyboard/touchpad are USB2 HID behind a hub (not DWC3/xHCI). Needs a DWC2 host driver or an alternate input path; Phase 4.                                             |
 
 ---
 
