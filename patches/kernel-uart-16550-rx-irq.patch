@@ -1,20 +1,30 @@
-# redox-os/kernel @ 719e8f5c: keep NS16550 usable when the loopback self-test fails
+# redox-os/kernel @ 719e8f5c: make the NS16550 receive path deliver input
 #
 # Target repository : https://gitlab.redox-os.org/redox-os/kernel.git
 # Base commit       : 719e8f5c (master, 2026-11)
 # Reason            : RK3399 UART2 (snps,dw-apb-uart, Pinebook Pro console,
-#                     experiment 5). uart_16550::init() performs a loopback
-#                     self-test that fails on this board; the early `return
-#                     Err(())` skipped the final `modem_ctrl = 0x0F` /
-#                     `int_en = 0x01` writes, leaving the port with loopback
-#                     enabled (no output without external re-init) and the
-#                     receive interrupt disabled (no serial input, so the
-#                     initfs debugsh console could not read keystrokes).
-#                     The patch records the test outcome instead of returning
-#                     early, so DTR/RTS/OUT1/OUT2 and IER are always restored
-#                     even when the self-test fails, logs the failure, and
-#                     implements SerialKind::enable_irq for the NS16550
-#                     variants (it was a documented TODO no-op).
+#                     experiment 5) received no keystrokes. Two driver bugs:
+#
+#                     1. uart_16550::init() performs a loopback self-test that
+#                        fails on this board; the early `return Err(())`
+#                        skipped the final `modem_ctrl = 0x0F` /
+#                        `int_en = 0x01` writes, leaving the port with
+#                        loopback enabled (no output without external re-init)
+#                        and IER = 0 (no receive interrupts). The test outcome
+#                        is now recorded instead of returning early, so
+#                        DTR/RTS/OUT1/OUT2 and IER are always restored, and
+#                        the failure is logged.
+#
+#                     2. init() enabled the FIFO with a 14-byte receive
+#                        threshold (FCR = 0xC7). A single keystroke never
+#                        reaches the threshold, and UARTs without a working
+#                        character-timeout interrupt (this one) then never
+#                        raise a receive interrupt at all. FCR now uses a
+#                        one-character threshold (0x07), matching what the
+#                        Linux 8250 driver uses for interactive consoles.
+#
+#                     Also implements SerialKind::enable_irq for the NS16550
+#                     variants (previously a documented TODO no-op).
 #
 # Apply from src (repo root):  git apply <this file>
 diff --git a/src/devices/serial.rs b/src/devices/serial.rs
@@ -39,10 +49,25 @@ index 1b3435dc..5a2e0bbe 100644
              Self::Pl011(inner) => inner.enable_irq(),
          }
 diff --git a/src/devices/uart_16550.rs b/src/devices/uart_16550.rs
-index cc0a26c1..496e5064 100644
+index cc0a26c1..e034c2d3 100644
 --- a/src/devices/uart_16550.rs
 +++ b/src/devices/uart_16550.rs
-@@ -111,6 +111,7 @@ where
+@@ -102,8 +102,12 @@ where
+             // Use 8 data bits, no parity, one stop bit
+             self.line_ctrl.write(0x03.into());
+ 
+-            // Enable and clear FIFOs with 14-byte threshold
+-            self.fifo_ctrl.write(0xC7.into());
++            // Enable and clear FIFOs with a one-character receive threshold.
++            // A larger threshold delays the receive interrupt until the FIFO
++            // fills up; UARTs without a functioning character-timeout
++            // interrupt (e.g. RK3399 snps,dw-apb-uart) then never interrupt
++            // for interactive input, one keystroke at a time.
++            self.fifo_ctrl.write(0x07.into());
+ 
+             // IRQs enabled, RTS/DSR set
+             self.modem_ctrl.write(0x0B.into());
+@@ -111,6 +115,7 @@ where
              // Enable loopback
              self.modem_ctrl.write(0x1E.into());
              // Perform loopback test with even/odd pattern
@@ -50,7 +75,7 @@ index cc0a26c1..496e5064 100644
              for &byte in &[0x55, 0xAA] {
                  // Write loopback byte
                  self.data.write(byte.into());
-@@ -125,19 +126,32 @@ where
+@@ -125,19 +130,32 @@ where
                  // Read loopback byte
                  let loopback = self.data.read();
                  if loopback != byte.into() {
