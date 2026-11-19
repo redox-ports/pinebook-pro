@@ -1,15 +1,15 @@
 # Experiment 5 — Interim serial console (`debugsh`) in the initfs phase
 
-**Status:** iteration 2 pending hardware run (2026-11-20). Iteration 1 (first capture,
-`logs/serial-20261120-011908.log`): **`debugsh` starts and prints its banner + prompt on
-UART2**, but typed characters produce no echo/response, and `pcid` still panics — see
-"Iteration 1 results". Both causes were found and fixed; the rebuild is ready to flash.
-**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`
+**Status:** iteration 3 (diagnostics) ready to flash (2026-11-20). Iteration 1: banner+prompt
+OK, no input, `pcid` panic. Iteration 2: `pcid` panic and the `IER=0` bug are gone, **still
+no input**. **The board reboots by itself** after `init: switchroot to /usr /etc` (device
+owner confirmed: no manual reset). Iteration 3 instruments the UART and GICv3 distributor
+state and adds the Group 1 SPI routing, plus a U-Boot-side watchdog check.
+**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `patches/debug/kernel-serial-irq-dump.patch`
 
 ## Iteration 1 results (2026-11-20)
 
-Capture: `logs/serial-20261120-011908.log` (the boot appears twice in it; assumed a
-manual reset between runs — `FILL IN` whether that is correct).
+Capture: `logs/serial-20261120-011908.log`.
 
 What worked:
 
@@ -26,17 +26,64 @@ What failed, and why:
    `read(/scheme/debug)` never returns) and `MCR = 0x1E` (loopback — the same reason
    the uninstrumented kernel was silent in experiment 4 until the marker helper
    cleared MCR). Additionally `SerialKind::enable_irq` for NS16550 was a documented
-   TODO no-op. **Fixed** by `patches/kernel-uart-16550-rx-irq.patch`: the test outcome
-   is recorded instead of returning early, MCR/IER are always restored, and
-   `enable_irq` now really enables RX interrupts for the NS16550 variants.
+   TODO no-op. **Fixed** by `patches/kernel-uart-16550-rx-irq.patch`.
 2. **`pcid` still panicked — it is spawned by `hwd`, not by an init service.**
    Gating `40_pcid-spawner-initfs.service` removed the spawner from the log, but
    `drivers/hwd/src/main.rs` calls `daemon::Daemon::spawn(Command::new("pcid"))`
    directly (deprecated legacy path). **Fixed** in
    `patches/base-initfs-debug-console.patch`: hwd skips the pcid spawn on aarch64.
 
-Remaining question from iteration 1: whether the duplicated boot in the capture was a
-manual reset (assumed) or a spontaneous reboot loop.
+## Iteration 2 results (2026-11-20)
+
+Capture: `logs/serial-20261120-<time>.log` (second boot after the fixes).
+
+- **`pcid` panic gone** — hwd no longer spawns it on aarch64. ✔
+- **Still no echo**: IER is (per the driver) written, but no keystroke reaches
+  `debugsh`. So the UART receive interrupt is still not delivered.
+- **The board reboots on its own** after `init: switchroot to /usr /etc` (confirmed by
+  the device owner: no manual power cycle). Reset time looks constant (~17–19 s after
+  kernel start), which points at a hardware watchdog armed before Redox runs (likely
+  the DW watchdog at `0xff830000`, possibly started by U-Boot) — Redox never pets it.
+
+Hypotheses for the missing input, to be distinguished by iteration 3:
+
+1. IER is not actually 0x01 (e.g. the write lands elsewhere, or the port is
+   re-initialized later);
+2. the GIC distributor does not deliver SPI 100 (e.g. Group 0 → FIQ → EL3/unhandled,
+   or ISENABLER not set);
+3. the UART receives no bytes at all (pinmux/RX wiring in this boot stage).
+
+## Iteration 3 — actions (diagnostics)
+
+Kernel changes in this build:
+
+- `patches/kernel-gicv3-spi-group1.patch` (new): mark all GICv3 SPIs Group 1
+  non-secure before enabling the distributor (correct for an NS kernel, harmless if
+  the GIC is single-security-state).
+- `patches/debug/kernel-serial-irq-dump.patch` (temporary): prints UART2
+  `IER/IIR/MCR/LSR/MSR` and GICD `CTLR/IGROUPR4/ISENABLER4/ISPENDR4/ICFGR8` at
+  serial-init and on the first three serial interrupts.
+
+Device-owner steps:
+
+1. Flash the new image and capture a normal boot; type a few keys at the `debugsh>`
+   prompt.
+2. Power-cycle, and at `Hit any key to stop autoboot` press a key to stop U-Boot:
+   - if the key press does not stop autoboot, UART RX is dead already in U-Boot;
+   - else wait 3–4 minutes at the prompt: if the board resets by itself, the
+     watchdog is armed before the OS (confirm the hypothesis);
+   - also run `md 0xff830000 8` twice (DW watchdog registers: CR/TORR/CCVR/CRR/…; a
+     counting `CCVR` or `CR` bit 0 means the watchdog is armed).
+
+What to look for in the capture:
+
+| Line                                   | Meaning                                                  |
+| -------------------------------------- | -------------------------------------------------------- |
+| `debug: init uart ier=0x1 mcr=0xf ...` | IER/MCR are correct after serial init                    |
+| `debug: init gicd ... isenabler4=...`  | bit 4 of `isenabler4` set (IRQ 132 enabled)              |
+| `debug: irq ...` lines                 | the UART interrupt does fire when keys are typed         |
+| `igroupr4` bits                        | SPI group routing (bit 4 = IRQ 132)                      |
+| no `debug: irq` at all                 | either RX data never arrives or the SPI is not delivered |
 
 ## Goal
 
