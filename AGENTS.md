@@ -85,6 +85,7 @@ README.md            # research + plan + checklist (source of truth)
 AGENTS.md            # this file
 LICENSE
 .gitignore
+experiments/         # chronological hardware experiment logs (append-only)
 .github/workflows/   # build.yml (Phase 1+)
 scripts/             # repack-pbp.sh, qemu-smoke.sh, deps install helpers (Phase 1+)
 config/              # filesystem config overlay for the redox build (Phase 2+)
