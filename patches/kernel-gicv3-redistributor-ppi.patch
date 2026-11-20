@@ -1,0 +1,217 @@
+# redox-os/kernel @ 719e8f5c: program the GICv3 redistributor (PPIs/SGIs)
+#
+# Target repository : https://github.com/redox-os/kernel (mirror of
+#                     https://gitlab.redox-os.org/redox-os/kernel.git)
+# Base commit       : 719e8f5c (master, 2026-11)
+# Reason            : the architected timer never fired on the Pinebook Pro, so
+#                     nothing preempted, `nanosleep` never returned, scheme
+#                     timeouts never expired and the VT only repainted when a
+#                     key produced a syscall ("you have to press Enter",
+#                     experiment 11). Two independent defects in the GICv3
+#                     driver:
+#
+#                     (1) `GicV3::parse()` built a fresh `reg()` iterator for
+#                     every entry, so `chunk.iter().next()` returned the *GICD*
+#                     chunk `#redistributor-regions` times. The boot log showed
+#                     it plainly: `gicrs: [(FEE00000, 10000)]` - that is the
+#                     distributor, not the redistributor region the RK3399 DT
+#                     places at `fef00000` (six 0x20000 frames). The frames
+#                     were also stored without `PHYS_OFFSET`, unlike the GICD.
+#
+#                     (2) The redistributor itself was never programmed. In
+#                     GICv3 SGIs (0..16) and PPIs (16..32) are banked per CPU:
+#                     their enable, group, priority and trigger configuration
+#                     live in `GICR_ISENABLER0`, `GICR_IGROUPR0`,
+#                     `GICR_IPRIORITYR` and `GICR_ICFGR1` of the redistributor's
+#                     SGI frame, and the frame has to be woken through
+#                     `GICR_WAKER`. `GICD_ISENABLER` only covers SPIs (ID 32+),
+#                     so `IRQ_CHIP.irq_enable(27)` for the timer PPI wrote a
+#                     RES0 bit and disabled nothing while enabling nothing.
+#                     The host SPI work (UART2) was unaffected, which is why
+#                     interrupts looked healthy.
+#
+#                     Fix: keep one iterator so the redistributor region is
+#                     parsed (and translate it like the GICD), compute the
+#                     current CPU's frame from the region size and the CPU
+#                     count the distributor reports, wake it through GICR_WAKER
+#                     (best effort: QEMU and the GIC-500 can leave undefined
+#                     bits set) and set group 1 NS + priority 0xa0 +
+#                     level-triggered PPIs, then route `irq_enable`/
+#                     `irq_disable` for IDs below 32 to
+#                     `GICR_ISENABLER0`/`GICR_ICENABLER0`.
+#
+#                     Verified in QEMU (`-M virt,gic-version=3`): `sleep(10ms)`
+#                     and `sleep(250ms)` now return after 10.9 ms and 250.2 ms;
+#                     before the fix a 10 ms `nanosleep` never returned.
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/arch/aarch64/device/irqchip/gicv3.rs b/src/arch/aarch64/device/irqchip/gicv3.rs
+index fb435b8e..dfb886a4 100644
+--- a/src/arch/aarch64/device/irqchip/gicv3.rs
++++ b/src/arch/aarch64/device/irqchip/gicv3.rs
+@@ -23,6 +23,32 @@ pub struct GicV3 {
+     pub irq_range: (usize, usize),
+ }
+ 
++// Redistributor register offsets. Each redistributor owns two 64 KiB frames:
++// the RD frame (control/TYPER/WAKER) and the SGI frame, where the banked SGIs
++// (0..16) and PPIs (16..32) are configured. GICD only covers SPIs, so writing
++// GICD_ISENABLER for a PPI is a write to a RES0 bit: on this port that silently
++// disabled every private interrupt, including the architected timer PPI (27)
++// that drives `context::switch::tick()` and thus `nanosleep` (experiment 11).
++const GICR_WAKER: u32 = 0x0014;
++const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 0;
++const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 1;
++const GICR_SGI_FRAME: usize = 0x1_0000;
++const GICR_IGROUPR0: u32 = 0x0080;
++const GICR_ISENABLER0: u32 = 0x0100;
++const GICR_ICENABLER0: u32 = 0x0180;
++const GICR_IPRIORITYR: u32 = 0x0400;
++const GICR_ICFGR1: u32 = 0x0c04;
++/// Frame stride used when the devicetree does not describe the region size.
++const GICR_FRAME_STRIDE: usize = 0x2_0000;
++
++fn gicr_read32(base: usize, offset: u32) -> u32 {
++    unsafe { core::ptr::read_volatile((base + offset as usize) as *const u32) }
++}
++
++fn gicr_write32(base: usize, offset: u32, value: u32) {
++    unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u32, value) }
++}
++
+ impl GicV3 {
+     pub fn new() -> Self {
+         GicV3 {
+@@ -51,8 +77,8 @@ impl GicV3 {
+ 
+         // Read registers
+         let chunks = node.reg().unwrap();
+-        if let Some(gicd) = chunks.iter::<usize, usize>().next()
+-            && let Ok(gicd) = gicd
++        let mut chunks = chunks.iter::<usize, usize>();
++        if let Some(Ok(gicd)) = chunks.next()
+             && let Some(addr) = translate_mmio_address(fdt, &node, &gicd)
+         {
+             unsafe {
+@@ -60,11 +86,14 @@ impl GicV3 {
+             }
+         }
+         for _ in 0..gicrs {
+-            if let Some(gicr) = chunks.iter::<usize, usize>().next()
+-                && let Ok(gicr) = gicr
++            // Each call to `reg().iter()` yields a fresh iterator over the
++            // same list, so the previous code pushed the *GICD* entry here
++            // (and pushed it `#redistributor-regions` times). Keep one
++            // iterator and take the entries after the GICD instead.
++            if let Some(Ok(gicr)) = chunks.next()
++                && let Some(addr) = translate_mmio_address(fdt, &node, &gicr)
+             {
+-                self.gicrs
+-                    .push((translate_mmio_address(fdt, &node, &gicr).unwrap(), gicr.len));
++                self.gicrs.push((crate::PHYS_OFFSET + addr, gicr.len));
+             }
+         }
+ 
+@@ -74,6 +103,67 @@ impl GicV3 {
+             Ok(())
+         }
+     }
++
++    /// Redistributor frame belonging to the running CPU.
++    ///
++    /// A single `#redistributor-regions` entry describes all per-CPU frames
++    /// back to back, so the stride is the region size divided by the number of
++    /// CPUs the distributor reports.
++    fn current_cpu_gicr(&self) -> Option<usize> {
++        let (region_base, region_len) = *self.gicrs.first()?;
++        let ncpus = core::cmp::max(self.gic_dist_if.ncpus as usize, 1);
++        let stride = match region_len / ncpus {
++            0 => GICR_FRAME_STRIDE,
++            stride => stride & !0xfff,
++        };
++        Some(region_base + usize::try_from(crate::cpu_id().get()).ok()? * stride)
++    }
++
++    /// Wake the local redistributor and reset the banked SGI/PPI state.
++    unsafe fn init_current_cpu_redist(&mut self) -> Result<()> {
++        let rd = self.current_cpu_gicr().ok_or_else(|| Error::new(EINVAL))?;
++
++        // Clearing ProcessorSleep powers the frame up; ChildrenAsleep drops
++        // once the redistributor has finished its internal wake-up. Both QEMU
++        // and the GIC-500 can leave bits outside the defined fields set, so
++        // the wait is best-effort: what actually matters is that the
++        // GICR_ISENABLER0 write below takes effect.
++        let waker_before = gicr_read32(rd, GICR_WAKER);
++        gicr_write32(rd, GICR_WAKER, waker_before & !GICR_WAKER_PROCESSOR_SLEEP);
++        let mut spins = 0u32;
++        while gicr_read32(rd, GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
++            spins += 1;
++            if spins >= 100_000 {
++                debug!(
++                    "gicv3: redistributor {:#x} still reports ChildrenAsleep ({:#x})",
++                    rd,
++                    gicr_read32(rd, GICR_WAKER)
++                );
++                break;
++            }
++            core::hint::spin_loop();
++        }
++
++        let sgi = rd + GICR_SGI_FRAME;
++
++        // SGIs and PPIs are private, so their group, priority and trigger
++        // configuration live here rather than in the distributor. Group 1 NS
++        // matches the SPI setup, and PPIs (the architected timer among them)
++        // are level-triggered (GICR_ICFGR1 bit 2n == 0).
++        gicr_write32(sgi, GICR_IGROUPR0, 0xffff_ffff);
++        for irq in (0..32).step_by(4) {
++            gicr_write32(sgi, GICR_IPRIORITYR + 4 * irq, 0xa0a0_a0a0);
++        }
++        gicr_write32(sgi, GICR_ICFGR1, 0);
++
++        info!(
++            "gicv3: redistributor {:#x} ready, GICR_WAKER {:#x} -> {:#x}",
++            rd,
++            waker_before,
++            gicr_read32(rd, GICR_WAKER)
++        );
++        Ok(())
++    }
+ }
+ 
+ impl InterruptHandler for GicV3 {
+@@ -95,6 +185,7 @@ impl InterruptController for GicV3 {
+ 
+         unsafe {
+             self.gic_cpu_if.init();
++            self.init_current_cpu_redist()?;
+         }
+         let idx = *irq_idx;
+         let cnt = if self.gic_dist_if.nirqs > 1024 {
+@@ -125,10 +216,24 @@ impl InterruptController for GicV3 {
+         unsafe { self.gic_cpu_if.irq_eoi(irq_num) }
+     }
+     fn irq_enable(&mut self, irq_num: u32) {
+-        unsafe { self.gic_dist_if.irq_enable(irq_num) }
++        let hwirq = (irq_num as usize).saturating_sub(self.irq_range.0) as u32;
++        if hwirq < 32 {
++            if let Some(rd) = self.current_cpu_gicr() {
++                gicr_write32(rd + GICR_SGI_FRAME, GICR_ISENABLER0, 1 << hwirq);
++                return;
++            }
++        }
++        unsafe { self.gic_dist_if.irq_enable(hwirq) }
+     }
+     fn irq_disable(&mut self, irq_num: u32) {
+-        unsafe { self.gic_dist_if.irq_disable(irq_num) }
++        let hwirq = (irq_num as usize).saturating_sub(self.irq_range.0) as u32;
++        if hwirq < 32 {
++            if let Some(rd) = self.current_cpu_gicr() {
++                gicr_write32(rd + GICR_SGI_FRAME, GICR_ICENABLER0, 1 << hwirq);
++                return;
++            }
++        }
++        unsafe { self.gic_dist_if.irq_disable(hwirq) }
+     }
+     fn irq_configure(&mut self, irq_data: IrqCell) -> Result<()> {
+         let (irq, flags) = match irq_data {

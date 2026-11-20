@@ -72,7 +72,7 @@ fix(ci): prune runner disk before redox build
 - Bootloader (UEFI, `BOOTAA64.EFI`): drops EL2→EL1, builds page tables, reads EFI memory map, **passes DTB to kernel via env `DTB_ADDR`/`DTB_SIZE`**, framebuffer via `FRAMEBUFFER_ADDR/WIDTH/HEIGHT/STRIDE/BPP`, RedoxFS via `REDOXFS_UUID`/`REDOXFS_BLOCK`.
 - **The firmware framebuffer is not necessarily 32bpp:** U-Boot v2021.07 `rk_vop.c` sets `VIDEO_BPP16` for `VOP_MODE_EDP`, and its GOP reports `PixelBitMask` with masks `0xf800/0x07e0/0x001f` (RGB565); `gop_set_mode` accepts only mode 0, so the depth cannot be changed from UEFI. Our bootloader derives `FRAMEBUFFER_BPP` from `Mode.Info.PixelFormat` and the kernel `graphical_debug` plus `vesad` honour it (experiment 7). Writing 32-bit ARGB `0xFF000000` into an RGB565 surface produces black/yellow pixel pairs — that was the "yellow screen".
 - Kernel serial driver is DTB-driven and supports `snps,dw-apb-uart` (16550 with u32 MMIO) → RK3399 UART2 works out of the box.
-- IRQ: RK3399 is **GICv3** (`arm,gic-v3`, GIC-500) — not GICv2/GIC-400. `gicv3.rs` exists; `irqchip::init_ap` (secondary CPUs) currently supports only the GICv2 memory-mapped interface, so expect single-CPU until extended. Timer: ARM generic timer. PSCI 1.1 (SMC conduit) works.
+- IRQ: RK3399 is **GICv3** (`arm,gic-v3`, GIC-500) — not GICv2/GIC-400. `gicv3.rs` exists; `irqchip::init_ap` (secondary CPUs) currently supports only the GICv2 memory-mapped interface, so expect single-CPU until extended. Timer: ARM generic timer. PSCI 1.1 (SMC conduit) works. **GICv3 private interrupts need the redistributor, not the distributor:** SGIs (0–16) and PPIs (16–32, including the timer PPI 27) are banked per CPU and enabled through `GICR_ISENABLER0` in the redistributor's SGI frame (`RD_base + 0x10000`, one 0x20000 frame per CPU back to back, frames woken via `GICR_WAKER`), while `GICD_ISENABLER` covers only SPIs (32+). Writing GICD for a PPI id is a RES0 write that fails silently (experiment 11).
 - Precedent: Raspberry Pi 3 B+ (ARM64, U-Boot) boots to UART serial console; storage drivers are the missing piece everywhere on aarch64.
 
 ### Device state (verified 2026-11-19)
@@ -118,8 +118,16 @@ fix(ci): prune runner disk before redox build
   IP never raises CDONE for clock-only commands); SRST_SDMMC pulse verified on
   hardware (STATUS 0x6106 → 0x0106). Iterations 6–7 hardware runs also proved
   `CLKSEL_CON16` is write-mask (hiword) protected — plain writes are dropped —
-  and that kernel `nanosleep` does not wake on the generic timer (a 10 ms sleep
-  blocked until a serial interrupt; `dwmmcd` now busy-waits). **Storage works
+  and exposed that kernel `nanosleep` did not wake on the generic timer (a 10 ms
+  sleep blocked until a serial interrupt; `dwmmcd` was left busy-waiting). **The
+  timer itself was broken (experiment 11):** the architected timer PPI (27)
+  never fired, because `GicV3::parse()` reported the _GICD_ chunk as the
+  redistributor (`gicrs: [(FEE00000, 10000)]`) and the redistributor was never
+  programmed — in GICv3 SGIs/PPIs are banked per CPU and enabled through
+  `GICR_ISENABLER0`, while `GICD_ISENABLER` only covers SPIs, so `irq_enable(27)`
+  wrote a RES0 bit and silently enabled nothing. Fixed in
+  `patches/kernel-gicv3-redistributor-ppi.patch`; verified in QEMU
+  (`sleep(10ms)` → 10.9 ms, `sleep(250ms)` → 250.2 ms). **Storage works
   end-to-end (iteration 8):** the microSD enumerates (`card ready: size=30436
 MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   switchroots to `/usr`, the rootfs userspace starts and the `redox login:`
@@ -133,15 +141,17 @@ MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   must be rebased before symbolising (identify the base with a register whose meaning you
   can name, e.g. `X19` = `main` in `relibc_start_v1`; both recorded crash PCs then landed
   on `brk` instructions in `libc.so`). Two defects killed every uutils applet:
-  `__cxa_thread_finalize()` held the thread-local `DTORS` borrow across destructor calls
-  (panics at `src/cxa.rs:84` when a destructor registers another thread-atexit handler;
-  `brk #1` at exit, buffered stdout lost), and `signal_handler()` runs from
-  `sched_yield()`/the timer tick, i.e. **before** the arch syscall epilogue stores the
-  result, so a signal delivered mid-syscall saved the syscall _argument_ as the return
-  value (relibc's `Sys::verify()` yield resumed with `x0 = -1` and took its abort branch).
-  Fixes: `patches/relibc-cxa-reentrancy.patch`,
-  `patches/kernel-signal-delivery-after-syscall.patch`. QEMU cannot exercise this path:
-  no root filesystem and the initfs holds only static binaries.
+  thread-atexit registration and finalization shared a `RefCell` (`DTORS`), so a
+  destructor or signal handler registering a handler while the stack was being
+  drained panicked with `RefCell already borrowed` (`brk #1` at exit, buffered
+  stdout lost) — the fix keeps the stack as an intrusive list behind a `Cell`, so
+  registration can never observe a drain; and `signal_handler()` runs from
+  `sched_yield()`/the timer tick, i.e. **before** the arch syscall epilogue stores
+  the result, so a signal delivered mid-syscall saved the syscall _argument_ as the
+  return value (relibc's `Sys::verify()` yield resumed with `x0 = -1` and took its
+  abort branch). Fixes: `patches/relibc-cxa-reentrancy.patch`,
+  `patches/kernel-signal-delivery-after-syscall.patch`. QEMU cannot exercise this
+  path: no root filesystem and the initfs holds only static binaries.
 
 ### Target SD image layout (produced by our repack)
 
