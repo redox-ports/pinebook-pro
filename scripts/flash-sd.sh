@@ -143,13 +143,24 @@ fi
 # device, and desktop automounters (udisks) may grab the freshly created
 # ESP afterwards. The image bytes are already on the media (dd conv=fsync
 # flushed them and the verify step re-read them), but pulling a mounted
-# FAT partition can still corrupt its metadata, so warn instead of
-# staying silent.
+# FAT partition can still corrupt its metadata. Detach whatever the
+# desktop grabbed so the card can simply be pulled out afterwards.
 MOUNTED=$(lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | sed '/^$/d' || true)
 if [ -n "$MOUNTED" ]; then
-    echo "warning: something mounted partitions of the card after the write:" >&2
+    echo "==> detaching partitions the desktop automounted after the write"
+    echo "$MOUNTED" | while read -r M; do
+        if run umount "$M" 2>/dev/null; then
+            echo "    unmounted: $M"
+        else
+            echo "    could not unmount: $M" >&2
+        fi
+    done
+    sync
+    MOUNTED=$(lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | sed '/^$/d' || true)
+fi
+if [ -n "$MOUNTED" ]; then
+    echo "warning: still mounted, unmount before removing the card:" >&2
     echo "$MOUNTED" | while read -r M; do echo "  mounted: $M" >&2; done
-    echo "unmount before removing the card, e.g.: udisksctl unmount -b <partition>" >&2
 else
     echo "==> card contents are written and flushed; it is safe to remove it now"
 fi
