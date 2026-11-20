@@ -29,6 +29,7 @@ Every commit message must follow [Conventional Commits](https://en.wikipedia.org
 - **Scopes used in this repo:** `ci` (GitHub Actions workflow), `scripts`, `config` (filesystem config overlay), `docs`.
 - **Summary:** English, imperative mood ("add", not "added"), no trailing period, keep the first line ≤ 72 characters.
 - **One line only:** the commit message must be a single line — no body, no footers. Extra context belongs in the PR/MR description or docs.
+- **One commit per experiment:** an experiment lands as **one** commit, made when the experiment is finished (code, patches, docs and the experiment log together). Do not leave a chain of intermediate commits for the iterations of the same experiment — amend, squash or rebase local work into that single commit first. Separate experiments are separate commits.
 - Use `!` after the type/scope when a change breaks the workflow or image format.
 
 Examples:
