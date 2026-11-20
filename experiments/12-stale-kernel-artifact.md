@@ -163,3 +163,34 @@ Two images isolate the remaining variables (both with the clean kernel):
 Interpretation: if (1) boots, one of the two bootloader changes broke the handover; if
 only (2) boots, the dump itself matters; if both stay silent, the marker code in the
 kernel is required for the boot and the marker side effects must be understood.
+
+## Iteration 4 — the UART dump is the magic (2026-11-20 22:0x)
+
+Result of the isolation pair (both with the clean kernel and the old, firmware-clock
+bootloader):
+
+| Image                    | Extra work before `kernel_entry`    | Result     |
+| ------------------------ | ----------------------------------- | ---------- |
+| `diag-oldboot-clean.img` | none                                | **silent** |
+| `diag-oldboot.img`       | 4 UART register reads + one println | **boots**  |
+
+Everything else in the two images is identical (same kernel artifact, same bootloader
+sources, same allocation layout). So the deciding factor is the `dump_uart2()` call
+itself - which is read-only for the port - or the extra console write it performs, or
+the time they take. This also re-frames every earlier observation: the marker kernels
+only ever booted behind the dump bootloader, and the kernel-side markers were never the
+fix.
+
+### Splitting the dump
+
+Two more images isolate which part matters (same old bootloader, clean kernel):
+
+1. `build/diag-delay.img` — a pure ~100 ms spin loop where the dump was: no register
+   access, no console output.
+2. `build/diag-println.img` — a single `println!` (console write) with no register
+   reads.
+
+Interpretation: delay boots ⇒ the handover is time-sensitive (something needs to settle
+after the last console output); println-only boots ⇒ the console/driver activity is
+what matters; neither boots ⇒ the register reads themselves change the state the kernel
+inherits.
