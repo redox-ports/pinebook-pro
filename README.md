@@ -211,7 +211,7 @@ Single workflow (`build.yml`), stages:
 1. **Build Redox aarch64 image** — `ubuntu-24.04` runner, native build (`PODMAN_BUILD=0`, deps per `native_bootstrap.sh`; fallback `PODMAN_BUILD=1`). `ARCH=aarch64`, minimal board config. `CI=1`, verbose logs to files.
 2. **Build/fetch U-Boot for RK3399** — primary: build upstream U-Boot (`pinebook-pro-rk3399_defconfig`) with BL31 from ARM Trusted Firmware (`PLAT=rk3399`) → `idbloader.img` + `u-boot.itb`; pinned commits. Alternative: download TOW-Boot release artifact for `pine64-pinebookPro`.
 3. **Repack** — `scripts/repack-pbp.sh`: relocate ESP to sector 32768 (`sgdisk` + `mkfs.vfat` + `mtools`), embed U-Boot stages at sectors 64/16384, compress with `zstd`.
-4. **Smoke test (QEMU, optional but desired)** — boot the _stock_ (pre-repack) image with `qemu-system-aarch64 -M virt` + AAVMF + serial capture; assert the Redox bootloader banner / kernel messages appear.
+4. **Smoke test (QEMU)** — boot the _stock_ (pre-repack) image headless and assert the Redox banner/kernel messages. **Correction (experiment 9):** AAVMF cannot be used — Debian's build has no `QemuFdtDxe`, so the guest gets ACPI only and the devicetree-only Redox kernel initializes nothing. The working setup is the packaged U-Boot (`apt-get download u-boot-qemu`, unpacked without root) with `-M virt,gic-version=3`; it boots to initfs and runs the driver self-tests. See `experiments/9-qemu-smoke-test.md`.
 5. **Publish** — upload `redox-pinebook-pro-<sha/date>.img.zst` + SHA256 as workflow artifact; cut a GitHub Release on tags.
 
 Notes: runner disk ~14 GB (use `/mnt` for the build tree, prune dotnet/android/ghc), free-tier job wall clock limit is 6 h (a minimal aarch64 build is expected to fit; measure first run, then optimize with `REPO_BINARY=1` and caches).
@@ -235,7 +235,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [ ] `scripts/` + `.github/workflows/build.yml` scaffolding
 - [ ] Native (non-Podman) dependency set works on ubuntu-24.04 runner
 - [ ] `ARCH=aarch64` minimal image builds green in CI
-- [ ] QEMU aarch64 UEFI smoke test passes (serial banner assertion)
+- [ ] QEMU aarch64 UEFI smoke test passes (serial banner assertion) — **AAVMF route ruled out (experiment 9):** no devicetree, the kernel does not start. Use U-Boot + `-M virt,gic-version=3` (works locally; CI needs the `u-boot-qemu` package)
 - [ ] Upload `harddrive.img.zst` artifact
 - [ ] Measure build time & disk usage; decide on `REPO_BINARY`/caching strategy
 
