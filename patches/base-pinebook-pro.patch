@@ -606,10 +606,10 @@ index 00000000..1461a920
 +workspace = true
 diff --git a/drivers/storage/dwmmcd/src/dwmmc.rs b/drivers/storage/dwmmcd/src/dwmmc.rs
 new file mode 100644
-index 00000000..49afd696
+index 00000000..8046d620
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/dwmmc.rs
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,1033 @@
 +//! Synopsys DesignWare Mobile Storage Host Controller (dw_mshc) driver for
 +//! the Rockchip RK3399 microSD slot (`sdmmc@fe320000`).
 +//!
@@ -663,6 +663,7 @@ index 00000000..49afd696
 +const CDETECT: usize = 0x050;
 +const VERID: usize = 0x06c;
 +const HCON: usize = 0x070;
++const BMOD: usize = 0x080;
 +
 +/// FIFO data register. 0x100 for IP versions below 2.40a, 0x200 from 2.40a
 +/// on. U-Boot hardcodes 0x200 for every board it supports (including all
@@ -671,7 +672,9 @@ index 00000000..49afd696
 +const DATA_OFFSET_240A: usize = 0x200;
 +
 +// CTRL bits
++const CTRL_RESET: u32 = 1 << 0;
 +const CTRL_FIFO_RESET: u32 = 1 << 1;
++const CTRL_DMA_RESET: u32 = 1 << 2;
 +
 +// CLKENA bits
 +const CLKENA_ENABLE: u32 = 1 << 0;
@@ -745,6 +748,7 @@ index 00000000..49afd696
 +const CMD_TIMEOUT_MS: u64 = 1000;
 +const CLK_UPDATE_TIMEOUT_MS: u64 = 100;
 +const FIFO_RESET_TIMEOUT_MS: u64 = 100;
++const CTRL_RESET_TIMEOUT_MS: u64 = 500;
 +const BUSY_TIMEOUT_MS: u64 = 500;
 +const DATA_TIMEOUT_PER_BLOCK_MS: u64 = 100;
 +const DATA_TIMEOUT_BASE_MS: u64 = 500;
@@ -874,6 +878,7 @@ index 00000000..49afd696
 +    pub block_addressed: bool,
 +    pub size: u64,
 +    inherited_clkdiv: u32,
++    inherited_ctrl: u32,
 +    log: Logger,
 +}
 +
@@ -888,6 +893,7 @@ index 00000000..49afd696
 +            block_addressed: true,
 +            size: 0,
 +            inherited_clkdiv: 0,
++            inherited_ctrl: 0,
 +            log,
 +        }
 +    }
@@ -943,17 +949,49 @@ index 00000000..49afd696
 +    fn save_inherited_clock(&mut self) {
 +        let regs = self.regs.read().unwrap();
 +        self.inherited_clkdiv = unsafe { regs.read(CLKDIV) };
++        self.inherited_ctrl = unsafe { regs.read(CTRL) };
 +    }
 +
-+    /// Controller-level setup that is safe without CRU access: mask all
-+    /// interrupts, max out the hardware timeouts, program a sane FIFO
-+    /// watermark. The inherited clock source and divider are left alone.
++    /// Controller-level setup, mirroring U-Boot dwmci_init: a full
++    /// controller reset first (CTRL/FIFO/DMA — this is required because
++    /// U-Boot leaves the block in IDMAC/DMA state after loading the kernel
++    /// through EFI; experiment 6 measured ctrl=0x02000000, the USE_IDMAC
++    /// bit), then the polling-driver register state. The reset clears the
++    /// CIU-side registers (CLKDIV/CLKENA/CTYPE back to defaults), which is
++    /// fine: they are reprogrammed right after from known values. The CRU
++    /// cclk rate feeding the controller is NOT touched by this reset.
 +    fn controller_setup(&mut self) -> Result<()> {
 +        let regs = self.regs.read().unwrap();
 +        unsafe {
 +            // Power enable (slot 0). Harmless if the board wires power
 +            // always-on.
 +            regs.write(PWREN, 1);
++
++            // Full reset (U-Boot dwmci_wait_reset with DWMCI_RESET_ALL).
++            // The bits self-clear; wait for them to go away.
++            regs.write(CTRL, CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
++            let deadline = now_ms() + CTRL_RESET_TIMEOUT_MS;
++            loop {
++                if regs.read(CTRL) & (CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET) == 0 {
++                    break;
++                }
++                if now_ms() > deadline {
++                    self.log.log(format_args!(
++                        "dwmmcd: controller reset timeout, ctrl=0x{:08x}",
++                        regs.read(CTRL)
++                    ));
++                    return Err(Error::new(ETIMEDOUT));
++                }
++            }
++            self.log.log(format_args!(
++                "dwmmcd: controller reset ok (ctrl was 0x{:08x})",
++                self.inherited_ctrl
++            ));
++
++            // Software-reset the internal DMA engine as well (U-Boot writes
++            // BMOD = 1, the IDMAC reset bit), so no descriptor state leaks
++            // into the PIO data path.
++            regs.write(BMOD, 1);
 +
 +            // Polling driver: no controller interrupts may reach the GIC.
 +            regs.write(INTMASK, 0);
@@ -980,14 +1018,39 @@ index 00000000..49afd696
 +        let regs = self.regs.read().unwrap();
 +        unsafe {
 +            regs.write(CLKENA, 0);
-+            clk_update(&regs)?;
++            if let Err(err) = clk_update(&regs, "stop") {
++                self.log.log(format_args!(
++                    "dwmmcd: clock update (stop) failed: {} rint=0x{:08x} status=0x{:08x}",
++                    err,
++                    regs.read(RINTSTS),
++                    regs.read(STATUS)
++                ));
++                return Err(err);
++            }
 +
 +            regs.write(CLKDIV, div);
-+            regs.write(CLKSRC, 0); // slot 0, as inherited
-+            clk_update(&regs)?;
++            regs.write(CLKSRC, 0); // slot 0
++            if let Err(err) = clk_update(&regs, "div") {
++                self.log.log(format_args!(
++                    "dwmmcd: clock update (div={}) failed: {} rint=0x{:08x} status=0x{:08x}",
++                    div,
++                    err,
++                    regs.read(RINTSTS),
++                    regs.read(STATUS)
++                ));
++                return Err(err);
++            }
 +
 +            regs.write(CLKENA, CLKENA_ENABLE | CLKENA_LOW_PWR);
-+            clk_update(&regs)?;
++            if let Err(err) = clk_update(&regs, "start") {
++                self.log.log(format_args!(
++                    "dwmmcd: clock update (start) failed: {} rint=0x{:08x} status=0x{:08x}",
++                    err,
++                    regs.read(RINTSTS),
++                    regs.read(STATUS)
++                ));
++                return Err(err);
++            }
 +        }
 +        Ok(())
 +    }
@@ -1508,14 +1571,13 @@ index 00000000..49afd696
 +
 +/// CIU clock-update command: start a CMD with only UPD_CLK set and wait for
 +/// command-done. Never reaches the card (U-Boot dwmci_control_clken).
-+unsafe fn clk_update(regs: &DwmmcRegs) -> Result<()> {
++unsafe fn clk_update(regs: &DwmmcRegs, stage: &str) -> Result<()> {
 +    unsafe {
 +        regs.write(RINTSTS, 0xffff_ffff);
 +        regs.write(CMDARG, 0);
-+        regs.write(
-+            CMD,
-+            CMD_START | CMD_USE_HOLD_REG | CMD_UPD_CLK | CMD_PRV_DAT_WAIT,
-+        );
++        // Exactly the U-Boot clock-only command: START | PRV_DAT_WAIT |
++        // UPD_CLK (no USE_HOLD_REG — U-Boot does not set it here).
++        regs.write(CMD, CMD_START | CMD_UPD_CLK | CMD_PRV_DAT_WAIT);
 +
 +        let deadline = now_ms() + CLK_UPDATE_TIMEOUT_MS;
 +        loop {
@@ -1583,10 +1645,10 @@ index 00000000..49afd696
 +}
 diff --git a/drivers/storage/dwmmcd/src/log.rs b/drivers/storage/dwmmcd/src/log.rs
 new file mode 100644
-index 00000000..1ac2036f
+index 00000000..3563380d
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/log.rs
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +//! Bring-up logging for dwmmcd.
 +//!
 +//! stdout/stderr of initfs daemons go to the `log` scheme, which lives in
@@ -1627,11 +1689,12 @@ index 00000000..1ac2036f
 +        }
 +    }
 +
-+    /// Emit one line to the log scheme (stderr) and the UART (debug scheme).
++    /// Emit one line to the UART (kernel debug scheme). stderr is NOT
++    /// written: initfs daemons inherit init's stdio, which is already the
++    /// debug scheme, so writing both duplicates every line on the serial
++    /// console (observed in experiment 6).
 +    pub fn log(&self, args: core::fmt::Arguments) {
 +        let line = format!("{}\n", args);
-+        let mut stderr = std::io::stderr();
-+        let _ = stderr.write_all(line.as_bytes());
 +        if let Some(uart) = self.uart.lock().unwrap().as_mut() {
 +            let _ = uart.write_all(line.as_bytes());
 +            let _ = uart.flush();
@@ -1640,10 +1703,10 @@ index 00000000..1ac2036f
 +}
 diff --git a/drivers/storage/dwmmcd/src/main.rs b/drivers/storage/dwmmcd/src/main.rs
 new file mode 100644
-index 00000000..47cea549
+index 00000000..aa87cd67
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/main.rs
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,182 @@
 +//! dwmmcd - DesignWare MMC (dw_mshc) microSD driver for the RK3399.
 +//!
 +//! Serves the `disk.mmc` scheme for the `sdmmc@fe320000` controller found in
@@ -1819,6 +1882,7 @@ index 00000000..47cea549
 +        if event.fd == scheme.event_handle().raw() {
 +            TrivialExecutor.block_on(scheme.tick()).unwrap();
 +        } else {
++            // stderr already reaches the UART (inherited from init).
 +            let mut stderr = std::io::stderr();
 +            let _ = writeln!(stderr, "dwmmcd: unknown event {}", event.fd);
 +        }

@@ -109,6 +109,8 @@ init: switchroot to /usr /etc              <-- root filesystem!
 
 | Symptom (last dwmmcd line)                    | Meaning                                                        | Next action                                                                    |
 | --------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `init failed: Connection timed out` (no CMD*) | iteration 1: clock update stalled on the IDMAC-state controller | fixed for iteration 2: full controller reset first (see above)                 |
+| `clock update (stop/div/start) failed`        | CIU still not accepting updates after the reset                | capture the logged `rint`/`status`, compare with U-Boot `md 0xfe32002c`        |
 | `CMD0 failed: timeout`                        | controller not talking (clocking/power state unexpected)       | dump `CLKDIV/CLKENA/CLKSRC` from the log, try U-Boot `md 0xfe320008` pre-boot  |
 | `CMD8 ok` then `ACMD41 busy timeout`          | card never leaves busy; identification clock too slow/fast      | try `INIT_CLKDIV` 32/128, measure with U-Boot `mmc dev 1; mmc rescan`          |
 | `CMD3 failed` / `card returned RCA 0`         | RCA handshake broken (unlikely after ACMD41)                   | compare response words with a U-Boot `mmc switch` trace                        |
@@ -116,14 +118,61 @@ init: switchroot to /usr /etc              <-- root filesystem!
 | `data timeout at block ...`                   | FIFO starvation or DTO never fires                             | check `STATUS` FIFO count in the log line, lower chunk size to 1 block          |
 | `block 0 signature` not `55aa`                | reads return garbage (byte order/sync issue)                   | hexdump block 0 from debugsh: `hexdump disk.mmc: 512`? (needs scheme read)     |
 
+## First hardware boot (iteration 1, `logs/serial-20261120-082135.log`)
+
+What worked, in order:
+
+- DTB node walk correct: SDIO `mmc@fe310000` skipped, microSD
+  `mmc@fe320000` selected; mapped `(len 0x4000)`.
+- Inherited state read and logged (all values sane, matching what U-Boot
+  leaves after an EFI boot):
+  `verid=0x5342270a` (IP 2.70a, FIFO data register +0x200 confirmed),
+  `clkdiv=0, clksrc=0, clkena=0x00010001` (enable + low-power),
+  `ctype=0x1` (4-bit), `fifoth=0x207f0080` (U-Boot watermark), and —
+  decisive — `ctrl=0x02000000` = **CTRL bit 25, USE_IDMAC**: U-Boot's EFI
+  path read the ESP through the internal DMA engine.
+- Card enumeration did NOT start: the driver failed with
+  `Connection timed out` (ETIMEDOUT) inside `set_clkdiv` — the CIU
+  clock-update command never reached command-done. No CMD0/CMD8 lines were
+  logged, so the failure is before any card traffic.
+
+Diagnosis: the driver tiptoed around the inherited (IDMAC-active) state
+instead of resetting it. U-Boot's own `dwmci_init` always starts from a full
+`CTRL` reset (controller + FIFO + DMA) before touching clocks; with the DMA
+engine still armed, the very first clock-only command stalls. The reset is
+compatible with the inherited-clocking strategy: it clears only CIU-side
+registers (CLKDIV/CLKENA/CTYPE), which are immediately reprogrammed from
+known values — the CRU `cclk_sdmmc` rate is outside the block and untouched.
+
+Iteration 2 changes (built, image regenerated):
+
+- `controller_setup` now performs the full U-Boot reset sequence:
+  `CTRL = RESET|FIFO_RESET|DMA_RESET` (wait for self-clear, 500 ms guard),
+  then `BMOD = 1` (IDMAC software reset), then INTMASK/TMOUT/FIFOTH as
+  before.
+- The clock-update command drops `USE_HOLD_REG` to match U-Boot's
+  clock-only command exactly (`START | PRV_DAT_WAIT | UPD_CLK`).
+- `set_clkdiv` logs the failing stage (`stop`/`div`/`start`) with
+  `RINTSTS`/`STATUS` on timeout, so the next capture pinpoints any
+  remaining stall.
+- Logger no longer writes stderr (initfs daemons inherit init's stdio,
+  which is already the debug scheme — every line was duplicated on the
+  UART in iteration 1).
+
+Side observations from the same session (debugsh): bare `ls` and `ls /`
+now work (`ls /` lists the scheme namespace: `chan? debug? display.vesa?
+event? initfs/ input? irq/ kernel.dtb ...`); inputd logs a spurious
+`invalid path ''` error line during boot (pre-existing, unrelated).
+
 ## Status
 
-**in progress** — driver written, built into the image, awaiting the first
-hardware boot. Fill in after the test:
+**in progress** — iteration 2 built and flashed-pending:
 
-- [ ] flashed and booted
-- [ ] dwmmcd enumeration lines seen on UART
-- [ ] `disk.mmc` scheme registered
+- [x] flashed and booted (iteration 1, 2026-11-20 08:21)
+- [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited
+      state)
+- [ ] `disk.mmc` scheme registered (iteration 1 failed at clock update;
+      reset-based iteration 2 pending)
 - [ ] redoxfs mounted the root filesystem
 - [ ] `init: switchroot to /usr /etc`
 - [ ] rootfs userspace (getty/ion) reached
