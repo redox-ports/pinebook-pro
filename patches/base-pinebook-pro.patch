@@ -1,9 +1,9 @@
-# redox-os/base @ 8f576d27: Pinebook Pro initfs console and DW MMC storage
+# redox-os/base @ 8f576d27: Pinebook Pro initfs daemons and platform fixes
 #
 # Target repository : https://gitlab.redox-os.org/redox-os/base.git
 # Base commit       : 8f576d27ee5d028157b001e320affc7b1ec2736b (main, 2026-11)
-# Reason            : Pinebook Pro (RK3399) bring-up needs two initfs-only
-#                     additions that upstream does not have.
+# Reason            : Pinebook Pro (RK3399) bring-up needs four initfs-only
+#                     additions plus one display fix that upstream does not have.
 #
 #                     1. Interim serial console (experiments 4-5): the boot
 #                        stops at the initfs phase until storage works, so
@@ -76,6 +76,23 @@
 #                        the same pixel size. `FRAMEBUFFER{n}` gained an
 #                        optional fifth field (bpp) for additional outputs.
 #
+#                     4. USB input (experiment 8): `ohcid`, a static initfs
+#                        OHCI host controller driver for the RK3399 USB2
+#                        ports. U-Boot only brings up the OHCI halves of the
+#                        two EHCI/OHCI pairs, and the internal hub with the
+#                        keyboard and touchpad sits there. The driver maps
+#                        the controller through physmap, allocates
+#                        physically-contiguous descriptors through
+#                        common::dma, resets the root port(s), enumerates one
+#                        level of hub (class requests, port power/reset),
+#                        reads the configuration descriptors, switches a boot
+#                        keyboard to the boot protocol, and polls its
+#                        interrupt endpoint from one periodic slot (~32 ms).
+#                        Translated HID usages become `inputd` events, the
+#                        same path usbhidd uses. Everything is polled: no
+#                        controller interrupts, no nanosleep (the kernel does
+#                        not wake sleepers on the generic timer).
+#
 # Contents:
 #   * debugsh/                  new initfs-only crate (static binary;
 #                               `reboot` writes `reset` to the kernel sys:kstop
@@ -83,7 +100,9 @@
 #   * drivers/storage/dwmmcd/   new initfs-only crate (static binary)
 #   * drivers/graphics/vesad/src/main.rs, scheme.rs
 #                               honour FRAMEBUFFER_BPP (RGB565)
-#   * Makefile                  add debugsh and dwmmcd to INITFS_BINS
+#   * drivers/usb/ohcid/        new initfs-only crate (static binary)
+#   * init.initfs.d/40_ohcid.service            USB input (aarch64 only)
+#   * Makefile                  add debugsh, dwmmcd and ohcid to INITFS_BINS
 #   * Cargo.toml, Cargo.lock    workspace members + lock entries
 #   * init.initfs.d/95_debugsh.service          debug console (aarch64 only)
 #   * init.initfs.d/40_dwmmcd.service           microSD driver (aarch64 only)
@@ -95,7 +114,7 @@
 #
 # Apply from recipes/core/base/source:  git apply <this file>
 diff --git a/Cargo.lock b/Cargo.lock
-index bc96c6ed..b6a264df 100644
+index bc96c6ed..e3265b4f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -560,6 +560,14 @@ dependencies = [
@@ -133,8 +152,28 @@ index bc96c6ed..b6a264df 100644
  [[package]]
  name = "e1000d"
  version = "0.1.0"
+@@ -1563,6 +1584,19 @@ dependencies = [
+  "smallvec",
+ ]
+ 
++[[package]]
++name = "ohcid"
++version = "0.1.0"
++dependencies = [
++ "common",
++ "daemon",
++ "fdt",
++ "inputd",
++ "libredox 0.2.0",
++ "orbclient",
++ "redox_syscall 0.9.5",
++]
++
+ [[package]]
+ name = "once_cell"
+ version = "1.21.4"
 diff --git a/Cargo.toml b/Cargo.toml
-index 202fd178..ec9efea2 100644
+index 202fd178..659814fd 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -5,6 +5,7 @@ members = [
@@ -153,8 +192,16 @@ index 202fd178..ec9efea2 100644
      "drivers/storage/driver-block",
      "drivers/storage/ided",
      "drivers/storage/lived",          # TODO: not really a driver...
+@@ -68,6 +70,7 @@ members = [
+     "drivers/storage/virtio-blkd",
+     "drivers/storage/virtio-fsd",
+ 
++    "drivers/usb/ohcid",
+     "drivers/usb/xhcid",
+     "drivers/usb/usbctl",
+     "drivers/usb/usbhubd",
 diff --git a/Makefile b/Makefile
-index 6c2970fe..e0dc8e56 100644
+index 6c2970fe..081eb81d 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -13,7 +13,7 @@ TARGET_DIR = $(BUILD_DIR)/$(TARGET)/$(BUILD_TYPE)
@@ -171,7 +218,7 @@ index 6c2970fe..e0dc8e56 100644
  
  ifeq ($(TARGET),aarch64-unknown-redox)
 -	INITFS_BINS += bcm2835-sdhcid
-+	INITFS_BINS += bcm2835-sdhcid dwmmcd
++	INITFS_BINS += bcm2835-sdhcid dwmmcd ohcid
  endif
  
  # For testing/benchmarking only
@@ -2558,6 +2605,1708 @@ index 00000000..175b67f0
 +    }
 +    process::exit(0);
 +}
+diff --git a/drivers/usb/ohcid/Cargo.toml b/drivers/usb/ohcid/Cargo.toml
+new file mode 100644
+index 00000000..9f69c300
+--- /dev/null
++++ b/drivers/usb/ohcid/Cargo.toml
+@@ -0,0 +1,18 @@
++[package]
++name = "ohcid"
++version = "0.1.0"
++description = "OHCI host controller driver for the Rockchip RK3399 USB2 ports"
++edition = "2024"
++license = "MIT"
++
++[dependencies]
++common = { path = "../../common" }
++daemon = { path = "../../../daemon" }
++fdt.workspace = true
++inputd = { path = "../../inputd" }
++libredox.workspace = true
++orbclient.workspace = true
++redox_syscall = { workspace = true, features = ["std"] }
++
++[lints]
++workspace = true
+diff --git a/drivers/usb/ohcid/src/log.rs b/drivers/usb/ohcid/src/log.rs
+new file mode 100644
+index 00000000..132e2df7
+--- /dev/null
++++ b/drivers/usb/ohcid/src/log.rs
+@@ -0,0 +1,62 @@
++//! Bring-up logging for ohcid.
++//!
++//! stdout/stderr of initfs daemons go to the `log` scheme, which lives in RAM
++//! and is only visible on the boot VT. During USB bring-up the interesting
++//! events must be readable on the UART, so every message is also mirrored to
++//! the kernel `debug` scheme. The fd is opened before the daemon enters the
++//! null namespace, so it stays valid afterwards.
++
++use std::fs::OpenOptions;
++use std::io::Write;
++use std::os::unix::fs::OpenOptionsExt;
++use std::sync::Mutex;
++
++use libredox::flag;
++
++pub struct Logger {
++    uart: Mutex<Option<std::fs::File>>,
++    start_ms: u64,
++}
++
++fn now_ms() -> u64 {
++    let mut ts = syscall::TimeSpec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    if syscall::clock_gettime(syscall::flag::CLOCK_MONOTONIC, &mut ts).is_err() {
++        return 0;
++    }
++    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
++}
++
++impl Logger {
++    pub fn new() -> Self {
++        let start_ms = now_ms();
++        let uart = match OpenOptions::new()
++            .write(true)
++            .custom_flags(flag::O_WRONLY | flag::O_CLOEXEC)
++            .open("/scheme/debug")
++        {
++            Ok(file) => Some(file),
++            Err(err) => {
++                let mut stderr = std::io::stderr();
++                let _ = writeln!(stderr, "ohcid: cannot open /scheme/debug: {}", err);
++                None
++            }
++        };
++        Logger {
++            uart: Mutex::new(uart),
++            start_ms,
++        }
++    }
++
++    /// Emit one line to the UART (kernel debug scheme).
++    pub fn log(&self, args: core::fmt::Arguments) {
++        let elapsed = (now_ms().saturating_sub(self.start_ms)) as f64 / 1000.0;
++        let line = format!("[{:8.3}] {}\n", elapsed, args);
++        if let Some(uart) = self.uart.lock().unwrap().as_mut() {
++            let _ = uart.write_all(line.as_bytes());
++            let _ = uart.flush();
++        }
++    }
++}
+diff --git a/drivers/usb/ohcid/src/main.rs b/drivers/usb/ohcid/src/main.rs
+new file mode 100644
+index 00000000..17f55b33
+--- /dev/null
++++ b/drivers/usb/ohcid/src/main.rs
+@@ -0,0 +1,957 @@
++//! ohcid - OHCI host controller driver for the RK3399 USB2 ports.
++//!
++//! The Pinebook Pro's internal keyboard and touchpad sit behind a Genesys hub
++//! on `usb_host0`, which the installed U-Boot enumerates on the OHCI half of
++//! the EHCI/OHCI pair (its boot log lists `Bus usb@fe3e0000: USB OHCI 1.0`
++//! and no EHCI bus). This driver brings that controller up, enumerates the
++//! root port(s) and one level of hub, and translates boot-protocol HID
++//! keyboard reports into `inputd` events.
++//!
++//! Everything is polled: no interrupts are enabled, no `nanosleep` is used
++//! (the kernel does not wake sleepers on the generic timer, README risk 13),
++//! and the interrupt endpoint is scheduled in a single periodic slot, so the
++//! keyboard is sampled roughly every 32 ms.
++//!
++//! The driver registers as an initfs service and calls `daemon.ready()`
++//! before it touches hardware, so a failure here never blocks the boot: the
++//! root filesystem still mounts and the serial login still works.
++
++mod log;
++mod ohci;
++
++use std::{process, thread};
++
++use fdt::Fdt;
++use inputd::ProducerHandle;
++use orbclient::KeyEvent as OrbKeyEvent;
++
++use crate::log::Logger;
++use crate::ohci::{Error, Ohci};
++
++/// `usb_host0_ohci` and `usb_host1_ohci` (`rk3399.dtsi`). The internal hub
++/// with the keyboard/touchpad is on the first one; the second drives the
++/// remaining USB2 port.
++const OHCI_BASES: [usize; 2] = [0xfe3e0000, 0xfe3a0000];
++
++// USB standard descriptor types.
++const DESC_DEVICE: u8 = 1;
++const DESC_CONFIG: u8 = 2;
++const DESC_HUB: u8 = 0x29;
++
++// USB class codes.
++const CLASS_HUB: u8 = 9;
++const CLASS_HID: u8 = 3;
++
++// Hub class features (USB 2.0, 11.5.4).
++const FEAT_PORT_RESET: u16 = 4;
++const FEAT_PORT_POWER: u16 = 8;
++const FEAT_C_PORT_CONNECTION: u16 = 16;
++const FEAT_C_PORT_RESET: u16 = 20;
++
++// Hub port status bits.
++const PORT_CONNECTION: u16 = 1 << 0;
++const PORT_ENABLE: u16 = 1 << 1;
++const PORT_RESET: u16 = 1 << 4;
++const PORT_LOW_SPEED: u16 = 1 << 9;
++const PORT_RESET_CHANGE: u16 = 1 << 4;
++
++fn main() {
++    daemon::Daemon::new(daemon);
++}
++
++fn daemon(daemon: daemon::Daemon) -> ! {
++    common::init();
++    // Never let USB bring-up hold the boot up: init blocks on notify-type
++    // services, and the root filesystem does not depend on input.
++    daemon.ready();
++
++    let mut driver = Driver::new();
++    driver.log.log(format_args!("ohcid: starting"));
++
++    driver.bring_up_all();
++
++    if driver.hids.is_empty() {
++        driver.log.log(format_args!(
++            "ohcid: no HID keyboard found; input stays on the other drivers"
++        ));
++        // Stay alive but idle instead of exiting, so a later hotplug could
++        // still be handled once re-enumeration is implemented.
++        loop {
++            thread::yield_now();
++        }
++    }
++
++    driver.log.log(format_args!(
++        "ohcid: polling {} keyboard(s)",
++        driver.hids.len()
++    ));
++    driver.poll_forever();
++}
++
++struct Driver {
++    log: Logger,
++    hc: Option<Ohci>,
++    hids: Vec<HidDevice>,
++    input: ProducerHandle,
++}
++
++impl Driver {
++    fn new() -> Self {
++        let log = Logger::new();
++        let input = match wait_for_input(&log) {
++            Some(input) => input,
++            None => {
++                log.log(format_args!("ohcid: /scheme/input never appeared, exiting"));
++                process::exit(1);
++            }
++        };
++        Driver {
++            log,
++            hc: None,
++            hids: Vec::new(),
++            input,
++        }
++    }
++
++    fn bring_up_all(&mut self) {
++        let dtb = read_dtb();
++        let bases = dtb_ohci_bases(dtb.as_deref());
++        if bases.is_empty() {
++            self.log.log(format_args!(
++                "ohcid: no OHCI nodes in the devicetree, trying the known RK3399 addresses"
++            ));
++        }
++
++        for base in OHCI_BASES {
++            if !bases.is_empty() && !bases.contains(&base) {
++                self.log.log(format_args!(
++                    "ohcid: 0x{:08x} is not enabled in the devicetree, skipped",
++                    base
++                ));
++                continue;
++            }
++            if let Err(err) = self.bring_up_controller(base) {
++                self.log
++                    .log(format_args!("ohcid: 0x{:08x} failed: {:?}", base, err));
++            }
++        }
++    }
++
++    fn bring_up_controller(&mut self, base: usize) -> Result<(), Error> {
++        let mut hc = unsafe { Ohci::new(base) }?;
++        self.log.log(format_args!(
++            "ohcid: 0x{:08x}: OHCI revision 0x{:02x}, {} port(s)",
++            base,
++            hc.revision() & 0xff,
++            hc.num_ports()
++        ));
++        hc.init()?;
++        self.log.log(format_args!(
++            "ohcid: 0x{:08x}: operational, control 0x{:08x} rh_a 0x{:08x}",
++            base,
++            hc.read(ohci::REG_CONTROL),
++            hc.read(ohci::REG_RH_A)
++        ));
++        hc.power_ports()?;
++
++        let ports = hc.num_ports();
++        let mut en = Enumeration {
++            hc: &mut hc,
++            log: &self.log,
++            next_addr: 1,
++            next_ed: 4, // slots 0..3 are the control pipe
++            next_td: 4,
++            next_slot: 0,
++            found: Vec::new(),
++        };
++
++        for port in 0..ports {
++            let status = en.hc.port_status(port);
++            en.log.log(format_args!(
++                "ohcid: 0x{:08x}: port {} status 0x{:08x}{}",
++                base,
++                port + 1,
++                status,
++                if status & 1 != 0 { " (connected)" } else { "" }
++            ));
++            if status & 1 == 0 {
++                continue;
++            }
++
++            match en.hc.reset_root_port(port) {
++                Ok((connected, low_speed, enabled)) => {
++                    en.log.log(format_args!(
++                        "ohcid: 0x{:08x}: port {} reset (connected {}, low-speed {}, enabled {})",
++                        base,
++                        port + 1,
++                        connected,
++                        low_speed,
++                        enabled
++                    ));
++                    if !connected {
++                        continue;
++                    }
++                    // USB 2.0, 7.1.7.5: 2 ms of recovery, generously padded.
++                    en.hc.delay_ms(20);
++                    if let Err(err) = en.enumerate_at_zero(low_speed, 0) {
++                        en.log.log(format_args!(
++                            "ohcid: 0x{:08x}: port {} enumeration failed: {:?}",
++                            base,
++                            port + 1,
++                            err
++                        ));
++                    }
++                }
++                Err(err) => en.log.log(format_args!(
++                    "ohcid: 0x{:08x}: port {} reset failed: {:?}",
++                    base,
++                    port + 1,
++                    err
++                )),
++            }
++        }
++
++        let found = en.found;
++        self.log.log(format_args!(
++            "ohcid: 0x{:08x}: {} HID device(s)",
++            base,
++            found.len()
++        ));
++        self.hids.extend(found);
++        // Keep the controller alive for the poll loop.
++        self.hc = Some(hc);
++        Ok(())
++    }
++
++    fn poll_forever(&mut self) -> ! {
++        loop {
++            for hid in self.hids.iter_mut() {
++                hid.poll(
++                    self.hc.as_mut().expect("controller"),
++                    &mut self.input,
++                    &self.log,
++                );
++            }
++            thread::yield_now();
++        }
++    }
++}
++
++fn wait_for_input(log: &Logger) -> Option<ProducerHandle> {
++    let deadline = ohci::now_ms() + 5_000;
++    loop {
++        match ProducerHandle::new() {
++            Ok(handle) => return Some(handle),
++            Err(err) => {
++                if ohci::now_ms() > deadline {
++                    log.log(format_args!("ohcid: cannot open /scheme/input: {}", err));
++                    return None;
++                }
++                thread::yield_now();
++            }
++        }
++    }
++}
++
++fn read_dtb() -> Option<Vec<u8>> {
++    std::fs::read("kernel.dtb:").ok()
++}
++
++/// Collect the `reg` base addresses of the enabled `rockchip,rk3399-ohci`
++/// nodes. An empty result means "no devicetree information available", in
++/// which case the caller falls back to the known addresses.
++fn dtb_ohci_bases(data: Option<&[u8]>) -> Vec<usize> {
++    let Some(data) = data else {
++        return Vec::new();
++    };
++    let Ok(fdt) = Fdt::new_unaligned(data) else {
++        return Vec::new();
++    };
++    let mut bases = Vec::new();
++    for node in fdt.all_compatible(&["rockchip,rk3399-ohci"]) {
++        let Some(reg) = node.reg() else { continue };
++        let Some(Ok(entry)) = reg.iter::<usize, usize>().next() else {
++            continue;
++        };
++        bases.push(entry.address);
++    }
++    bases
++}
++
++/// Enumeration state for one controller pass.
++struct Enumeration<'a> {
++    hc: &'a mut Ohci,
++    log: &'a Logger,
++    next_addr: u8,
++    next_ed: usize,
++    next_td: usize,
++    next_slot: usize,
++    found: Vec<HidDevice>,
++}
++
++impl<'a> Enumeration<'a> {
++    fn alloc_addr(&mut self) -> Result<u8, Error> {
++        let addr = self.next_addr;
++        if addr >= 127 {
++            return Err(Error::Protocol("out of USB addresses"));
++        }
++        self.next_addr += 1;
++        Ok(addr)
++    }
++
++    /// Enumerate the device that currently answers at address 0.
++    /// `depth` is 0 for a root port device, 1 for a hub downstream port.
++    fn enumerate_at_zero(&mut self, low_speed: bool, depth: u8) -> Result<(), Error> {
++        // First 8 bytes: enough to learn wMaxPacketSize0.
++        let mut first = [0u8; 8];
++        self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first)?;
++        let mps0 = match first[7] {
++            8 | 16 | 32 | 64 => first[7],
++            other => {
++                self.log.log(format_args!(
++                    "ohcid:   implausible bMaxPacketSize0 {} (using 8)",
++                    other
++                ));
++                8
++            }
++        };
++
++        let addr = self.alloc_addr()?;
++        self.set_address(0, low_speed, 8, addr)?;
++        // USB 2.0, 9.2.6.3: 2 ms of recovery.
++        self.hc.delay_ms(10);
++
++        let mut dev = [0u8; 18];
++        self.get_descriptor(addr, low_speed, u16::from(mps0), DESC_DEVICE, 0, &mut dev)?;
++
++        let vid = u16::from_le_bytes([dev[8], dev[9]]);
++        let pid = u16::from_le_bytes([dev[10], dev[11]]);
++        let class = dev[4];
++        let subclass = dev[5];
++        let protocol = dev[6];
++        self.log.log(format_args!(
++            "ohcid:   {} addr {} id {:04x}:{:04x} class {:02x}/{:02x}/{:02x} mps0 {} {}",
++            if depth == 0 {
++                "root device"
++            } else {
++                "hub device"
++            },
++            addr,
++            vid,
++            pid,
++            class,
++            subclass,
++            protocol,
++            mps0,
++            if low_speed { "low-speed" } else { "full-speed" }
++        ));
++
++        if class == CLASS_HUB {
++            return self.enumerate_hub(addr, low_speed, mps0, depth);
++        }
++
++        // Configuration descriptor: header first for wTotalLength.
++        let mut header = [0u8; 9];
++        self.get_descriptor(
++            addr,
++            low_speed,
++            u16::from(mps0),
++            DESC_CONFIG,
++            0,
++            &mut header,
++        )?;
++        let total = u16::from_le_bytes([header[2], header[3]]) as usize;
++        if !(9..=512).contains(&total) {
++            return Err(Error::Protocol("bad configuration descriptor length"));
++        }
++        let mut config = vec![0u8; total];
++        self.get_descriptor(
++            addr,
++            low_speed,
++            u16::from(mps0),
++            DESC_CONFIG,
++            0,
++            &mut config,
++        )?;
++
++        let config_value = config[5];
++        self.set_configuration(addr, low_speed, u16::from(mps0), config_value)?;
++
++        let Some(info) = find_hid_keyboard(&config) else {
++            self.log
++                .log(format_args!("ohcid:   no HID keyboard interface, ignored"));
++            return Ok(());
++        };
++
++        self.log.log(format_args!(
++            "ohcid:   HID interface {} protocol {} endpoint 0x{:02x} mps {} interval {}",
++            info.interface, info.protocol, info.ep_address, info.ep_mps, info.ep_interval
++        ));
++        if info.protocol == 2 {
++            self.log.log(format_args!(
++                "ohcid:   boot mouse interface, report parser not implemented yet"
++            ));
++            return Ok(());
++        }
++        if info.protocol == 1 {
++            // Boot protocol: fixed 8-byte keyboard reports.
++            self.hid_set_protocol(addr, low_speed, mps0, info.interface)?;
++        } else {
++            self.log.log(format_args!(
++                "ohcid:   device uses report protocol, assuming boot layout"
++            ));
++        }
++        let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
++        self.start_hid(addr, low_speed, info)?;
++        Ok(())
++    }
++
++    fn enumerate_hub(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        depth: u8,
++    ) -> Result<(), Error> {
++        if depth >= 1 {
++            self.log
++                .log(format_args!("ohcid:   nested hub ignored (one level only)"));
++            return Ok(());
++        }
++        self.set_configuration(addr, low_speed, u16::from(mps0), 1)?;
++
++        let mut hub = [0u8; 9];
++        let got = self.get_descriptor(addr, low_speed, u16::from(mps0), DESC_HUB, 0, &mut hub)?;
++        if got < 3 {
++            return Err(Error::Protocol("short hub descriptor"));
++        }
++        let ports = hub[2];
++        self.log
++            .log(format_args!("ohcid:   hub with {} port(s)", ports));
++
++        for port in 1..=ports {
++            let (status, change) = self.hub_port_status(addr, low_speed, mps0, port)?;
++            if change & PORT_RESET_CHANGE != 0 {
++                let _ = self.hub_clear_feature(addr, low_speed, mps0, port, FEAT_C_PORT_CONNECTION);
++            }
++            if status & PORT_CONNECTION == 0 {
++                continue;
++            }
++
++            let _ = self.hub_set_feature(addr, low_speed, mps0, port, FEAT_PORT_POWER);
++            self.hc.delay_ms(100);
++
++            self.hub_set_feature(addr, low_speed, mps0, port, FEAT_PORT_RESET)?;
++            // The hub clears PORT_RESET when its 10 ms sequence finishes.
++            let deadline = ohci::now_ms() + 500;
++            loop {
++                let (status, change) = self.hub_port_status(addr, low_speed, mps0, port)?;
++                if status & PORT_RESET == 0 && change & PORT_RESET_CHANGE != 0 {
++                    break;
++                }
++                if ohci::now_ms() > deadline {
++                    self.log.log(format_args!(
++                        "ohcid:   hub port {} reset timed out (status 0x{:04x})",
++                        port, status
++                    ));
++                    break;
++                }
++                self.hc.delay_ms(2);
++            }
++
++            let _ = self.hub_clear_feature(addr, low_speed, mps0, port, FEAT_C_PORT_RESET);
++            let _ = self.hub_clear_feature(addr, low_speed, mps0, port, FEAT_C_PORT_CONNECTION);
++
++            let (status, _) = self.hub_port_status(addr, low_speed, mps0, port)?;
++            if status & PORT_CONNECTION == 0 {
++                self.log.log(format_args!(
++                    "ohcid:   hub port {}: nothing connected after reset",
++                    port
++                ));
++                continue;
++            }
++
++            let dev_low_speed = status & PORT_LOW_SPEED != 0;
++            self.log.log(format_args!(
++                "ohcid:   hub port {}: device attached (status 0x{:04x}, {}, enabled {})",
++                port,
++                status,
++                if dev_low_speed {
++                    "low-speed"
++                } else {
++                    "full-speed"
++                },
++                status & PORT_ENABLE != 0
++            ));
++            self.hc.delay_ms(20);
++
++            if let Err(err) = self.enumerate_at_zero(dev_low_speed, depth + 1) {
++                self.log.log(format_args!(
++                    "ohcid:   hub port {} enumeration failed: {:?}",
++                    port, err
++                ));
++            }
++            // One keyboard is enough for the bring-up milestone.
++            if !self.found.is_empty() {
++                break;
++            }
++        }
++        Ok(())
++    }
++
++    // --- control requests -------------------------------------------------
++
++    fn get_descriptor(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps: u16,
++        desc_type: u8,
++        index: u8,
++        buf: &mut [u8],
++    ) -> Result<usize, Error> {
++        let value = (u32::from(desc_type) << 8) | u32::from(index);
++        let setup = build_setup(0x80, 6, value, 0, buf.len() as u16);
++        self.hc
++            .control_transfer(addr, low_speed, mps, setup, Some(buf), true)
++    }
++
++    fn set_address(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps: u16,
++        new_addr: u8,
++    ) -> Result<(), Error> {
++        let setup = build_setup(0x00, 5, u32::from(new_addr), 0, 0);
++        self.hc
++            .control_transfer(addr, low_speed, mps, setup, None, false)?;
++        Ok(())
++    }
++
++    fn set_configuration(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps: u16,
++        value: u8,
++    ) -> Result<(), Error> {
++        let setup = build_setup(0x00, 9, u32::from(value), 0, 0);
++        self.hc
++            .control_transfer(addr, low_speed, mps, setup, None, false)?;
++        Ok(())
++    }
++
++    fn hid_set_protocol(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        interface: u8,
++    ) -> Result<(), Error> {
++        // bmRequestType 0x21 (class, interface), bRequest SET_PROTOCOL.
++        let setup = build_setup(0x21, 0x0b, 1, u32::from(interface), 0);
++        self.hc
++            .control_transfer(addr, low_speed, u16::from(mps0), setup, None, false)?;
++        Ok(())
++    }
++
++    fn hid_set_idle(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        interface: u8,
++    ) -> Result<(), Error> {
++        // bmRequestType 0x21, bRequest SET_IDLE, idle rate 0 (report on change).
++        let setup = build_setup(0x21, 0x0a, 0, u32::from(interface), 0);
++        self.hc
++            .control_transfer(addr, low_speed, u16::from(mps0), setup, None, false)?;
++        Ok(())
++    }
++
++    fn hub_port_status(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        port: u8,
++    ) -> Result<(u16, u16), Error> {
++        let mut data = [0u8; 4];
++        let setup = build_setup(0xa3, 0x00, 0, u32::from(port), 4);
++        self.hc.control_transfer(
++            addr,
++            low_speed,
++            u16::from(mps0),
++            setup,
++            Some(&mut data),
++            true,
++        )?;
++        Ok((
++            u16::from_le_bytes([data[0], data[1]]),
++            u16::from_le_bytes([data[2], data[3]]),
++        ))
++    }
++
++    fn hub_set_feature(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        port: u8,
++        feature: u16,
++    ) -> Result<(), Error> {
++        let setup = build_setup(0x23, 0x03, u32::from(feature), u32::from(port), 0);
++        self.hc
++            .control_transfer(addr, low_speed, u16::from(mps0), setup, None, false)?;
++        Ok(())
++    }
++
++    fn hub_clear_feature(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps0: u8,
++        port: u8,
++        feature: u16,
++    ) -> Result<(), Error> {
++        let setup = build_setup(0x23, 0x01, u32::from(feature), u32::from(port), 0);
++        self.hc
++            .control_transfer(addr, low_speed, u16::from(mps0), setup, None, false)?;
++        Ok(())
++    }
++
++    fn start_hid(&mut self, addr: u8, low_speed: bool, info: HidInfo) -> Result<(), Error> {
++        let ed = self.next_ed;
++        let td = self.next_td;
++        let dummy = self.next_td + 1;
++        let slot = self.next_slot % 32;
++        self.next_ed += 1;
++        self.next_td += 2;
++        self.next_slot += 1;
++
++        let mps = info.ep_mps;
++        let (buf_off, buf_phys) = self.hc.alloc_buf(usize::from(mps))?;
++        self.hc.arm_interrupt(
++            ed,
++            td,
++            dummy,
++            addr,
++            info.ep_number,
++            low_speed,
++            mps,
++            buf_phys,
++            slot,
++        )?;
++
++        self.log.log(format_args!(
++            "ohcid:   polling keyboard addr {} endpoint {} via periodic slot {}",
++            addr, info.ep_number, slot
++        ));
++
++        self.found.push(HidDevice {
++            ed,
++            td,
++            dummy,
++            buf_off,
++            buf_phys,
++            mps,
++            slot,
++            addr,
++            ep: info.ep_number,
++            low_speed,
++            prev_modifiers: 0,
++            prev_keys: [0; 6],
++            seen: false,
++        });
++        Ok(())
++    }
++}
++
++fn build_setup(request_type: u8, request: u8, value: u32, index: u32, length: u16) -> [u8; 8] {
++    let mut setup = [0u8; 8];
++    setup[0] = request_type;
++    setup[1] = request;
++    setup[2..4].copy_from_slice(&(value as u16).to_le_bytes());
++    setup[4..6].copy_from_slice(&(index as u16).to_le_bytes());
++    setup[6..8].copy_from_slice(&length.to_le_bytes());
++    setup
++}
++
++/// Parsed HID keyboard interface.
++#[derive(Clone, Copy)]
++struct HidInfo {
++    interface: u8,
++    protocol: u8,
++    ep_address: u8,
++    ep_number: u8,
++    ep_mps: u16,
++    ep_interval: u8,
++}
++
++/// Walk a configuration descriptor and return the first HID interface that
++/// has an interrupt IN endpoint. Boot keyboards use subclass 1; some devices
++/// report subclass 0, so only the class is required here.
++fn find_hid_keyboard(config: &[u8]) -> Option<HidInfo> {
++    let mut i = 0usize;
++    let mut current: Option<(u8, u8)> = None;
++    while i + 2 <= config.len() {
++        let len = usize::from(config[i]);
++        if len < 2 || i + len > config.len() {
++            break;
++        }
++        let ty = config[i + 1];
++        if ty == 4 && len >= 9 {
++            let number = config[i + 2];
++            let class = config[i + 5];
++            let protocol = config[i + 7];
++            current = if class == CLASS_HID {
++                Some((number, protocol))
++            } else {
++                None
++            };
++        } else if ty == 5 && len >= 7 {
++            if let Some((interface, protocol)) = current {
++                let address = config[i + 2];
++                let attributes = config[i + 3];
++                let is_interrupt = attributes & 0x03 == 3;
++                let is_in = address & 0x80 != 0;
++                if is_interrupt && is_in {
++                    let mps = u16::from_le_bytes([config[i + 4], config[i + 5]]) & 0x07ff;
++                    return Some(HidInfo {
++                        interface,
++                        protocol,
++                        ep_address: address,
++                        ep_number: address & 0x0f,
++                        ep_mps: mps,
++                        ep_interval: config[i + 6],
++                    });
++                }
++            }
++        }
++        i += len;
++    }
++    None
++}
++
++struct HidDevice {
++    ed: usize,
++    td: usize,
++    dummy: usize,
++    buf_off: usize,
++    buf_phys: usize,
++    mps: u16,
++    slot: usize,
++    addr: u8,
++    ep: u8,
++    low_speed: bool,
++    prev_modifiers: u8,
++    prev_keys: [u8; 6],
++    seen: bool,
++}
++
++impl HidDevice {
++    fn poll(&mut self, hc: &mut Ohci, input: &mut ProducerHandle, log: &Logger) {
++        if !hc.interrupt_done(self.td) {
++            return;
++        }
++
++        let cc = hc.interrupt_cc(self.td);
++        let len = hc.td_transferred(self.td, self.buf_phys, usize::from(self.mps));
++        let report = hc.buf_slice(self.buf_off, len).to_vec();
++
++        if cc == ohci::TD_CC_NOERROR || cc == ohci::TD_CC_DATAUNDERRUN {
++            if len >= 8 {
++                self.handle_report(&report, input, log);
++            }
++        } else {
++            log.log(format_args!(
++                "ohcid: keyboard {}: interrupt transfer cc {} (halted {})",
++                self.addr,
++                cc,
++                hc.ed(self.ed).head & 0x1 != 0
++            ));
++            hc.clear_interrupt_halt(self.ed);
++        }
++
++        let _ = hc.arm_interrupt(
++            self.ed,
++            self.td,
++            self.dummy,
++            self.addr,
++            self.ep,
++            self.low_speed,
++            self.mps,
++            self.buf_phys,
++            self.slot,
++        );
++        // Keep the done queue drained even though completion is detected
++        // through the TD condition code.
++        let _ = hc.reap_done();
++    }
++
++    fn handle_report(&mut self, report: &[u8], input: &mut ProducerHandle, log: &Logger) {
++        let modifiers = report[0];
++        let mut keys = [0u8; 6];
++        keys.copy_from_slice(&report[2..8]);
++
++        if !self.seen {
++            // The first report is the current idle state, not a key press.
++            self.seen = true;
++            self.prev_modifiers = modifiers;
++            self.prev_keys = keys;
++            return;
++        }
++
++        // Modifier bits map to usages 0xE0..0xE7.
++        for bit in 0..8u8 {
++            let was = self.prev_modifiers & (1 << bit) != 0;
++            let is = modifiers & (1 << bit) != 0;
++            if was != is {
++                if let Some(scancode) = usage_to_scancode(0xe0 + u16::from(bit)) {
++                    send_key(input, scancode, is, log);
++                }
++            }
++        }
++
++        for old in self.prev_keys {
++            if old != 0 && !keys.contains(&old) {
++                if let Some(scancode) = usage_to_scancode(u16::from(old)) {
++                    send_key(input, scancode, false, log);
++                }
++            }
++        }
++        for new in keys {
++            if new != 0 && !self.prev_keys.contains(&new) {
++                if let Some(scancode) = usage_to_scancode(u16::from(new)) {
++                    send_key(input, scancode, true, log);
++                }
++            }
++        }
++
++        self.prev_modifiers = modifiers;
++        self.prev_keys = keys;
++    }
++}
++
++fn send_key(input: &mut ProducerHandle, scancode: u8, pressed: bool, log: &Logger) {
++    let event = OrbKeyEvent {
++        character: '\0',
++        scancode,
++        pressed,
++    };
++    if let Err(err) = input.write_event(event.to_event()) {
++        log.log(format_args!("ohcid: failed to send key event: {}", err));
++    }
++}
++
++/// HID usage (page 0x07) to `orbclient` scancode, same table as `usbhidd`.
++fn usage_to_scancode(usage: u16) -> Option<u8> {
++    Some(match usage {
++        0x04 => orbclient::K_A,
++        0x05 => orbclient::K_B,
++        0x06 => orbclient::K_C,
++        0x07 => orbclient::K_D,
++        0x08 => orbclient::K_E,
++        0x09 => orbclient::K_F,
++        0x0A => orbclient::K_G,
++        0x0B => orbclient::K_H,
++        0x0C => orbclient::K_I,
++        0x0D => orbclient::K_J,
++        0x0E => orbclient::K_K,
++        0x0F => orbclient::K_L,
++        0x10 => orbclient::K_M,
++        0x11 => orbclient::K_N,
++        0x12 => orbclient::K_O,
++        0x13 => orbclient::K_P,
++        0x14 => orbclient::K_Q,
++        0x15 => orbclient::K_R,
++        0x16 => orbclient::K_S,
++        0x17 => orbclient::K_T,
++        0x18 => orbclient::K_U,
++        0x19 => orbclient::K_V,
++        0x1A => orbclient::K_W,
++        0x1B => orbclient::K_X,
++        0x1C => orbclient::K_Y,
++        0x1D => orbclient::K_Z,
++        0x1E => orbclient::K_1,
++        0x1F => orbclient::K_2,
++        0x20 => orbclient::K_3,
++        0x21 => orbclient::K_4,
++        0x22 => orbclient::K_5,
++        0x23 => orbclient::K_6,
++        0x24 => orbclient::K_7,
++        0x25 => orbclient::K_8,
++        0x26 => orbclient::K_9,
++        0x27 => orbclient::K_0,
++        0x28 => orbclient::K_ENTER,
++        0x29 => orbclient::K_ESC,
++        0x2A => orbclient::K_BKSP,
++        0x2B => orbclient::K_TAB,
++        0x2C => orbclient::K_SPACE,
++        0x2D => orbclient::K_MINUS,
++        0x2E => orbclient::K_EQUALS,
++        0x2F => orbclient::K_BRACE_OPEN,
++        0x30 => orbclient::K_BRACE_CLOSE,
++        0x31 => orbclient::K_BACKSLASH,
++        0x32 => 0x56,
++        0x33 => orbclient::K_SEMICOLON,
++        0x34 => orbclient::K_QUOTE,
++        0x35 => orbclient::K_TICK,
++        0x36 => orbclient::K_COMMA,
++        0x37 => orbclient::K_PERIOD,
++        0x38 => orbclient::K_SLASH,
++        0x39 => orbclient::K_CAPS,
++        0x3A => orbclient::K_F1,
++        0x3B => orbclient::K_F2,
++        0x3C => orbclient::K_F3,
++        0x3D => orbclient::K_F4,
++        0x3E => orbclient::K_F5,
++        0x3F => orbclient::K_F6,
++        0x40 => orbclient::K_F7,
++        0x41 => orbclient::K_F8,
++        0x42 => orbclient::K_F9,
++        0x43 => orbclient::K_F10,
++        0x44 => orbclient::K_F11,
++        0x45 => orbclient::K_F12,
++        0x46 => orbclient::K_PRTSC,
++        0x47 => orbclient::K_SCROLL,
++        0x49 => orbclient::K_INS,
++        0x4A => orbclient::K_HOME,
++        0x4B => orbclient::K_PGUP,
++        0x4C => orbclient::K_DEL,
++        0x4D => orbclient::K_END,
++        0x4E => orbclient::K_PGDN,
++        0x4F => orbclient::K_RIGHT,
++        0x50 => orbclient::K_LEFT,
++        0x51 => orbclient::K_DOWN,
++        0x52 => orbclient::K_UP,
++        0x53 => orbclient::K_NUM,
++        0x54 => orbclient::K_NUM_SLASH,
++        0x55 => orbclient::K_NUM_ASTERISK,
++        0x56 => orbclient::K_NUM_MINUS,
++        0x57 => orbclient::K_NUM_PLUS,
++        0x58 => orbclient::K_NUM_ENTER,
++        0x59 => orbclient::K_NUM_1,
++        0x5A => orbclient::K_NUM_2,
++        0x5B => orbclient::K_NUM_3,
++        0x5C => orbclient::K_NUM_4,
++        0x5D => orbclient::K_NUM_5,
++        0x5E => orbclient::K_NUM_6,
++        0x5F => orbclient::K_NUM_7,
++        0x60 => orbclient::K_NUM_8,
++        0x61 => orbclient::K_NUM_9,
++        0x62 => orbclient::K_NUM_0,
++        0x64 => orbclient::K_APP,
++        0x66 => orbclient::K_POWER,
++        0xE0 => orbclient::K_LEFT_CTRL,
++        0xE1 => orbclient::K_LEFT_SHIFT,
++        0xE2 => orbclient::K_ALT,
++        0xE3 => orbclient::K_LEFT_SUPER,
++        0xE4 => orbclient::K_RIGHT_CTRL,
++        0xE5 => orbclient::K_RIGHT_SHIFT,
++        0xE6 => orbclient::K_ALT_GR,
++        0xE7 => orbclient::K_RIGHT_SUPER,
++        _ => return None,
++    })
++}
+diff --git a/drivers/usb/ohcid/src/ohci.rs b/drivers/usb/ohcid/src/ohci.rs
+new file mode 100644
+index 00000000..d580931b
+--- /dev/null
++++ b/drivers/usb/ohcid/src/ohci.rs
+@@ -0,0 +1,641 @@
++//! Minimal Open Host Controller Interface (OHCI) driver core.
++//!
++//! Register layout and descriptor bit fields follow the OHCI 1.0a
++//! specification and the Linux `drivers/usb/host/ohci.h` definitions, which
++//! is also what U-Boot uses. Only what is needed to enumerate full/low speed
++//! devices and poll one interrupt endpoint is implemented: there is no
++//! interrupt handling (the controller is driven by polling) and no
++//! isochronous or bulk scheduling.
++//!
++//! The RK3399 has two USB2 host controllers. Each is an EHCI/OHCI pair; the
++//! installed U-Boot only brings up the OHCI halves (its boot log lists
++//! `Bus usb@fe3a0000: USB OHCI 1.0` / `Bus usb@fe3e0000: USB OHCI 1.0` and no
++//! EHCI bus), so the whole internal USB tree — hub, keyboard, touchpad —
++//! enumerates as full/low speed devices on the companion controllers.
++
++use core::mem::size_of;
++use core::ptr;
++
++use common::dma::Dma;
++
++// Register offsets (OHCI spec section 7, `struct ohci_regs`).
++pub const REG_REVISION: usize = 0x00;
++pub const REG_CONTROL: usize = 0x04;
++pub const REG_CMDSTATUS: usize = 0x08;
++pub const REG_INTRSTATUS: usize = 0x0c;
++pub const REG_INTRDISABLE: usize = 0x14;
++pub const REG_HCCA: usize = 0x18;
++pub const REG_ED_CONTROLHEAD: usize = 0x20;
++pub const REG_ED_CONTROLCURRENT: usize = 0x24;
++pub const REG_ED_BULKHEAD: usize = 0x28;
++pub const REG_ED_BULKCURRENT: usize = 0x2c;
++pub const REG_DONEHEAD: usize = 0x30;
++pub const REG_FMINTERVAL: usize = 0x34;
++pub const REG_PERIODICSTART: usize = 0x40;
++pub const REG_LSTHRESH: usize = 0x44;
++pub const REG_RH_A: usize = 0x48;
++pub const REG_RH_STATUS: usize = 0x50;
++/// `HcRhPortStatus[0]`; port numbers are 0-based in the register map.
++pub const REG_RH_PORTSTATUS: usize = 0x54;
++
++// HcControl bits.
++const CTRL_CBSR: u32 = 0x3;
++const CTRL_PLE: u32 = 1 << 2;
++const CTRL_CLE: u32 = 1 << 4;
++const CTRL_BLE: u32 = 1 << 5;
++const CTRL_HCFS_OPER: u32 = 2 << 6;
++
++// HcCommandStatus bits.
++const CMD_HCR: u32 = 1 << 0;
++const CMD_CLF: u32 = 1 << 1;
++
++// HcInterruptStatus bits.
++const INTR_WDH: u32 = 1 << 1;
++
++// Root hub registers, per `ohci.h`.
++const RH_A_NDP: u32 = 0xff;
++const RH_A_PSM: u32 = 1 << 8;
++const RH_A_NPS: u32 = 1 << 9;
++
++const RH_PS_CCS: u32 = 0x0000_0001;
++const RH_PS_PES: u32 = 0x0000_0002;
++const RH_PS_PRS: u32 = 0x0000_0010;
++const RH_PS_PPS: u32 = 0x0000_0100;
++const RH_PS_LSDA: u32 = 0x0000_0200;
++const RH_PS_CSC: u32 = 0x0001_0000;
++const RH_PS_PRSC: u32 = 0x0010_0000;
++
++const RH_HS_LPSC: u32 = 0x0001_0000;
++
++// ED control word (`ED Control` dword, OHCI spec table 4-4).
++const ED_LOWSPEED: u32 = 1 << 13;
++const ED_IN: u32 = 0x02 << 11;
++const ED_OUT: u32 = 0x01 << 11;
++
++// TD control word (`TD Control` dword, OHCI spec table 4-6).
++const TD_CC: u32 = 0xf000_0000;
++const TD_CC_NOT_ACCESSED: u32 = 0x0f;
++const TD_T_DATA0: u32 = 0x0200_0000;
++const TD_T_DATA1: u32 = 0x0300_0000;
++const TD_T_TOGGLE: u32 = 0x0000_0000;
++const TD_DP_SETUP: u32 = 0x0000_0000;
++const TD_DP_OUT: u32 = 0x0008_0000;
++const TD_DP_IN: u32 = 0x0010_0000;
++const TD_R: u32 = 0x0004_0000;
++
++/// Completion codes that mean "the transfer ended as expected".
++pub const TD_CC_NOERROR: u32 = 0x00;
++pub const TD_CC_DATAUNDERRUN: u32 = 0x09;
++
++/// One endpoint descriptor (16 bytes, 16-byte aligned).
++#[repr(C, align(16))]
++#[derive(Clone, Copy, Default)]
++pub struct Ed {
++    pub info: u32,
++    pub tail: u32,
++    pub head: u32,
++    pub next: u32,
++}
++
++/// One transfer descriptor (16 bytes, 16-byte aligned).
++#[repr(C, align(16))]
++#[derive(Clone, Copy, Default)]
++pub struct Td {
++    pub info: u32,
++    pub cbp: u32,
++    pub next: u32,
++    pub be: u32,
++}
++
++/// Errors reported by the controller or by the driver itself.
++///
++/// The payloads are only used by the derived `Debug` implementation (they
++/// end up in the UART log), which dead-code analysis ignores.
++#[allow(dead_code)]
++#[derive(Debug, Clone, Copy)]
++pub enum Error {
++    /// A register never reached the expected state.
++    Timeout(&'static str),
++    /// The transfer descriptor completed with a non-zero condition code.
++    Td(u32),
++    /// The endpoint was halted (ED HeadP.H) during the transfer.
++    Halted,
++    /// The device answered, but the data does not fit the assumptions.
++    Protocol(&'static str),
++    /// The DMA arena ran out of space (the driver allocates once, up front).
++    OutOfMemory,
++}
++
++pub type Result<T> = core::result::Result<T, Error>;
++
++/// Number of endpoint descriptors in the preallocated pool.
++const ED_POOL: usize = 16;
++/// Number of transfer descriptors in the preallocated pool.
++const TD_POOL: usize = 64;
++/// Bytes of shared buffer space for setup packets, descriptors and reports.
++const BUF_POOL: usize = 4096;
++
++#[inline]
++fn ed_info(addr: u8, endpoint: u8, low_speed: bool, dir: u32, mps: u16) -> u32 {
++    u32::from(addr & 0x7f)
++        | (u32::from(endpoint & 0x0f) << 7)
++        | dir
++        | if low_speed { ED_LOWSPEED } else { 0 }
++        | (u32::from(mps & 0x07ff) << 16)
++}
++
++pub struct Ohci {
++    regs: usize,
++    hcca: Dma<[u32; 64]>,
++    eds: Dma<[Ed]>,
++    tds: Dma<[Td]>,
++    bufs: Dma<[u8]>,
++    next_buf: usize,
++}
++
++impl Ohci {
++    /// Map the controller registers and allocate the descriptors.
++    ///
++    /// # Safety
++    /// `base` must be the MMIO base of an OHCI controller.
++    pub unsafe fn new(base: usize) -> Result<Self> {
++        let regs = unsafe {
++            common::physmap(
++                base,
++                0x1000,
++                common::Prot::RW,
++                common::MemoryType::DeviceMemory,
++            )
++        }
++        .map_err(|_| Error::Protocol("cannot map OHCI registers"))? as usize;
++
++        let hcca = Dma::new([0u32; 64]).map_err(|_| Error::OutOfMemory)?;
++        let eds = unsafe {
++            Dma::<[Ed]>::zeroed_slice(ED_POOL)
++                .map_err(|_| Error::OutOfMemory)?
++                .assume_init()
++        };
++        let tds = unsafe {
++            Dma::<[Td]>::zeroed_slice(TD_POOL)
++                .map_err(|_| Error::OutOfMemory)?
++                .assume_init()
++        };
++        let bufs = unsafe {
++            Dma::<[u8]>::zeroed_slice(BUF_POOL)
++                .map_err(|_| Error::OutOfMemory)?
++                .assume_init()
++        };
++
++        Ok(Ohci {
++            regs,
++            hcca,
++            eds,
++            tds,
++            bufs,
++            next_buf: 0,
++        })
++    }
++
++    #[inline]
++    pub fn read(&self, offset: usize) -> u32 {
++        unsafe { ptr::read_volatile((self.regs + offset) as *const u32) }
++    }
++
++    #[inline]
++    pub fn write(&self, offset: usize, value: u32) {
++        unsafe { ptr::write_volatile((self.regs + offset) as *mut u32, value) }
++    }
++
++    pub fn revision(&self) -> u32 {
++        self.read(REG_REVISION)
++    }
++
++    /// Bring the controller into the USB Operational state with empty
++    /// schedules. Mirrors `ohci_run()` from Linux.
++    pub fn init(&mut self) -> Result<()> {
++        // Force the reset state before the soft reset.
++        self.write(REG_CONTROL, 0);
++        self.write(REG_CMDSTATUS, CMD_HCR);
++
++        let deadline = now_ms() + 100;
++        while self.read(REG_CMDSTATUS) & CMD_HCR != 0 {
++            if now_ms() > deadline {
++                return Err(Error::Timeout("HcCommandStatus.HCR"));
++            }
++            core::hint::spin_loop();
++        }
++
++        let hcca_phys = self.hcca.physical();
++        if hcca_phys & 0xff != 0 {
++            return Err(Error::Protocol("HCCA is not 256-byte aligned"));
++        }
++
++        self.write(REG_INTRDISABLE, 0xffff_ffff);
++        self.write(REG_INTRSTATUS, 0xffff_ffff);
++
++        self.write(REG_ED_CONTROLHEAD, 0);
++        self.write(REG_ED_CONTROLCURRENT, 0);
++        self.write(REG_ED_BULKHEAD, 0);
++        self.write(REG_ED_BULKCURRENT, 0);
++        self.write(REG_HCCA, hcca_phys as u32);
++
++        // Frame timing: 11999 means one frame every 1 ms. FSMPS (largest
++        // packet) is derived from the interval like Linux does.
++        let fi = 0x2edfu32;
++        let fsmps = (fi - 210) * 6 / 7;
++        self.write(REG_FMINTERVAL, (fsmps << 16) | fi);
++        self.write(REG_PERIODICSTART, fi * 9 / 10);
++        self.write(REG_LSTHRESH, 0x628);
++
++        // Go operational with all three lists enabled; the driver toggles
++        // CLE per control transfer and keeps PLE on for the interrupt ED.
++        self.write(
++            REG_CONTROL,
++            CTRL_CBSR | CTRL_PLE | CTRL_CLE | CTRL_BLE | CTRL_HCFS_OPER,
++        );
++
++        self.delay_ms(2);
++        Ok(())
++    }
++
++    pub fn num_ports(&self) -> usize {
++        (self.read(REG_RH_A) & RH_A_NDP) as usize
++    }
++
++    /// Power the root hub ports if the controller needs it.
++    pub fn power_ports(&mut self) -> Result<()> {
++        let rh_a = self.read(REG_RH_A);
++        if rh_a & RH_A_NPS != 0 {
++            // No power switching: ports are always powered.
++            return Ok(());
++        }
++        if rh_a & RH_A_PSM != 0 {
++            // Per-port power switching.
++            for port in 0..self.num_ports() {
++                let reg = REG_RH_PORTSTATUS + 4 * port;
++                if self.read(reg) & RH_PS_PPS == 0 {
++                    self.write(reg, RH_PS_PPS);
++                }
++            }
++        } else {
++            // Ganged power switching: one global power-on command.
++            self.write(REG_RH_STATUS, RH_HS_LPSC);
++        }
++        // Power-on-to-power-good is at most 0xff * 2 ms.
++        self.delay_ms(200);
++        Ok(())
++    }
++
++    pub fn port_status(&self, port: usize) -> u32 {
++        self.read(REG_RH_PORTSTATUS + 4 * port)
++    }
++
++    /// Reset a root hub port; returns `(connected, low_speed, enabled)`.
++    pub fn reset_root_port(&mut self, port: usize) -> Result<(bool, bool, bool)> {
++        let reg = REG_RH_PORTSTATUS + 4 * port;
++
++        let status = self.read(reg);
++        if status & RH_PS_CSC != 0 {
++            self.write(reg, RH_PS_CSC);
++        }
++        if status & RH_PS_CCS == 0 {
++            return Ok((false, false, false));
++        }
++
++        self.write(reg, RH_PS_PRS);
++        let deadline = now_ms() + 500;
++        loop {
++            let status = self.read(reg);
++            if status & RH_PS_PRSC != 0 {
++                // Reset finished; acknowledge both change bits.
++                self.write(reg, RH_PS_PRSC);
++                if status & RH_PS_CSC != 0 {
++                    self.write(reg, RH_PS_CSC);
++                }
++                let connected = status & RH_PS_CCS != 0;
++                let low_speed = status & RH_PS_LSDA != 0;
++                let enabled = status & RH_PS_PES != 0;
++                return Ok((connected, low_speed, enabled));
++            }
++            if now_ms() > deadline {
++                return Err(Error::Timeout("root port reset"));
++            }
++            self.delay_ms(1);
++        }
++    }
++
++    pub fn delay_ms(&self, ms: u64) {
++        // The bring-up kernel does not wake `nanosleep` on the generic timer
++        // (README risk 13), so every delay is a busy-wait.
++        let target = now_ms() + ms;
++        while now_ms() < target {
++            core::hint::spin_loop();
++        }
++    }
++
++    // --- descriptor pools -------------------------------------------------
++
++    pub fn ed(&self, index: usize) -> &Ed {
++        &self.eds[index]
++    }
++
++    fn ed_mut(&mut self, index: usize) -> &mut Ed {
++        &mut self.eds[index]
++    }
++
++    pub fn ed_phys(&self, index: usize) -> usize {
++        self.eds.physical() + index * size_of::<Ed>()
++    }
++
++
++    fn td_mut(&mut self, index: usize) -> &mut Td {
++        &mut self.tds[index]
++    }
++
++    pub fn td_phys(&self, index: usize) -> usize {
++        self.tds.physical() + index * size_of::<Td>()
++    }
++
++    /// Reserve `len` bytes in the shared DMA buffer arena and return
++    /// `(offset, physical)`. The arena is allocated once and never reused.
++    pub fn alloc_buf(&mut self, len: usize) -> Result<(usize, usize)> {
++        let off = self.next_buf;
++        let end = off + len.max(1);
++        if end > BUF_POOL {
++            return Err(Error::OutOfMemory);
++        }
++        self.next_buf = (end + 15) & !15;
++        Ok((off, self.bufs.physical() + off))
++    }
++
++    pub fn buf_slice_mut(&mut self, off: usize, len: usize) -> &mut [u8] {
++        &mut self.bufs[off..off + len]
++    }
++
++    pub fn buf_slice(&self, off: usize, len: usize) -> &[u8] {
++        &self.bufs[off..off + len]
++    }
++
++    /// Fill one general TD and link it to `next`.
++    fn fill_td(&mut self, index: usize, info: u32, buf_phys: usize, len: usize, next: usize) {
++        let td = self.td_mut(index);
++        td.info = info;
++        td.cbp = if len == 0 { 0 } else { buf_phys as u32 };
++        td.next = next as u32;
++        td.be = if len == 0 {
++            0
++        } else {
++            (buf_phys + len - 1) as u32
++        };
++    }
++
++    /// Put the control ED at the head of the control list and kick it.
++    fn start_control(&mut self, ed_index: usize) {
++        let ed_phys = self.ed_phys(ed_index);
++        let control = self.read(REG_CONTROL);
++        self.write(REG_CONTROL, control & !CTRL_CLE);
++        self.write(REG_ED_CONTROLHEAD, ed_phys as u32);
++        self.write(REG_ED_CONTROLCURRENT, 0);
++        self.write(REG_CONTROL, (control & !CTRL_CLE) | CTRL_CLE);
++        // Tell the controller the control list has been refilled.
++        self.write(REG_CMDSTATUS, CMD_CLF);
++    }
++
++    fn stop_control(&mut self) {
++        let control = self.read(REG_CONTROL);
++        self.write(REG_CONTROL, control & !CTRL_CLE);
++        self.write(REG_ED_CONTROLHEAD, 0);
++    }
++
++    /// Run one control transfer on the default pipe (endpoint 0).
++    ///
++    /// `data_in` selects the direction of the optional data stage; `setup`
++    /// holds the 8-byte USB setup packet. Returns the number of bytes in the
++    /// data stage (for IN transfers the data is copied back into `data`).
++    pub fn control_transfer(
++        &mut self,
++        addr: u8,
++        low_speed: bool,
++        mps: u16,
++        setup: [u8; 8],
++        data: Option<&mut [u8]>,
++        data_in: bool,
++    ) -> Result<usize> {
++        let (setup_off, setup_phys) = self.alloc_buf(8)?;
++        self.buf_slice_mut(setup_off, 8).copy_from_slice(&setup);
++
++        let data_len = data.as_ref().map_or(0, |d| d.len());
++        let (data_off, data_phys) = if data_len > 0 {
++            let (off, phys) = self.alloc_buf(data_len)?;
++            if !data_in {
++                if let Some(src) = data.as_deref() {
++                    self.buf_slice_mut(off, data_len).copy_from_slice(src);
++                }
++            }
++            (Some(off), phys)
++        } else {
++            (None, 0)
++        };
++
++        // Descriptor slots 0..3 are reserved for the control pipe.
++        let ed_index = 0;
++        let td_setup = 0;
++        let td_data = 1;
++        let td_status = 2;
++        let td_dummy = 3;
++
++        let status_next = self.td_phys(td_status);
++        if data_len > 0 {
++            self.fill_td(
++                td_setup,
++                TD_CC | TD_DP_SETUP | TD_T_DATA0,
++                setup_phys,
++                8,
++                self.td_phys(td_data),
++            );
++            let info = TD_CC | TD_R | TD_T_DATA1 | if data_in { TD_DP_IN } else { TD_DP_OUT };
++            self.fill_td(td_data, info, data_phys, data_len, status_next);
++        } else {
++            self.fill_td(
++                td_setup,
++                TD_CC | TD_DP_SETUP | TD_T_DATA0,
++                setup_phys,
++                8,
++                status_next,
++            );
++        }
++
++        // Status stage: opposite direction, DATA1, zero length.
++        let status_info = if data_in || data_len == 0 {
++            TD_CC | TD_DP_OUT | TD_T_DATA1
++        } else {
++            TD_CC | TD_DP_IN | TD_T_DATA1
++        };
++        self.fill_td(td_status, status_info, 0, 0, self.td_phys(td_dummy));
++        self.fill_td(td_dummy, 0, 0, 0, 0);
++
++        let head = self.td_phys(td_setup) as u32;
++        let tail = self.td_phys(td_dummy) as u32;
++        {
++            let ed = self.ed_mut(ed_index);
++            ed.info = ed_info(
++                addr,
++                0,
++                low_speed,
++                if data_in { ED_IN } else { ED_OUT },
++                mps,
++            );
++            ed.head = head;
++            ed.tail = tail;
++            ed.next = 0;
++        }
++
++        self.start_control(ed_index);
++        let result = self.wait_td(ed_index, td_status, 500);
++        self.stop_control();
++
++        // Clear a possible halt so the ED can be reused.
++        let ed_head = self.ed(ed_index).head;
++        self.ed_mut(ed_index).head = ed_head & !0x3;
++
++        result?;
++
++        if data_in {
++            if let (Some(off), Some(dst)) = (data_off, data) {
++                let len = dst.len().min(data_len);
++                let copy = self.buf_slice(off, len).to_vec();
++                dst[..len].copy_from_slice(&copy);
++            }
++        }
++        Ok(data_len)
++    }
++
++    /// Poll a TD until the controller retires it, then check its condition
++    /// code. `timeout_ms` bounds the wait.
++    fn wait_td(&self, ed_index: usize, td_index: usize, timeout_ms: u64) -> Result<u32> {
++        let deadline = now_ms() + timeout_ms;
++        loop {
++            let info = self.tds[td_index].info;
++            let cc = (info >> 28) & 0xf;
++            if cc != TD_CC_NOT_ACCESSED {
++                if cc == TD_CC_NOERROR || cc == TD_CC_DATAUNDERRUN {
++                    return Ok(cc);
++                }
++                if self.ed(ed_index).head & 0x1 != 0 {
++                    return Err(Error::Halted);
++                }
++                return Err(Error::Td(cc));
++            }
++            if now_ms() >= deadline {
++                return Err(Error::Timeout("transfer descriptor"));
++            }
++            core::hint::spin_loop();
++        }
++    }
++
++    /// Queue one interrupt IN transfer on a periodic ED.
++    #[allow(clippy::too_many_arguments)]
++    pub fn arm_interrupt(
++        &mut self,
++        ed_index: usize,
++        td_index: usize,
++        dummy_index: usize,
++        addr: u8,
++        endpoint: u8,
++        low_speed: bool,
++        mps: u16,
++        buf_phys: usize,
++        slot: usize,
++    ) -> Result<()> {
++        self.fill_td(
++            td_index,
++            TD_CC | TD_R | TD_T_TOGGLE | TD_DP_IN,
++            buf_phys,
++            usize::from(mps),
++            self.td_phys(dummy_index),
++        );
++        self.fill_td(dummy_index, 0, 0, 0, 0);
++
++        let head = self.td_phys(td_index) as u32;
++        let tail = self.td_phys(dummy_index) as u32;
++        {
++            let ed = self.ed_mut(ed_index);
++            ed.info = ed_info(addr, endpoint, low_speed, ED_IN, mps);
++            ed.next = 0;
++            // Preserve the toggle carry (bit 1) across re-arms.
++            let carry = ed.head & 0x2;
++            ed.head = head | carry;
++            ed.tail = tail;
++        }
++
++        // Put the ED into the periodic list. A 32-entry table is walked one
++        // entry per frame, so one slot polls every ~32 ms — plenty for a
++        // keyboard and far simpler than the interval tree Linux builds.
++        let entry = self.hcca.physical() as *mut u32;
++        unsafe { ptr::write_volatile(entry.add(slot), self.ed_phys(ed_index) as u32) };
++
++        let control = self.read(REG_CONTROL);
++        if control & CTRL_PLE == 0 {
++            self.write(REG_CONTROL, control | CTRL_PLE);
++        }
++        Ok(())
++    }
++
++    /// Returns true when the periodic TD has been retired by the controller.
++    pub fn interrupt_done(&self, td_index: usize) -> bool {
++        ((self.tds[td_index].info >> 28) & 0xf) != TD_CC_NOT_ACCESSED
++    }
++
++    /// Condition code of a retired interrupt TD.
++    pub fn interrupt_cc(&self, td_index: usize) -> u32 {
++        (self.tds[td_index].info >> 28) & 0xf
++    }
++
++    /// Bytes actually transferred by a completed TD whose buffer starts at
++    /// `buf_phys` and is `len` bytes long.
++    pub fn td_transferred(&self, td_index: usize, buf_phys: usize, len: usize) -> usize {
++        let td = &self.tds[td_index];
++        if td.cbp == 0 {
++            // Buffer end pointer reached: the whole buffer was filled.
++            len
++        } else {
++            (td.cbp as usize).saturating_sub(buf_phys).min(len)
++        }
++    }
++
++    /// Clear a halted interrupt ED (for example after a STALL).
++    pub fn clear_interrupt_halt(&mut self, ed_index: usize) {
++        let head = self.ed(ed_index).head;
++        self.ed_mut(ed_index).head = head & !0x3;
++    }
++
++    /// Remove an ED from the periodic list.
++
++    /// Read and acknowledge the done queue head so it does not overflow.
++    /// Completion itself is detected through the TD condition codes.
++    pub fn reap_done(&self) -> u32 {
++        let status = self.read(REG_INTRSTATUS);
++        if status & INTR_WDH != 0 {
++            let head = self.read(REG_DONEHEAD);
++            self.write(REG_INTRSTATUS, INTR_WDH);
++            head
++        } else {
++            0
++        }
++    }
++
++
++
++
++}
++
++pub fn now_ms() -> u64 {
++    let mut ts = syscall::TimeSpec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    if syscall::clock_gettime(syscall::flag::CLOCK_MONOTONIC, &mut ts).is_err() {
++        return 0;
++    }
++    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
++}
 diff --git a/init.d/00_pcid-spawner.service b/init.d/00_pcid-spawner.service
 index 8ba6fc6c..65768d55 100644
 --- a/init.d/00_pcid-spawner.service
@@ -2572,14 +4321,15 @@ index 8ba6fc6c..65768d55 100644
  [service]
  cmd = "pcid-spawner"
 diff --git a/init.initfs.d/40_drivers.target b/init.initfs.d/40_drivers.target
-index 8ddb4795..0945705f 100644
+index 8ddb4795..94ab3e7d 100644
 --- a/init.initfs.d/40_drivers.target
 +++ b/init.initfs.d/40_drivers.target
-@@ -5,6 +5,7 @@ requires_weak = [
+@@ -5,6 +5,8 @@ requires_weak = [
      "20_graphics.target",
      "40_ps2d.service",
      "40_bcm2835-sdhcid.service",
 +    "40_dwmmcd.service",
++    "40_ohcid.service",
      "40_hwd.service",
      "40_pcid-spawner-initfs.service",
  ]
@@ -2595,6 +4345,19 @@ index 00000000..5e053117
 +
 +[service]
 +cmd = "dwmmcd"
++type = "notify"
+diff --git a/init.initfs.d/40_ohcid.service b/init.initfs.d/40_ohcid.service
+new file mode 100644
+index 00000000..74d16b70
+--- /dev/null
++++ b/init.initfs.d/40_ohcid.service
+@@ -0,0 +1,7 @@
++[unit]
++description = "Rockchip RK3399 OHCI USB2 host controller driver"
++condition_architecture = ["aarch64"]
++
++[service]
++cmd = "ohcid"
 +type = "notify"
 diff --git a/init.initfs.d/40_pcid-spawner-initfs.service b/init.initfs.d/40_pcid-spawner-initfs.service
 index 6945b9ea..0829375d 100644
