@@ -164,9 +164,39 @@ now work (`ls /` lists the scheme namespace: `chan? debug? display.vesa?
 event? initfs/ input? irq/ kernel.dtb ...`); inputd logs a spurious
 `invalid path ''` error line during boot (pre-existing, unrelated).
 
+## Iteration 2 result (`logs/serial-20261120-083143.log`)
+
+The full controller reset worked (`controller reset ok`, reset bits
+self-cleared), and the driver still stalled at the first clock update —
+but now with a precise register snapshot:
+
+```text
+dwmmcd: controller reset ok (ctrl was 0x02000000)
+dwmmcd: clock update (stop) failed: Connection timed out rint=0x00000000 status=0x00006106
+```
+
+`RINTSTS = 0` means the command never started (no CDONE, no error bits);
+`STATUS = 0x6106` has bit 9 (BUSY) and bits 12/13 set — the controller
+reports residual data/DMA state right after the reset, and the clock-only
+command carries `PRV_DAT_WAIT` ("wait for previous data"), which waits on
+exactly that state. Also, `debugsh`'s `reboot` builtin was exercised and
+works (PSCI SYSTEM_RESET through `sys:kstop`) — the test loop no longer
+needs power-cycling.
+
+Iteration 3 changes (built):
+
+- The `BMOD = 1` (IDMAC software reset) write moved after the clock setup —
+  U-Boot writes it after `setup_bus`, not before; writing it first may
+  itself arm the busy/DMA state that stalls the clock update.
+- Every clock update retries once without `PRV_DAT_WAIT` when the
+  conventional form times out: a CIU-only command never touches the data
+  lines, so waiting on stale data state is unnecessary; if the retry path
+  is what works, the next log will show enumeration proceeding after a
+  stop-stage timeout message.
+
 ## Status
 
-**in progress** — iteration 2 built and flashed-pending:
+**in progress** — iteration 3 built and flashed-pending:
 
 - [x] flashed and booted (iteration 1, 2026-11-20 08:21)
 - [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited

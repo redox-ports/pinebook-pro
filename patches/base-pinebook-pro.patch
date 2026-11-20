@@ -606,10 +606,10 @@ index 00000000..1461a920
 +workspace = true
 diff --git a/drivers/storage/dwmmcd/src/dwmmc.rs b/drivers/storage/dwmmcd/src/dwmmc.rs
 new file mode 100644
-index 00000000..8046d620
+index 00000000..b9f4945e
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/dwmmc.rs
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1057 @@
 +//! Synopsys DesignWare Mobile Storage Host Controller (dw_mshc) driver for
 +//! the Rockchip RK3399 microSD slot (`sdmmc@fe320000`).
 +//!
@@ -988,11 +988,6 @@ index 00000000..8046d620
 +                self.inherited_ctrl
 +            ));
 +
-+            // Software-reset the internal DMA engine as well (U-Boot writes
-+            // BMOD = 1, the IDMAC reset bit), so no descriptor state leaks
-+            // into the PIO data path.
-+            regs.write(BMOD, 1);
-+
 +            // Polling driver: no controller interrupts may reach the GIC.
 +            regs.write(INTMASK, 0);
 +            // Clear any stale raw status.
@@ -1176,6 +1171,14 @@ index 00000000..8046d620
 +        // Identification must run at 100-400 kHz. Slow the inherited clock
 +        // down by reprogramming CLKDIV only.
 +        self.set_clkdiv(INIT_CLKDIV)?;
++
++        // Software-reset the internal DMA engine now, after the clocks are
++        // settled (U-Boot writes BMOD = 1 after setup_bus, not before), so
++        // no descriptor state leaks into the PIO data path.
++        {
++            let regs = self.regs.read().unwrap();
++            unsafe { regs.write(BMOD, 1) };
++        }
 +
 +        // CMD0: go to idle. No response; a failure here means the
 +        // controller cannot talk to the bus at all.
@@ -1571,13 +1574,21 @@ index 00000000..8046d620
 +
 +/// CIU clock-update command: start a CMD with only UPD_CLK set and wait for
 +/// command-done. Never reaches the card (U-Boot dwmci_control_clken).
-+unsafe fn clk_update(regs: &DwmmcRegs, stage: &str) -> Result<()> {
++unsafe fn clk_update_try(regs: &DwmmcRegs, prv_dat_wait: bool) -> Result<()> {
 +    unsafe {
 +        regs.write(RINTSTS, 0xffff_ffff);
 +        regs.write(CMDARG, 0);
-+        // Exactly the U-Boot clock-only command: START | PRV_DAT_WAIT |
-+        // UPD_CLK (no USE_HOLD_REG — U-Boot does not set it here).
-+        regs.write(CMD, CMD_START | CMD_UPD_CLK | CMD_PRV_DAT_WAIT);
++        // The U-Boot clock-only command: START | PRV_DAT_WAIT | UPD_CLK
++        // (no USE_HOLD_REG — U-Boot does not set it here). PRV_DAT_WAIT
++        // defers the command until the data lines settle; iteration 2 of
++        // experiment 6 measured a controller that reports BUSY/DMA state
++        // right after the CTRL reset, which would stall such a command
++        // forever, so the caller retries without it.
++        let mut flags = CMD_START | CMD_UPD_CLK;
++        if prv_dat_wait {
++            flags |= CMD_PRV_DAT_WAIT;
++        }
++        regs.write(CMD, flags);
 +
 +        let deadline = now_ms() + CLK_UPDATE_TIMEOUT_MS;
 +        loop {
@@ -1590,6 +1601,19 @@ index 00000000..8046d620
 +                return Err(Error::new(ETIMEDOUT));
 +            }
 +        }
++    }
++}
++
++unsafe fn clk_update(regs: &DwmmcRegs, stage: &str) -> Result<()> {
++    unsafe {
++        if clk_update_try(regs, true).is_ok() {
++            return Ok(());
++        }
++        // Retry without PRV_DAT_WAIT: a stale busy/data state (the EFI
++        // loader leaves IDMAC armed) must not block a CIU-only clock
++        // update, which never touches the data lines anyway. Iteration 2
++        // of experiment 6 stalled here with status BUSY bits set.
++        clk_update_try(regs, false)
 +    }
 +}
 +
