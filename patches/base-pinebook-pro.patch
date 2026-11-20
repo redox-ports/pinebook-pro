@@ -93,6 +93,24 @@
 #                        controller interrupts, no nanosleep (the kernel does
 #                        not wake sleepers on the generic timer).
 #
+#                        U-Boot stops its USB stack before handing over to the
+#                        EFI payload, which leaves the RK3399 CRU USB gates
+#                        closed (dwmmcd reads CLKGATE_CON(6) as 0x60, i.e. both
+#                        USB2 PHY reference clocks gated) and the USB2 PHYs
+#                        powered down. Touching an OHCI register window in that
+#                        state stalls the whole SoC, so before the first
+#                        register access the driver un-gates the host and PHY
+#                        clocks (CLKGATE_CON(6) bits 5/6, CLKGATE_CON(20) bits
+#                        5-8, hiword-masked per the Rockchip convention), reads
+#                        them back, and gives up instead of probing when a gate
+#                        is still closed. It then powers the PHY host ports back
+#                        on through the GRF (clkout_ctl bit 4 and the port
+#                        suspend field, per Linux phy-rockchip-inno-usb2.c) so
+#                        the controller regains its 480 MHz UTMI clock. The
+#                        root port is polled for a few frames before it is
+#                        declared empty, and every bring-up step is logged to
+#                        /scheme/debug for the serial console.
+#
 # Contents:
 #   * debugsh/                  new initfs-only crate (static binary;
 #                               `reboot` writes `reset` to the kernel sys:kstop
@@ -100,7 +118,10 @@
 #   * drivers/storage/dwmmcd/   new initfs-only crate (static binary)
 #   * drivers/graphics/vesad/src/main.rs, scheme.rs
 #                               honour FRAMEBUFFER_BPP (RGB565)
-#   * drivers/usb/ohcid/        new initfs-only crate (static binary)
+#   * drivers/usb/ohcid/        new initfs-only crate (static binary);
+#                               src/ohci.rs = controller core, src/cru.rs =
+#                               RK3399 clock gates, src/u2phy.rs = USB2 PHY
+#                               power-on, src/log.rs = UART mirror
 #   * init.initfs.d/40_ohcid.service            USB input (aarch64 only)
 #   * Makefile                  add debugsh, dwmmcd and ohcid to INITFS_BINS
 #   * Cargo.toml, Cargo.lock    workspace members + lock entries
@@ -2651,6 +2672,117 @@ index 00000000..9f69c300
 +
 +[lints]
 +workspace = true
+diff --git a/drivers/usb/ohcid/src/cru.rs b/drivers/usb/ohcid/src/cru.rs
+new file mode 100644
+index 00000000..3bf1dcc4
+--- /dev/null
++++ b/drivers/usb/ohcid/src/cru.rs
+@@ -0,0 +1,105 @@
++//! RK3399 CRU (clock & reset unit) handling for the USB2 host controllers.
++//!
++//! U-Boot shuts its USB stack down before it hands control to the EFI payload,
++//! and that leaves the USB clock gates disabled: `dwmmcd` reads
++//! `CLKGATE_CON(6)` as `0x00000060` on the Pinebook Pro, i.e. both USB2 PHY
++//! reference gates are set (in the RK3399 the gate bit means "disabled").
++//! Touching an OHCI register window whose bus clock is gated is not safe, so
++//! the driver re-enables the gates before the first register access.
++//!
++//! Register numbering follows Linux `drivers/clk/rockchip/clk-rk3399.c`:
++//! `CLKGATE_CON(n) = 0x300 + 4n`; gates are HIWORD protected (mask in
++//! [31:16], data in [15:0]) and flagged `CLK_GATE_SET_TO_DISABLE`, so writing
++//! a zero through the mask enables the clock.
++
++use crate::log::Logger;
++use crate::ohci::now_ms;
++
++/// CRU register window (`clock-controller@ff760000`).
++const CRU_BASE: usize = 0xff760000;
++const CRU_LEN: usize = 0x1000;
++
++/// `CLKGATE_CON(6)` = 0x318: bit 5 `clk_usb2phy0_ref`, bit 6 `clk_usb2phy1_ref`.
++const CLKGATE_CON6: usize = 0x318;
++/// `CLKGATE_CON(20)` = 0x350: bits 5/6 `hclk_host0`/`hclk_host0_arb`,
++/// bits 7/8 `hclk_host1`/`hclk_host1_arb`.
++const CLKGATE_CON20: usize = 0x350;
++
++/// Both USB2 PHY reference gates.
++const PHY_REF_GATES: u32 = (1 << 5) | (1 << 6);
++/// Both host bus-clock gates (host0 and host1, including the arbiters).
++const HOST_GATES: u32 = (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
++
++/// Time the bus clocks (and the PHY reference) need to come back up.
++const SETTLE_MS: u64 = 5;
++
++#[inline]
++unsafe fn read32(base: usize, offset: usize) -> u32 {
++    unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
++}
++
++#[inline]
++unsafe fn write32(base: usize, offset: usize, value: u32) {
++    unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
++}
++
++/// Un-gate the USB2 host clocks and report the gate state before and after.
++///
++/// Returns `true` when the gates read back as enabled, which is the
++/// precondition for touching an OHCI register window. A `false` return means
++/// the caller must not probe the controllers (the machine would stall on the
++/// first access to an unclocked peripheral).
++pub fn enable_usb_host_clocks(log: &Logger) -> bool {
++    let base = match unsafe {
++        common::physmap(
++            CRU_BASE,
++            CRU_LEN,
++            common::Prot::RW,
++            common::MemoryType::DeviceMemory,
++        )
++    } {
++        Ok(ptr) => ptr as usize,
++        Err(_) => {
++            log.log(format_args!(
++                "ohcid: cannot map the CRU, leaving the usb clocks alone"
++            ));
++            return false;
++        }
++    };
++
++    let con6 = unsafe { read32(base, CLKGATE_CON6) };
++    let con20 = unsafe { read32(base, CLKGATE_CON20) };
++    log.log(format_args!(
++        "ohcid: cru gates inherited: con6=0x{:08x} con20=0x{:08x}",
++        con6, con20
++    ));
++
++    if con6 & PHY_REF_GATES != 0 {
++        unsafe { write32(base, CLKGATE_CON6, PHY_REF_GATES << 16) };
++    }
++    if con20 & HOST_GATES != 0 {
++        unsafe { write32(base, CLKGATE_CON20, HOST_GATES << 16) };
++    }
++
++    let target = now_ms() + SETTLE_MS;
++    while now_ms() < target {
++        core::hint::spin_loop();
++    }
++
++    let con6 = unsafe { read32(base, CLKGATE_CON6) };
++    let con20 = unsafe { read32(base, CLKGATE_CON20) };
++    log.log(format_args!(
++        "ohcid: cru gates now: con6=0x{:08x} con20=0x{:08x}",
++        con6, con20
++    ));
++
++    let stuck = (con6 & PHY_REF_GATES) | (con20 & HOST_GATES);
++    if stuck != 0 {
++        log.log(format_args!(
++            "ohcid: usb clocks still gated (0x{:08x}), not touching the controllers",
++            stuck
++        ));
++        return false;
++    }
++    true
++}
 diff --git a/drivers/usb/ohcid/src/log.rs b/drivers/usb/ohcid/src/log.rs
 new file mode 100644
 index 00000000..132e2df7
@@ -2721,10 +2853,10 @@ index 00000000..132e2df7
 +}
 diff --git a/drivers/usb/ohcid/src/main.rs b/drivers/usb/ohcid/src/main.rs
 new file mode 100644
-index 00000000..541e1a88
+index 00000000..6ac45e44
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/main.rs
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,1055 @@
 +//! ohcid - OHCI host controller driver for the RK3399 USB2 ports.
 +//!
 +//! The Pinebook Pro's internal keyboard and touchpad sit behind a Genesys hub
@@ -2743,8 +2875,10 @@ index 00000000..541e1a88
 +//! before it touches hardware, so a failure here never blocks the boot: the
 +//! root filesystem still mounts and the serial login still works.
 +
++mod cru;
 +mod log;
 +mod ohci;
++mod u2phy;
 +
 +use std::{process, thread};
 +
@@ -2851,11 +2985,35 @@ index 00000000..541e1a88
 +
 +    fn bring_up_all(&mut self) {
 +        let dtb = read_dtb();
++        self.log.log(format_args!(
++            "ohcid: devicetree {} bytes",
++            dtb.as_ref().map_or(0, |data| data.len())
++        ));
 +        let bases = dtb_ohci_bases(dtb.as_deref());
 +        if bases.is_empty() {
 +            self.log.log(format_args!(
 +                "ohcid: no OHCI nodes in the devicetree, trying the known RK3399 addresses"
 +            ));
++            // This is not a RK3399 (QEMU, for instance). Exercise the DMA
++            // path anyway: it is the part of the driver that cannot be tested
++            // by simply failing to map a register.
++            self.selftest();
++        } else {
++            let mut list = String::new();
++            for base in &bases {
++                let _ = core::fmt::Write::write_fmt(&mut list, format_args!(" 0x{:08x}", base));
++            }
++            self.log
++                .log(format_args!("ohcid: devicetree OHCI nodes:{}", list));
++            // U-Boot gates the USB clocks when it hands over to the EFI
++            // payload, and an access to an unclocked controller stalls the
++            // whole machine. Only probe when the gates are really open.
++            if !cru::enable_usb_host_clocks(&self.log) {
++                return;
++            }
++            // The PHY is powered down as well; without its 480 MHz UTMI clock
++            // the controller sees no devices at all.
++            u2phy::power_on_host_ports(&self.log);
 +        }
 +
 +        for base in OHCI_BASES {
@@ -2874,13 +3032,18 @@ index 00000000..541e1a88
 +    }
 +
 +    fn bring_up_controller(&mut self, base: usize) -> Result<(), Error> {
-+        let mut hc = unsafe { Ohci::new(base) }?;
++        self.log.log(format_args!("ohcid: 0x{:08x}: probing", base));
++        let mut hc = unsafe { Ohci::new(base, &self.log) }?;
++        self.log
++            .log(format_args!("ohcid: 0x{:08x}: reading HcRevision", base));
++        let revision = hc.revision();
 +        self.log.log(format_args!(
-+            "ohcid: 0x{:08x}: OHCI revision 0x{:02x}, {} port(s)",
-+            base,
-+            hc.revision() & 0xff,
-+            hc.num_ports()
++            "ohcid: 0x{:08x}: OHCI revision 0x{:08x}",
++            base, revision
 +        ));
++        let ports = hc.num_ports();
++        self.log
++            .log(format_args!("ohcid: 0x{:08x}: {} port(s)", base, ports));
 +        hc.init()?;
 +        self.log.log(format_args!(
 +            "ohcid: 0x{:08x}: operational, control 0x{:08x} rh_a 0x{:08x}",
@@ -2890,7 +3053,6 @@ index 00000000..541e1a88
 +        ));
 +        hc.power_ports()?;
 +
-+        let ports = hc.num_ports();
 +        let hc_index = self.hcs.len();
 +        let found = {
 +            let mut en = Enumeration {
@@ -2905,7 +3067,16 @@ index 00000000..541e1a88
 +            };
 +
 +            for port in 0..ports {
-+                let status = en.hc.port_status(port);
++                // The PHY may still be settling: give the root hub a moment
++                // to report the connection instead of giving up on the first
++                // read.
++                let mut status = en.hc.port_status(port);
++                let mut wait = 0;
++                while status & 1 == 0 && wait < 5 {
++                    en.hc.delay_ms(20);
++                    status = en.hc.port_status(port);
++                    wait += 1;
++                }
 +                en.log.log(format_args!(
 +                    "ohcid: 0x{:08x}: port {} status 0x{:08x}{}",
 +                    base,
@@ -2961,6 +3132,36 @@ index 00000000..541e1a88
 +        // Keep the controller alive for the poll loop.
 +        self.hcs.push(hc);
 +        Ok(())
++    }
++
++    /// Verify that physically contiguous DMA memory can be allocated and is
++    /// usable. Runs on platforms without OHCI nodes so the same code path can
++    /// be tested under emulation.
++    fn selftest(&mut self) {
++        self.log.log(format_args!(
++            "ohcid: selftest: allocating 4 KiB of DMA memory"
++        ));
++        match common::dma::Dma::<[u8]>::zeroed_slice(4096) {
++            Ok(dma) => {
++                let phys = dma.physical();
++                let virt = dma.virt_addr();
++                self.log.log(format_args!(
++                    "ohcid: selftest: DMA ok, phys 0x{:08x} virt 0x{:08x}",
++                    phys, virt
++                ));
++                let mut dma = unsafe { dma.assume_init() };
++                dma[0] = 0x5a;
++                dma[4095] = 0xa5;
++                self.log.log(format_args!(
++                    "ohcid: selftest: DMA readback 0x{:02x} 0x{:02x}",
++                    dma[0], dma[4095]
++                ));
++            }
++            Err(err) => {
++                self.log
++                    .log(format_args!("ohcid: selftest: DMA failed: {:?}", err));
++            }
++        }
 +    }
 +
 +    fn poll_forever(&mut self) -> ! {
@@ -3713,10 +3914,10 @@ index 00000000..541e1a88
 +}
 diff --git a/drivers/usb/ohcid/src/ohci.rs b/drivers/usb/ohcid/src/ohci.rs
 new file mode 100644
-index 00000000..5c67644c
+index 00000000..08fefce2
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/ohci.rs
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,687 @@
 +//! Minimal Open Host Controller Interface (OHCI) driver core.
 +//!
 +//! Register layout and descriptor bit fields follow the OHCI 1.0a
@@ -3736,6 +3937,8 @@ index 00000000..5c67644c
 +use core::ptr;
 +
 +use common::dma::Dma;
++
++use crate::log::Logger;
 +
 +// Register offsets (OHCI spec section 7, `struct ohci_regs`).
 +pub const REG_REVISION: usize = 0x00;
@@ -3877,7 +4080,11 @@ index 00000000..5c67644c
 +    ///
 +    /// # Safety
 +    /// `base` must be the MMIO base of an OHCI controller.
-+    pub unsafe fn new(base: usize) -> Result<Self> {
++    pub unsafe fn new(base: usize, log: &Logger) -> Result<Self> {
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: mapping the register window",
++            base
++        ));
 +        let regs = unsafe {
 +            common::physmap(
 +                base,
@@ -3887,23 +4094,50 @@ index 00000000..5c67644c
 +            )
 +        }
 +        .map_err(|_| Error::Protocol("cannot map OHCI registers"))? as usize;
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: registers at 0x{:08x}",
++            base, regs
++        ));
 +
 +        let hcca = Dma::new([0u32; 64]).map_err(|_| Error::OutOfMemory)?;
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: hcca phys 0x{:08x}",
++            base,
++            hcca.physical()
++        ));
 +        let eds = unsafe {
 +            Dma::<[Ed]>::zeroed_slice(ED_POOL)
 +                .map_err(|_| Error::OutOfMemory)?
 +                .assume_init()
 +        };
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: {} eds phys 0x{:08x}",
++            base,
++            ED_POOL,
++            eds.physical()
++        ));
 +        let tds = unsafe {
 +            Dma::<[Td]>::zeroed_slice(TD_POOL)
 +                .map_err(|_| Error::OutOfMemory)?
 +                .assume_init()
 +        };
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: {} tds phys 0x{:08x}",
++            base,
++            TD_POOL,
++            tds.physical()
++        ));
 +        let bufs = unsafe {
 +            Dma::<[u8]>::zeroed_slice(BUF_POOL)
 +                .map_err(|_| Error::OutOfMemory)?
 +                .assume_init()
 +        };
++        log.log(format_args!(
++            "ohcid: 0x{:08x}: {} byte buffer phys 0x{:08x}",
++            base,
++            BUF_POOL,
++            bufs.physical()
++        ));
 +
 +        Ok(Ohci {
 +            regs,
@@ -4370,6 +4604,111 @@ index 00000000..5c67644c
 +        return 0;
 +    }
 +    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
++}
+diff --git a/drivers/usb/ohcid/src/u2phy.rs b/drivers/usb/ohcid/src/u2phy.rs
+new file mode 100644
+index 00000000..c7baaa61
+--- /dev/null
++++ b/drivers/usb/ohcid/src/u2phy.rs
+@@ -0,0 +1,99 @@
++//! RK3399 USB2 PHY (Innosilicon IP) power-on for the OHCI companions.
++//!
++//! U-Boot powers the PHY down when it stops its USB stack, and the OHCI needs
++//! both the PHY's 480 MHz UTMI clock and a port that is out of suspend.
++//!
++//! Everything here is the `rockchip,rk3399-usb2phy` configuration from Linux
++//! `drivers/phy/rockchip/phy-rockchip-inno-usb2.c` (`rk3399_phy_cfgs`): the
++//! `u2phyN` blocks live in the GRF at 0xe450/0xe460, `clkout_ctl` is bit 4 of
++//! the block base (0 turns the 480 MHz output on) and the host port suspend
++//! field is bits [1:0] at base + 8, where 2 is "running" and 1 is "suspended".
++//! The registers are HIWORD write-masked, like the CRU gates.
++
++use crate::log::Logger;
++use crate::ohci::now_ms;
++
++/// GRF page that holds both `u2phy` blocks (`syscon@ff770000` + 0xe000).
++const GRF_PHY_BASE: usize = 0xff77e000;
++const GRF_PHY_LEN: usize = 0x1000;
++
++/// `u2phy0` block: 480 MHz clock output and the host port suspend field.
++const U2PHY0_CLKOUT: usize = 0x450;
++const U2PHY0_HOST_SUS: usize = 0x458;
++/// `u2phy1` block (`usb_host1`).
++const U2PHY1_CLKOUT: usize = 0x460;
++const U2PHY1_HOST_SUS: usize = 0x468;
++
++/// Bit 4 of the block base gates the 480 MHz output clock.
++const CLKOUT_ENABLE_MASK: u32 = 1 << 4;
++/// Bits [1:0] of the port register: 2 = running, 1 = suspended.
++const PORT_SUS_MASK: u32 = 0x3;
++const PORT_RUNNING: u32 = 0x2;
++
++/// Time the PHY needs to settle after leaving suspend (Linux uses 1.5-2 ms).
++const SETTLE_MS: u64 = 3;
++
++#[inline]
++unsafe fn read32(base: usize, offset: usize) -> u32 {
++    unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
++}
++
++#[inline]
++unsafe fn write32(base: usize, offset: usize, value: u32) {
++    unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
++}
++
++/// Power both USB2 PHY host ports back on and report the register state.
++///
++/// Failure is not fatal: the caller still probes the controllers, it just
++/// will not see any device behind a powered-down PHY.
++pub fn power_on_host_ports(log: &Logger) {
++    let base = match unsafe {
++        common::physmap(
++            GRF_PHY_BASE,
++            GRF_PHY_LEN,
++            common::Prot::RW,
++            common::MemoryType::DeviceMemory,
++        )
++    } {
++        Ok(ptr) => ptr as usize,
++        Err(_) => {
++            log.log(format_args!(
++                "ohcid: cannot map the usb2 phy registers, leaving them alone"
++            ));
++            return;
++        }
++    };
++
++    let clkout0 = unsafe { read32(base, U2PHY0_CLKOUT) };
++    let sus0 = unsafe { read32(base, U2PHY0_HOST_SUS) };
++    let clkout1 = unsafe { read32(base, U2PHY1_CLKOUT) };
++    let sus1 = unsafe { read32(base, U2PHY1_HOST_SUS) };
++    log.log(format_args!(
++        "ohcid: u2phy inherited: clkout0=0x{:08x} host0=0x{:08x} clkout1=0x{:08x} host1=0x{:08x}",
++        clkout0, sus0, clkout1, sus1
++    ));
++
++    // 480 MHz output clock on (clear bit 4 through the hiword mask).
++    unsafe {
++        write32(base, U2PHY0_CLKOUT, CLKOUT_ENABLE_MASK << 16);
++        write32(base, U2PHY1_CLKOUT, CLKOUT_ENABLE_MASK << 16);
++        // Leave suspend on both host ports.
++        write32(base, U2PHY0_HOST_SUS, (PORT_SUS_MASK << 16) | PORT_RUNNING);
++        write32(base, U2PHY1_HOST_SUS, (PORT_SUS_MASK << 16) | PORT_RUNNING);
++    }
++
++    let target = now_ms() + SETTLE_MS;
++    while now_ms() < target {
++        core::hint::spin_loop();
++    }
++
++    let clkout0 = unsafe { read32(base, U2PHY0_CLKOUT) };
++    let sus0 = unsafe { read32(base, U2PHY0_HOST_SUS) };
++    let clkout1 = unsafe { read32(base, U2PHY1_CLKOUT) };
++    let sus1 = unsafe { read32(base, U2PHY1_HOST_SUS) };
++    log.log(format_args!(
++        "ohcid: u2phy now: clkout0=0x{:08x} host0=0x{:08x} clkout1=0x{:08x} host1=0x{:08x}",
++        clkout0, sus0, clkout1, sus1
++    ));
 +}
 diff --git a/init.d/00_pcid-spawner.service b/init.d/00_pcid-spawner.service
 index 8ba6fc6c..65768d55 100644
