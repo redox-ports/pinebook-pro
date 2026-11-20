@@ -139,6 +139,21 @@ if [ "$VERIFY" -eq 1 ]; then
     echo "verify: OK"
 fi
 
+# The kernel rescans the partition table once the raw writer closes the
+# device, and desktop automounters (udisks) may grab the freshly created
+# ESP afterwards. The image bytes are already on the media (dd conv=fsync
+# flushed them and the verify step re-read them), but pulling a mounted
+# FAT partition can still corrupt its metadata, so warn instead of
+# staying silent.
+MOUNTED=$(lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | sed '/^$/d' || true)
+if [ -n "$MOUNTED" ]; then
+    echo "warning: something mounted partitions of the card after the write:" >&2
+    echo "$MOUNTED" | while read -r M; do echo "  mounted: $M" >&2; done
+    echo "unmount before removing the card, e.g.: udisksctl unmount -b <partition>" >&2
+else
+    echo "==> card contents are written and flushed; it is safe to remove it now"
+fi
+
 echo
 echo "==> done. Put the card into the Pinebook Pro and run scripts/serial-log.sh"
 echo "    before powering on, to capture the boot log."
