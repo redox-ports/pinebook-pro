@@ -3713,10 +3713,10 @@ index 00000000..541e1a88
 +}
 diff --git a/drivers/usb/ohcid/src/ohci.rs b/drivers/usb/ohcid/src/ohci.rs
 new file mode 100644
-index 00000000..24595669
+index 00000000..5c67644c
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/ohci.rs
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,654 @@
 +//! Minimal Open Host Controller Interface (OHCI) driver core.
 +//!
 +//! Register layout and descriptor bit fields follow the OHCI 1.0a
@@ -3932,8 +3932,10 @@ index 00000000..24595669
 +    /// Bring the controller into the USB Operational state with empty
 +    /// schedules. Mirrors `ohci_run()` from Linux.
 +    pub fn init(&mut self) -> Result<()> {
-+        // Force the reset state before the soft reset.
++        // Force the USB Reset state and let the bus settle, like
++        // `ohci_run()` in Linux (50 ms), before the controller reset.
 +        self.write(REG_CONTROL, 0);
++        self.delay_ms(50);
 +        self.write(REG_CMDSTATUS, CMD_HCR);
 +
 +        let deadline = now_ms() + 100;
