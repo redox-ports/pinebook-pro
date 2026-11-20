@@ -2721,10 +2721,10 @@ index 00000000..132e2df7
 +}
 diff --git a/drivers/usb/ohcid/src/main.rs b/drivers/usb/ohcid/src/main.rs
 new file mode 100644
-index 00000000..db9b5138
+index 00000000..541e1a88
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/main.rs
-@@ -0,0 +1,984 @@
+@@ -0,0 +1,986 @@
 +//! ohcid - OHCI host controller driver for the RK3399 USB2 ports.
 +//!
 +//! The Pinebook Pro's internal keyboard and touchpad sit behind a Genesys hub
@@ -2783,6 +2783,7 @@ index 00000000..db9b5138
 +
 +// Hub port status bits.
 +const PORT_CONNECTION: u16 = 1 << 0;
++const PORT_CONNECTION_CHANGE: u16 = 1 << 0;
 +const PORT_ENABLE: u16 = 1 << 1;
 +const PORT_RESET: u16 = 1 << 4;
 +const PORT_LOW_SPEED: u16 = 1 << 9;
@@ -2793,10 +2794,11 @@ index 00000000..db9b5138
 +}
 +
 +fn daemon(daemon: daemon::Daemon) -> ! {
-+    common::init();
 +    // Never let USB bring-up hold the boot up: init blocks on notify-type
-+    // services, and the root filesystem does not depend on input.
++    // services, and the root filesystem does not depend on input. Signal
++    // readiness before touching any hardware.
 +    daemon.ready();
++    common::init();
 +
 +    let mut driver = Driver::new();
 +    driver.log.log(format_args!("ohcid: starting"));
@@ -3173,7 +3175,7 @@ index 00000000..db9b5138
 +
 +        for port in 1..=ports {
 +            let (status, change) = self.hub_port_status(addr, low_speed, mps0, port)?;
-+            if change & PORT_RESET_CHANGE != 0 {
++            if change & PORT_CONNECTION_CHANGE != 0 {
 +                let _ = self.hub_clear_feature(addr, low_speed, mps0, port, FEAT_C_PORT_CONNECTION);
 +            }
 +            if status & PORT_CONNECTION == 0 {
