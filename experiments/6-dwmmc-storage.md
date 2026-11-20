@@ -501,6 +501,55 @@ induced synchronous exception (ty=111100)` (EC=0x3C, BRK) — the kernel
 - `audiod` and `dhcpd` lack their hardware; `net` and audio are future
   drivers.
 
+## Iteration 9: serial login works (`logs/serial-20261120-105143.log`)
+
+`debugsh` did not release the console in iteration 8: the log shows its banner
+*before* dwmmcd's first line, i.e. init started the initfs services before
+the driver (target order is not enforced — see the AGENTS correction), so the
+one-shot startup check ran before `disk.mmc` existed. As a workaround the
+user typed `exit`, and the console was handed to the login:
+
+```text
+debugsh> exit
+debugsh: bye
+redox login: user
+Welcome to Redox OS!
+[src/initnsmgr.rs:47 WARN] Scheme ip not found in namespace
+...
+ion: creating history file at "/home/user/.local/share/ion/history"
+user:~$ cd /
+user:/$ ls
+```
+
+The system is genuinely interactive: ion runs, the history file is created
+(writes to redoxfs work), builtins work, and login as both `user` and
+`root`/`password` works. `debugsh` now waits up to 3 s (yield-spin) for
+`disk.mmc`, then releases the console; if a keypress arrives after the
+timeout with storage up, the next keypress does the same — so no `exit`
+typing is required.
+
+**Two userspace crashes, both on directory listing**, independent of
+`dwmmcd` (file reads and mounts work):
+
+- `/usr/bin/ls` dies with `ESR_EL1=0xF2000001` — EC=0x3C (BRK), ISS=1,
+  which is the LLVM `trap` instruction (`brk #1`) used by Rust's abort
+  path — after a syscall returned `-1` with `x8=0x9E` (SYS_YIELD). No
+  panic message is printed.
+- `/usr/bin/rm -rf /tmp` at boot prints `RELIBC PANIC: panicked at
+  src/cxa.rs:84:11: RefCell already borrowed` — `__cxa_thread_finalize`
+  holds `DTORS.borrow_mut()` while running destructors, and a destructor
+  that registers another thread-atexit function double-borrows → panic →
+  abort → BRK; the kernel then reports `FATAL: Not an SVC induced
+  synchronous exception (ty=111100)` and kills the process (init continues).
+
+Both commands call `read_dir`; the redoxfs `getdents` implementation and the
+relibc `std_fs_call(Getdents)` path look correct in isolation, and listing
+`/scheme` (kernel scheme, legacy pread fallback in relibc) worked for
+redoxfs itself at boot, so the failure is in the userspace listing/protocol
+path, not on the storage side. Next step: reproduce under QEMU (nvme root)
+with `RUST_BACKTRACE=1` to get symbolized stacks — this is an upstream
+relibc/protocols/redoxfs issue, tracked as README risk #14.
+
 ## Status
 
 **DONE — hardware-verified (iteration 8, 2026-11-20 10:22): redoxfs
