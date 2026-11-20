@@ -2699,10 +2699,10 @@ index 00000000..132e2df7
 +}
 diff --git a/drivers/usb/ohcid/src/main.rs b/drivers/usb/ohcid/src/main.rs
 new file mode 100644
-index 00000000..f06815f7
+index 00000000..db9b5138
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/main.rs
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,984 @@
 +//! ohcid - OHCI host controller driver for the RK3399 USB2 ports.
 +//!
 +//! The Pinebook Pro's internal keyboard and touchpad sit behind a Genesys hub
@@ -2733,9 +2733,15 @@ index 00000000..f06815f7
 +use crate::log::Logger;
 +use crate::ohci::{Error, Ohci};
 +
-+/// `usb_host0_ohci` and `usb_host1_ohci` (`rk3399.dtsi`). The internal hub
-+/// with the keyboard/touchpad is on the first one; the second drives the
-+/// remaining USB2 port.
++/// The two OHCI companions of the RK3399 USB2 host controllers, from
++/// `rk3399.dtsi` (Linux and U-Boot agree):
++///
++/// - `usb_host0_ohci` = 0xfe3a0000 (EHCI 0xfe380000)
++/// - `usb_host1_ohci` = 0xfe3e0000 (EHCI 0xfe3c0000)
++///
++/// U-Boot's boot log lists 4 devices on `usb@fe3e0000` and 2 on
++/// `usb@fe3a0000`, so the internal hub with the keyboard and touchpad is on
++/// `usb_host1` and is scanned first.
 +const OHCI_BASES: [usize; 2] = [0xfe3e0000, 0xfe3a0000];
 +
 +// USB standard descriptor types.
@@ -2979,7 +2985,9 @@ index 00000000..f06815f7
 +        return Vec::new();
 +    };
 +    let mut bases = Vec::new();
-+    for node in fdt.all_compatible(&["rockchip,rk3399-ohci"]) {
++    // `rk3399.dtsi` (Linux and U-Boot) uses the generic binding; keep the
++    // Rockchip-specific string for boards that carry it.
++    for node in fdt.all_compatible(&["generic-ohci", "rockchip,rk3399-ohci"]) {
 +        let Some(reg) = node.reg() else { continue };
 +        let Some(Ok(entry)) = reg.iter::<usize, usize>().next() else {
 +            continue;
