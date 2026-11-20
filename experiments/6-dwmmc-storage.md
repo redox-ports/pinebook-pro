@@ -194,9 +194,51 @@ Iteration 3 changes (built):
   is what works, the next log will show enumeration proceeding after a
   stop-stage timeout message.
 
+## Iteration 3 result (`logs/serial-20261120-084441.log`)
+
+Identical stall to iteration 2, now with proof that neither the IDMAC
+reorder nor dropping `PRV_DAT_WAIT` is the answer:
+
+```text
+dwmmcd: controller reset ok (ctrl was 0x02000000)
+dwmmcd: clock update (stop) failed: Connection timed out rint=0x00000000 status=0x00006106
+```
+
+The retry without `PRV_DAT_WAIT` also failed (no card lines were ever
+reached — no CMD0/CMD8 logs). `RINTSTS = 0` means the CIU never even
+started the command; `STATUS = 0x6106` (bit 9 BUSY + bits 12/13) is
+consistent with a frozen CIU. A CIU that does not execute commands while
+the register block still answers (BIU clock alive) points at the CIU clock
+itself being gated.
+
+Iteration 4 changes (built):
+
+- The driver maps the CRU (`ff760000`) and logs the SDMMC-related state:
+  `CLKSEL_CON(13)` (HCLK_SD mux/div), `CLKSEL_CON(16)` (SCLK_SDMMC
+  mux/div, decoded to source name), and the gate registers
+  `CLKGATE_CON(6)/CON(12)/CON(33)`.
+- If any of the three SDMMC clocks is gated (SCLK_SDMMC = CIU, CON(6)
+  bit 1; HCLK_SD = CON(12) bit 13; HCLK_SDMMC = CON(33) bit 8), the
+  driver enables it with a hiword write (Linux `clk_prepare_enable`
+  equivalent; all three are set-to-disable gates) and proceeds. This is
+  the minimal CRU write the port has to make: it does not change any
+  rate or mux, it only prevents an inherited gate from starving the
+  controller.
+
+Reference map used (verified in Linux `drivers/clk/rockchip/clk-rk3399.c`
+and U-Boot v2021.07 `drivers/clk/rockchip/clk_rk3399.c`):
+`COMPOSITE(SCLK_SDMMC, ..., CLKSEL_CON(16), 8,3 mux, 0,7 div,
+CLKGATE_CON(6), 1)`, `GATE(HCLK_SDMMC, ..., CLKGATE_CON(33), 8)`,
+`COMPOSITE(HCLK_SD, ..., CLKSEL_CON(13), CLKGATE_CON(12), 13)`. Note for
+later phases: the dw_mshc CIU on RK3399 divides the CRU clock by two
+internally ("dwmmc controller have internal div 2", U-Boot
+`rk3399_mmc_set_clk`), and U-Boot switches the source to `xin24m`
+(mux value 5) for the 400 kHz identification clock — relevant once the
+gate theory is confirmed or disproved.
+
 ## Status
 
-**in progress** — iteration 3 built and flashed-pending:
+**in progress** — iteration 4 built and flashed-pending:
 
 - [x] flashed and booted (iteration 1, 2026-11-20 08:21)
 - [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited

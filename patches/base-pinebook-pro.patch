@@ -606,10 +606,10 @@ index 00000000..1461a920
 +workspace = true
 diff --git a/drivers/storage/dwmmcd/src/dwmmc.rs b/drivers/storage/dwmmcd/src/dwmmc.rs
 new file mode 100644
-index 00000000..b9f4945e
+index 00000000..abca4f7d
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/dwmmc.rs
-@@ -0,0 +1,1057 @@
+@@ -0,0 +1,1179 @@
 +//! Synopsys DesignWare Mobile Storage Host Controller (dw_mshc) driver for
 +//! the Rockchip RK3399 microSD slot (`sdmmc@fe320000`).
 +//!
@@ -664,6 +664,34 @@ index 00000000..b9f4945e
 +const VERID: usize = 0x06c;
 +const HCON: usize = 0x070;
 +const BMOD: usize = 0x080;
++
++// ---------------------------------------------------------------------------
++// RK3399 CRU (clock and reset unit), ff760000. Offsets follow Linux
++// dt-bindings/clock/rk3399-cru.h: CLKSEL_CON(n) = 0x100 + 4n,
++// CLKGATE_CON(n) = 0x300 + 4n. Gates are HIWORD (mask in [31:16], data in
++// [15:0]) and set-to-disable: a data bit of 0 enables the clock.
++// ---------------------------------------------------------------------------
++
++pub const CRU_BASE: usize = 0xff760000;
++pub const CRU_LEN: usize = 0x1000;
++
++/// HCLK_SD (sdmmc bus-clock composite): CLKSEL_CON(13).
++const CRU_CLKSEL_CON13_HCLK_SD: usize = 0x134;
++/// SCLK_SDMMC (CIU clock composite): CLKSEL_CON(16).
++const CRU_CLKSEL_CON16_SCLK_SDMMC: usize = 0x140;
++/// SCLK_SDMMC gate (Linux: RK3399_CLKGATE_CON(6), bit 1).
++const CRU_CLKGATE_CON6: usize = 0x318;
++/// HCLK_SD gate (Linux: RK3399_CLKGATE_CON(12), bit 13).
++const CRU_CLKGATE_CON12: usize = 0x330;
++/// HCLK_SDMMC gate (Linux: RK3399_CLKGATE_CON(33), bit 8).
++const CRU_CLKGATE_CON33: usize = 0x384;
++
++const SDMMC_CIU_GATE_CON: usize = CRU_CLKGATE_CON6;
++const SDMMC_CIU_GATE_BIT: u32 = 1;
++const HCLK_SD_GATE_CON: usize = CRU_CLKGATE_CON12;
++const HCLK_SD_GATE_BIT: u32 = 13;
++const HCLK_SDMMC_GATE_CON: usize = CRU_CLKGATE_CON33;
++const HCLK_SDMMC_GATE_BIT: u32 = 8;
 +
 +/// FIFO data register. 0x100 for IP versions below 2.40a, 0x200 from 2.40a
 +/// on. U-Boot hardcodes 0x200 for every board it supports (including all
@@ -873,6 +901,10 @@ index 00000000..b9f4945e
 +
 +pub struct DwmmcHost {
 +    regs: RwLock<DwmmcRegs>,
++    /// CRU mapping (ff760000) when available; used read-only for
++    /// diagnostics plus un-gating the SDMMC clocks if the inherited state
++    /// has them gated.
++    cru: RwLock<Option<DwmmcRegs>>,
 +    pub fifo_depth: u32,
 +    pub rca: u32,
 +    pub block_addressed: bool,
@@ -883,11 +915,18 @@ index 00000000..b9f4945e
 +}
 +
 +impl DwmmcHost {
-+    pub fn new(base: *mut u32, fifo_depth: u32, log: Logger) -> Self {
-+        // SAFETY: the caller guarantees the pointer maps the controller.
++    pub fn new(base: *mut u32, cru: Option<*mut u32>, fifo_depth: u32, log: Logger) -> Self {
++        // SAFETY: the caller guarantees the pointers map the controller and
++        // (when given) the CRU.
 +        let regs = unsafe { DwmmcRegs::new(base) };
++        let cru = cru.map(|ptr| unsafe {
++            let mut regs = DwmmcRegs::new(ptr);
++            regs.data_offset = 0; // unused for the CRU
++            regs
++        });
 +        DwmmcHost {
 +            regs: RwLock::new(regs),
++            cru: RwLock::new(cru),
 +            fifo_depth,
 +            rca: 0,
 +            block_addressed: true,
@@ -931,6 +970,7 @@ index 00000000..b9f4945e
 +    /// Bring up the controller and enumerate the card.
 +    pub fn init(&mut self) -> Result<()> {
 +        self.save_inherited_clock();
++        self.cru_diagnostics_and_ungate();
 +        self.controller_setup()?;
 +        self.card_init()?;
 +        self.log.log(format_args!(
@@ -950,6 +990,88 @@ index 00000000..b9f4945e
 +        let regs = self.regs.read().unwrap();
 +        self.inherited_clkdiv = unsafe { regs.read(CLKDIV) };
 +        self.inherited_ctrl = unsafe { regs.read(CTRL) };
++    }
++
++    /// Read the CRU state feeding the controller and un-gate the SDMMC
++    /// clocks if they are gated (Linux clk_prepare_enable equivalent; all
++    /// three gates are hiword set-to-disable). Gated CIU clock matches the
++    /// iteration 2/3 symptom exactly: registers respond (BIU clock) while
++    /// every CIU command, including clock updates, hangs with a clean
++    /// RINTSTS.
++    fn cru_diagnostics_and_ungate(&mut self) {
++        let guard = self.cru.read().unwrap();
++        let cru = match guard.as_ref() {
++            Some(cru) => cru,
++            None => {
++                self.log
++                    .log(format_args!("dwmmcd: CRU not mapped, skipping clock checks"));
++                return;
++            }
++        };
++        unsafe {
++            let sel13 = cru.read(CRU_CLKSEL_CON13_HCLK_SD);
++            let sel16 = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            let gate6 = cru.read(SDMMC_CIU_GATE_CON);
++            let gate12 = cru.read(HCLK_SD_GATE_CON);
++            let gate33 = cru.read(HCLK_SDMMC_GATE_CON);
++            self.log.log(format_args!(
++                "dwmmcd: cru hclk_sd sel=0x{:08x} sclk_sdmmc sel=0x{:08x}",
++                sel13, sel16
++            ));
++            self.log.log(format_args!(
++                "dwmmcd: cru gates: con6=0x{:08x} con12=0x{:08x} con33=0x{:08x}",
++                gate6, gate12, gate33
++            ));
++
++            // SCLK_SDMMC source/div (CLKSEL_CON16): mux bits [10:8]
++            // (0=cpll,1=gpll,2=npll,3=ppll,4=upll,5=xin24m), div bits [6:0].
++            let mux = (sel16 >> 8) & 0x7;
++            let div = sel16 & 0x7f;
++            let source = match mux {
++                0 => "cpll",
++                1 => "gpll",
++                2 => "npll",
++                3 => "ppll",
++                4 => "upll",
++                5 => "xin24m",
++                _ => "reserved",
++            };
++            self.log.log(format_args!(
++                "dwmmcd: sclk_sdmmc source {} div {}",
++                source, div
++            ));
++
++            // Un-gate each SDMMC-related clock if disabled (data bit 1).
++            // HIWORD update: mask in [31:16], value in [15:0]; writing 0
++            // with the mask set enables a set-to-disable gate.
++            if gate6 & SDMMC_CIU_GATE_BIT != 0 {
++                self.log.log(format_args!(
++                    "dwmmcd: sclk_sdmmc gate closed, enabling"
++                ));
++                cru.write(
++                    SDMMC_CIU_GATE_CON,
++                    (1 << 16 + SDMMC_CIU_GATE_BIT),
++                );
++            }
++            if gate12 & HCLK_SD_GATE_BIT != 0 {
++                self.log.log(format_args!(
++                    "dwmmcd: hclk_sd gate closed, enabling"
++                ));
++                cru.write(
++                    HCLK_SD_GATE_CON,
++                    (1 << 16 + HCLK_SD_GATE_BIT),
++                );
++            }
++            if gate33 & HCLK_SDMMC_GATE_BIT != 0 {
++                self.log.log(format_args!(
++                    "dwmmcd: hclk_sdmmc gate closed, enabling"
++                ));
++                cru.write(
++                    HCLK_SDMMC_GATE_CON,
++                    (1 << 16 + HCLK_SDMMC_GATE_BIT),
++                );
++            }
++        }
 +    }
 +
 +    /// Controller-level setup, mirroring U-Boot dwmci_init: a full
@@ -1727,10 +1849,10 @@ index 00000000..3563380d
 +}
 diff --git a/drivers/storage/dwmmcd/src/main.rs b/drivers/storage/dwmmcd/src/main.rs
 new file mode 100644
-index 00000000..aa87cd67
+index 00000000..175b67f0
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/main.rs
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,196 @@
 +//! dwmmcd - DesignWare MMC (dw_mshc) microSD driver for the RK3399.
 +//!
 +//! Serves the `disk.mmc` scheme for the `sdmmc@fe320000` controller found in
@@ -1852,7 +1974,21 @@ index 00000000..aa87cd67
 +        addr
 +    ));
 +
-+    let mut host = dwmmc::DwmmcHost::new(addr as *mut u32, fifo_depth, log);
++    // Map the CRU as well (read-diagnostics plus un-gating the SDMMC
++    // clocks if the inherited state has them gated). Failure is not fatal:
++    // the driver then just skips the clock checks.
++    let cru = unsafe {
++        common::physmap(
++            dwmmc::CRU_BASE,
++            dwmmc::CRU_LEN,
++            common::Prot::RW,
++            common::MemoryType::DeviceMemory,
++        )
++        .ok()
++        .map(|ptr| ptr as usize as *mut u32)
++    };
++
++    let mut host = dwmmc::DwmmcHost::new(addr as *mut u32, cru, fifo_depth, log);
 +    host.log_inherited_state();
 +
 +    if let Err(err) = host.init() {
