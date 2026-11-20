@@ -66,7 +66,8 @@ fix(ci): prune runner disk before redox build
 
 ### Redox aarch64 boot chain (why this port is feasible)
 
-- Bootloader (UEFI, `BOOTAA64.EFI`): drops EL2→EL1, builds page tables, reads EFI memory map, **passes DTB to kernel via env `DTB_ADDR`/`DTB_SIZE`**, framebuffer via `FRAMEBUFFER_ADDR/WIDTH/HEIGHT/STRIDE`, RedoxFS via `REDOXFS_UUID`/`REDOXFS_BLOCK`.
+- Bootloader (UEFI, `BOOTAA64.EFI`): drops EL2→EL1, builds page tables, reads EFI memory map, **passes DTB to kernel via env `DTB_ADDR`/`DTB_SIZE`**, framebuffer via `FRAMEBUFFER_ADDR/WIDTH/HEIGHT/STRIDE/BPP`, RedoxFS via `REDOXFS_UUID`/`REDOXFS_BLOCK`.
+- **The firmware framebuffer is not necessarily 32bpp:** U-Boot v2021.07 `rk_vop.c` sets `VIDEO_BPP16` for `VOP_MODE_EDP`, and its GOP reports `PixelBitMask` with masks `0xf800/0x07e0/0x001f` (RGB565); `gop_set_mode` accepts only mode 0, so the depth cannot be changed from UEFI. Our bootloader derives `FRAMEBUFFER_BPP` from `Mode.Info.PixelFormat` and the kernel `graphical_debug` plus `vesad` honour it (experiment 7). Writing 32-bit ARGB `0xFF000000` into an RGB565 surface produces black/yellow pixel pairs — that was the "yellow screen".
 - Kernel serial driver is DTB-driven and supports `snps,dw-apb-uart` (16550 with u32 MMIO) → RK3399 UART2 works out of the box.
 - IRQ: RK3399 is **GICv3** (`arm,gic-v3`, GIC-500) — not GICv2/GIC-400. `gicv3.rs` exists; `irqchip::init_ap` (secondary CPUs) currently supports only the GICv2 memory-mapped interface, so expect single-CPU until extended. Timer: ARM generic timer. PSCI 1.1 (SMC conduit) works.
 - Precedent: Raspberry Pi 3 B+ (ARM64, U-Boot) boots to UART serial console; storage drivers are the missing piece everywhere on aarch64.
@@ -116,7 +117,7 @@ fix(ci): prune runner disk before redox build
   and that kernel `nanosleep` does not wake on the generic timer (a 10 ms sleep
   blocked until a serial interrupt; `dwmmcd` now busy-waits). **Storage works
   end-to-end (iteration 8):** the microSD enumerates (`card ready: size=30436
-  MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
+MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   switchroots to `/usr`, the rootfs userspace starts and the `redox login:`
   banner appears. `debugsh` now exits at startup when `disk.mmc` is registered,
   releasing the serial console to the login. Secondary CPUs stay
