@@ -62,11 +62,27 @@
 #                        services, so redoxfs only starts after the scheme is
 #                        registered.
 #
+#                     3. Display colour (experiment 7): UEFI GOP does not
+#                        guarantee a 32-bit linear framebuffer. U-Boot v2021.07
+#                        programs the Rockchip VOP in RGB565 for the eDP panel
+#                        (rk_vop.c forces VIDEO_BPP16 for VOP_MODE_EDP) and
+#                        reports PixelBitMask 0xf800/0x07e0/0x001f, so 32-bit
+#                        ARGB writes turned the VT background into a
+#                        black/yellow dither. `vesad` now reads
+#                        FRAMEBUFFER_BPP (default 32 when absent, so x86 is
+#                        unchanged), maps the real framebuffer size and
+#                        converts client ARGB8888 buffers to RGB565 while
+#                        copying them to the framebuffer; the clear path uses
+#                        the same pixel size. `FRAMEBUFFER{n}` gained an
+#                        optional fifth field (bpp) for additional outputs.
+#
 # Contents:
 #   * debugsh/                  new initfs-only crate (static binary;
 #                               `reboot` writes `reset` to the kernel sys:kstop
 #                               scheme -> PSCI SYSTEM_RESET)
 #   * drivers/storage/dwmmcd/   new initfs-only crate (static binary)
+#   * drivers/graphics/vesad/src/main.rs, scheme.rs
+#                               honour FRAMEBUFFER_BPP (RGB565)
 #   * Makefile                  add debugsh and dwmmcd to INITFS_BINS
 #   * Cargo.toml, Cargo.lock    workspace members + lock entries
 #   * init.initfs.d/95_debugsh.service          debug console (aarch64 only)
@@ -640,6 +656,180 @@ index 00000000..3f4b321e
 +    }
 +    Ok(count)
 +}
+diff --git a/drivers/graphics/vesad/src/main.rs b/drivers/graphics/vesad/src/main.rs
+index 5aa1e755..208147ad 100644
+--- a/drivers/graphics/vesad/src/main.rs
++++ b/drivers/graphics/vesad/src/main.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ use std::env;
+ 
+ use driver_graphics::GraphicsScheme;
+-use event::{user_data, EventQueue};
++use event::{EventQueue, user_data};
+ 
+ use crate::scheme::{FbAdapter, FrameBuffer};
+ 
+@@ -39,10 +39,19 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+         16,
+     )
+     .expect("failed to parse FRAMEBUFFER_STRIDE");
++    // Firmware framebuffers are not always 32 bits per pixel; U-Boot programs
++    // RGB565 for the RK3399 eDP panel. Unknown/absent values keep 32 bpp.
++    let bpp = match env::var("FRAMEBUFFER_BPP") {
++        Ok(value) => match usize::from_str_radix(&value, 16) {
++            Ok(16) => 16,
++            _ => 32,
++        },
++        Err(_) => 32,
++    };
+ 
+     println!(
+-        "vesad: {}x{} stride {} at 0x{:X}",
+-        width, height, stride, phys
++        "vesad: {}x{} stride {} bpp {} at 0x{:X}",
++        width, height, stride, bpp, phys
+     );
+ 
+     if phys == 0 {
+@@ -51,7 +60,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+         std::process::exit(0);
+     }
+ 
+-    let mut framebuffers = vec![unsafe { FrameBuffer::new(phys, width, height, stride) }];
++    let mut framebuffers = vec![unsafe { FrameBuffer::new(phys, width, height, stride, bpp) }];
+ 
+     //TODO: ideal maximum number of outputs?
+     let bootloader_env = std::fs::read_to_string("/scheme/sys/env")
+@@ -67,8 +76,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+             Some(var) => match unsafe { FrameBuffer::parse(var) } {
+                 Some(fb) => {
+                     println!(
+-                        "vesad: framebuffer {}: {}x{} stride {} at 0x{:X}",
+-                        i, fb.width, fb.height, fb.stride, fb.phys
++                        "vesad: framebuffer {}: {}x{} stride {} bpp {} at 0x{:X}",
++                        i, fb.width, fb.height, fb.stride, fb.bpp, fb.phys
+                     );
+                     framebuffers.push(fb);
+                 }
+diff --git a/drivers/graphics/vesad/src/scheme.rs b/drivers/graphics/vesad/src/scheme.rs
+index a31f42dc..e006e04a 100644
+--- a/drivers/graphics/vesad/src/scheme.rs
++++ b/drivers/graphics/vesad/src/scheme.rs
+@@ -138,13 +138,14 @@ impl GraphicsAdapter for FbAdapter {
+             if let Some(buffer) = &new_plane_state.fb {
+                 buffer.buffer.sync(framebuffer, damage)
+             } else {
+-                let onscreen_ptr = framebuffer.onscreen as *mut u32; // FIXME use as_mut_ptr once stable
++                let bpp_bytes = framebuffer.bpp / 8;
++                let onscreen = framebuffer.onscreen;
+                 for row in 0..framebuffer.height {
+                     unsafe {
+                         ptr::write_bytes(
+-                            onscreen_ptr.add(row * framebuffer.stride),
++                            onscreen.add(row * framebuffer.stride * bpp_bytes),
+                             0,
+-                            framebuffer.width,
++                            framebuffer.width * bpp_bytes,
+                         );
+                     }
+                 }
+@@ -159,35 +160,36 @@ impl GraphicsAdapter for FbAdapter {
+ 
+ #[derive(Debug)]
+ pub struct FrameBuffer {
+-    pub onscreen: *mut [u32],
++    pub onscreen: *mut u8,
+     pub phys: usize,
+     pub width: usize,
+     pub height: usize,
+     pub stride: usize,
++    /// Bits per pixel of the firmware framebuffer (16 or 32)
++    pub bpp: usize,
+ }
+ 
+ impl FrameBuffer {
+-    pub unsafe fn new(phys: usize, width: usize, height: usize, stride: usize) -> Self {
+-        let size = stride * height;
++    pub unsafe fn new(phys: usize, width: usize, height: usize, stride: usize, bpp: usize) -> Self {
++        let size = stride * height * bpp / 8;
+         let virt = common::physmap(
+             phys,
+-            size * 4,
++            size,
+             common::Prot {
+                 read: true,
+                 write: true,
+             },
+             common::MemoryType::WriteCombining,
+         )
+-        .expect("vesad: failed to map framebuffer") as *mut u32;
+-
+-        let onscreen = ptr::slice_from_raw_parts_mut(virt, size);
++        .expect("vesad: failed to map framebuffer") as *mut u8;
+ 
+         Self {
+-            onscreen,
++            onscreen: virt,
+             phys,
+             width,
+             height,
+             stride,
++            bpp,
+         }
+     }
+ 
+@@ -212,7 +214,14 @@ impl FrameBuffer {
+         let width = parse_number(parts.next()?)?;
+         let height = parse_number(parts.next()?)?;
+         let stride = parse_number(parts.next()?)?;
+-        Some(Self::new(phys, width, height, stride))
++        let bpp = match parts.next() {
++            Some(part) => match parse_number(part)? {
++                16 => 16,
++                _ => 32,
++            },
++            None => 32,
++        };
++        Some(Self::new(phys, width, height, stride, bpp))
+     }
+ }
+ 
+@@ -271,16 +280,27 @@ impl GraphicScreen {
+         let w: usize = sync_rect.width.try_into().unwrap();
+         let h: usize = sync_rect.height.try_into().unwrap();
+ 
+-        let offscreen_ptr = self.ptr.as_ptr() as *mut u32;
+-        let onscreen_ptr = framebuffer.onscreen as *mut u32; // FIXME use as_mut_ptr once stable
++        let offscreen_ptr = self.ptr.as_ptr() as *const u32;
++        let bpp_bytes = framebuffer.bpp / 8;
+ 
+         for row in start_y..start_y + h {
+-            unsafe {
+-                ptr::copy(
+-                    offscreen_ptr.add(row * self.width + start_x),
+-                    onscreen_ptr.add(row * framebuffer.stride + start_x),
+-                    w,
+-                );
++            let src = unsafe { offscreen_ptr.add(row * self.width + start_x) };
++            let dst = unsafe {
++                framebuffer
++                    .onscreen
++                    .add((row * framebuffer.stride + start_x) * bpp_bytes)
++            };
++            if framebuffer.bpp == 16 {
++                // Firmware framebuffer is RGB565 (U-Boot rk_vop.c selects
++                // VIDEO_BPP16 for eDP panels); clients always render ARGB8888.
++                let dst = dst.cast::<u16>();
++                for i in 0..w {
++                    let px = unsafe { *src.add(i) };
++                    let px = ((px >> 8) & 0xF800) | ((px >> 5) & 0x07E0) | ((px >> 3) & 0x001F);
++                    unsafe { ptr::write_unaligned(dst.add(i), px as u16) };
++                }
++            } else {
++                unsafe { ptr::copy_nonoverlapping(src, dst.cast::<u32>(), w) };
+             }
+         }
+     }
 diff --git a/drivers/hwd/src/main.rs b/drivers/hwd/src/main.rs
 index 79360e34..e6e7f53c 100644
 --- a/drivers/hwd/src/main.rs

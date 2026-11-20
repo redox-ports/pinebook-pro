@@ -1,0 +1,199 @@
+# redox-os/kernel @ 719e8f5c: honour the firmware framebuffer bit depth
+#
+# Target repository : https://gitlab.redox-os.org/redox-os/kernel.git
+# Base commit       : 719e8f5c (master, 2026-11)
+# Reason            : The linear framebuffer handed over by UEFI GOP is not
+#                     always 32 bits per pixel. On the Pinebook Pro, U-Boot
+#                     v2021.07 programs the Rockchip VOP in RGB565 for the eDP
+#                     panel (drivers/video/rockchip/rk_vop.c forces
+#                     VIDEO_BPP16 for VOP_MODE_EDP) and its GOP reports
+#                     PixelBitMask with masks 0xf800/0x07e0/0x001f.
+#                     graphical_debug wrote 32-bit ARGB pixels into that
+#                     surface and reserved stride*height*4 bytes, which showed
+#                     up on the panel as a black/yellow dither (experiment 7).
+#
+#                     The debug display now reads FRAMEBUFFER_BPP (default 32
+#                     when absent or unknown, so every existing platform is
+#                     unchanged), converts glyph colours to RGB565 for 16bpp,
+#                     clears text rows within the real buffer (clamped to the
+#                     display height) and reserves stride*height*bpp/8 bytes.
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/devices/graphical_debug/debug.rs b/src/devices/graphical_debug/debug.rs
+index 4b684c8a..10958420 100644
+--- a/src/devices/graphical_debug/debug.rs
++++ b/src/devices/graphical_debug/debug.rs
+@@ -4,11 +4,59 @@ pub(super) struct Display {
+     pub(super) width: usize,
+     pub(super) height: usize,
+     pub(super) stride: usize,
+-    onscreen_ptr: *mut u32,
++    pub(super) bpp: usize,
++    onscreen_ptr: *mut u8,
+ }
+ 
+ unsafe impl Send for Display {}
+ 
++impl Display {
++    #[inline]
++    fn bytes_per_pixel(&self) -> usize {
++        self.bpp / 8
++    }
++
++    /// Convert a 0xAARRGGBB value to the hardware pixel format.
++    #[inline]
++    fn pixel(&self, color: u32) -> u32 {
++        if self.bpp == 16 {
++            // RGB565, as programmed by firmware for eDP panels (U-Boot
++            // rk_vop.c forces VIDEO_BPP16 for VOP_MODE_EDP).
++            ((color >> 8) & 0xF800) | ((color >> 5) & 0x07E0) | ((color >> 3) & 0x001F)
++        } else {
++            color
++        }
++    }
++
++    /// Write one pixel at (x, y), where y is already within the display.
++    unsafe fn set_pixel(&self, x: usize, y: usize, color: u32) {
++        let ptr = unsafe {
++            self.onscreen_ptr
++                .add((y * self.stride + x) * self.bytes_per_pixel())
++        };
++        if self.bpp == 16 {
++            unsafe { ptr::write_unaligned(ptr.cast::<u16>(), color as u16) };
++        } else {
++            unsafe { ptr::write_unaligned(ptr.cast::<u32>(), color) };
++        }
++    }
++
++    /// Zero a single text row (up to 16 pixels high, clamped to the display).
++    unsafe fn clear_text_row(&self, y: usize) {
++        let first = y * 16;
++        if first >= self.height {
++            return;
++        }
++        let rows = (self.height - first).min(16);
++        let bytes = rows * self.stride * self.bytes_per_pixel();
++        let ptr = unsafe {
++            self.onscreen_ptr
++                .add(first * self.stride * self.bytes_per_pixel())
++        };
++        unsafe { ptr::write_bytes(ptr, 0, bytes) };
++    }
++}
++
+ static FONT: &[u8] = include_bytes!("../../../res/unifont.font");
+ 
+ enum Mode {
+@@ -31,12 +79,14 @@ impl DebugDisplay {
+         width: usize,
+         height: usize,
+         stride: usize,
+-        onscreen_ptr: *mut u32,
++        bpp: usize,
++        onscreen_ptr: *mut u8,
+     ) -> DebugDisplay {
+         let display = Display {
+             width,
+             height,
+             stride,
++            bpp,
+             onscreen_ptr,
+         };
+ 
+@@ -109,45 +159,27 @@ impl DebugDisplay {
+     }
+ 
+     fn clear_row(&mut self, y: usize) {
+-        for row in y * 16..(y + 1) * 16 {
+-            unsafe {
+-                ptr::write_bytes(
+-                    self.display.onscreen_ptr.add(row * self.display.stride),
+-                    0,
+-                    self.display.width,
+-                );
+-            }
+-        }
++        unsafe { self.display.clear_text_row(y) };
+     }
+ 
+     /// Draw a character
+     fn char(&mut self, x: usize, y: usize, character: char, color: u32) {
+         if x + 8 <= self.display.width && y + 16 <= self.display.height {
+             let phys_y = y % self.display.height;
+-            let mut dst = unsafe {
+-                self.display
+-                    .onscreen_ptr
+-                    .add(phys_y * self.display.stride + x)
+-            };
++            let color = self.display.pixel(color);
+ 
+             let font_i = 16 * (character as usize);
+             if font_i + 16 <= FONT.len() {
+                 for row in 0..16 {
+                     let row_data = FONT[font_i + row];
++                    let pix_y = (phys_y + row) % self.display.height;
+                     for col in 0..8 {
+                         if (row_data >> (7 - col)) & 1 == 1 {
+                             unsafe {
+-                                *dst.add(col) = color;
++                                self.display.set_pixel(x + col, pix_y, color);
+                             }
+                         }
+                     }
+-
+-                    let next_phys_y = (phys_y + row + 1) % self.display.height;
+-                    dst = unsafe {
+-                        self.display
+-                            .onscreen_ptr
+-                            .add(next_phys_y * self.display.stride + x)
+-                    };
+                 }
+             }
+         }
+diff --git a/src/devices/graphical_debug/mod.rs b/src/devices/graphical_debug/mod.rs
+index b701c9a8..88262fed 100644
+--- a/src/devices/graphical_debug/mod.rs
++++ b/src/devices/graphical_debug/mod.rs
+@@ -18,6 +18,7 @@ pub fn init(env: &[u8]) {
+     let mut width = 0;
+     let mut height = 0;
+     let mut stride = 0;
++    let mut bpp = 32;
+ 
+     //TODO: should errors be reported?
+     for line in str::from_utf8(env).unwrap_or("").lines() {
+@@ -44,9 +45,18 @@ pub fn init(env: &[u8]) {
+         if name == "FRAMEBUFFER_STRIDE" {
+             stride = usize::from_str_radix(value, 16).unwrap_or(0);
+         }
++
++        if name == "FRAMEBUFFER_BPP" {
++            // Unknown values (including the absent variable on older
++            // bootloaders) keep the 32-bit-per-pixel default.
++            let parsed = usize::from_str_radix(value, 16).unwrap_or(0);
++            if parsed == 16 || parsed == 32 {
++                bpp = parsed;
++            }
++        }
+     }
+ 
+-    *FRAMEBUFFER.lock() = (phys, virt, stride * height * 4);
++    *FRAMEBUFFER.lock() = (phys, virt, stride * height * bpp / 8);
+ 
+     if phys == 0 || virt == 0 || width == 0 || height == 0 || stride == 0 {
+         println!("Framebuffer not found");
+@@ -54,11 +64,11 @@ pub fn init(env: &[u8]) {
+     }
+ 
+     println!(
+-        "Framebuffer {}x{} stride {} at {:X} mapped to {:X}",
+-        width, height, stride, phys, virt
++        "Framebuffer {}x{} stride {} bpp {} at {:X} mapped to {:X}",
++        width, height, stride, bpp, phys, virt
+     );
+ 
+-    let debug_display = DebugDisplay::new(width, height, stride, virt as *mut u32);
++    let debug_display = DebugDisplay::new(width, height, stride, bpp, virt as *mut u8);
+     *DEBUG_DISPLAY.lock() = Some(debug_display);
+ }
+ 

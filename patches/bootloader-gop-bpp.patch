@@ -1,0 +1,146 @@
+# redox-os/bootloader @ f3d9261: export the firmware framebuffer bit depth
+#
+# Target repository : https://gitlab.redox-os.org/redox-os/bootloader.git
+# Base commit       : f3d9261 (master, 2026-11)
+# Reason            : UEFI GOP does not guarantee a 32-bit linear framebuffer.
+#                     U-Boot v2021.07 formats the Rockchip VOP as RGB565 for
+#                     the eDP panel of the Pinebook Pro (rk_vop.c forces
+#                     VIDEO_BPP16 for VOP_MODE_EDP) and reports the surface
+#                     with PixelBitMask (0xf800/0x07e0/0x001f); gop_set_mode
+#                     accepts only mode 0, so the depth cannot be changed.
+#
+#                     OsVideoMode now carries bpp, derived after SetMode from
+#                     Mode.Info.PixelFormat: 32 for the two 8-bit-per-channel
+#                     formats, and the highest set bit of the R/G/B bit masks
+#                     for PixelBitMask (0xffff -> 16). The value is written to
+#                     the boot environment as FRAMEBUFFER_BPP (same blob as
+#                     FRAMEBUFFER_STRIDE, so init passes it to services) and
+#                     the framebuffer is mapped with the real size. Unknown
+#                     formats export 0, which consumers treat as 32bpp; VBE
+#                     keeps 32 (it only accepts 32-bit modes).
+#
+# Apply from the repo root:  git apply <this file>
+diff --git a/src/main.rs b/src/main.rs
+index 28d1e24..134b0a5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -663,12 +663,20 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+         for output_i in 0..os.video_outputs() {
+             if let Some(mode) = mode_opts[output_i] {
+                 if output_i == 0 {
++                    // The firmware may hand out a surface that is not 32 bits per
++                    // pixel (U-Boot programs RGB565 for the RK3399 eDP panel), so
++                    // the size and the reported format must follow the real mode.
++                    // Consumers treat 0 (unknown) as 32 bits per pixel.
++                    let bpp = match mode.bpp {
++                        16 | 32 => mode.bpp,
++                        _ => 32,
++                    };
+                     let virt = unsafe {
+                         paging_framebuffer(
+                             os,
+                             page_phys,
+                             mode.base,
+-                            (mode.stride * mode.height * 4) as u64,
++                            (mode.stride * mode.height * (bpp / 8)) as u64,
+                         )
+                     }
+                     .expect("Failed to map framebuffer");
+@@ -678,6 +686,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+                     writeln!(w, "FRAMEBUFFER_WIDTH={:016x}", mode.width).unwrap();
+                     writeln!(w, "FRAMEBUFFER_HEIGHT={:016x}", mode.height).unwrap();
+                     writeln!(w, "FRAMEBUFFER_STRIDE={:016x}", mode.stride).unwrap();
++                    writeln!(w, "FRAMEBUFFER_BPP={:016x}", mode.bpp).unwrap();
+                 } else {
+                     writeln!(
+                         w,
+diff --git a/src/os/bios/vbe.rs b/src/os/bios/vbe.rs
+index 9498b8d..18fdfa3 100644
+--- a/src/os/bios/vbe.rs
++++ b/src/os/bios/vbe.rs
+@@ -139,6 +139,7 @@ impl Iterator for VideoModeIter {
+                     width,
+                     height,
+                     stride,
++                    bpp: 32,
+                     base: mode_info.physbaseptr as u64,
+                 });
+             } else {
+diff --git a/src/os/mod.rs b/src/os/mod.rs
+index df22102..d5a62e5 100644
+--- a/src/os/mod.rs
++++ b/src/os/mod.rs
+@@ -79,7 +79,10 @@ pub struct OsVideoMode {
+     pub id: u32,
+     pub width: u32,
+     pub height: u32,
++    /// Scan line length in pixels
+     pub stride: u32,
++    /// Bits per pixel of the linear framebuffer (16 or 32)
++    pub bpp: u32,
+     pub base: u64,
+ }
+ 
+diff --git a/src/os/uefi/mod.rs b/src/os/uefi/mod.rs
+index f55d8e8..0a9125a 100644
+--- a/src/os/uefi/mod.rs
++++ b/src/os/uefi/mod.rs
+@@ -4,6 +4,7 @@ use std::proto::Protocol;
+ use uefi::{
+     Handle,
+     boot::LocateSearchType,
++    graphics::{GraphicsOutputModeInfo, GraphicsPixelFormat},
+     memory::MemoryType,
+     reset::ResetType,
+     status::{Result, Status},
+@@ -38,6 +39,29 @@ pub(crate) fn page_size() -> usize {
+     4096
+ }
+ 
++/// Bits per pixel of the linear framebuffer described by a GOP mode info.
++///
++/// UEFI only guarantees the byte layout for the two 8-bit-per-channel formats;
++/// anything else (notably the RGB565 surface U-Boot programs for eDP panels)
++/// is described by bit masks, so derive the pixel width from them. Returns 0
++/// when the mode has no linear framebuffer or the width cannot be derived.
++fn pixel_bits_per_pixel(info: &GraphicsOutputModeInfo) -> u32 {
++    match info.PixelFormat {
++        GraphicsPixelFormat::PixelRedGreenBlueReserved8BitPerColor
++        | GraphicsPixelFormat::PixelBlueGreenRedReserved8BitPerColor => 32,
++        GraphicsPixelFormat::PixelBitMask => {
++            let masks = &info.PixelInformation;
++            let used = masks.RedMask | masks.GreenMask | masks.BlueMask;
++            if used == 0 {
++                0
++            } else {
++                32 - used.leading_zeros()
++            }
++        }
++        _ => 0,
++    }
++}
++
+ pub(crate) fn alloc_zeroed_page_aligned(size: usize) -> *mut u8 {
+     assert!(size != 0);
+ 
+@@ -268,6 +292,7 @@ impl Os for OsEfi {
+         mode.width = output.0.Mode.Info.HorizontalResolution;
+         mode.height = output.0.Mode.Info.VerticalResolution;
+         mode.base = output.0.Mode.FrameBufferBase as u64;
++        mode.bpp = pixel_bits_per_pixel(&output.0.Mode.Info);
+     }
+ 
+     fn best_resolution(&self, output_i: usize) -> Option<(u32, u32)> {
+diff --git a/src/os/uefi/video_mode.rs b/src/os/uefi/video_mode.rs
+index b6e020a..8dad8b8 100644
+--- a/src/os/uefi/video_mode.rs
++++ b/src/os/uefi/video_mode.rs
+@@ -46,6 +46,8 @@ impl Iterator for VideoModeIter {
+                     width,
+                     height,
+                     stride,
++                    // Refined by set_video_mode from the live mode information
++                    bpp: 32,
+                     // Base is retrieved later by setting the mode
+                     base: 0,
+                 });
