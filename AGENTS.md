@@ -132,10 +132,14 @@ fix(ci): prune runner disk before redox build
 MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   switchroots to `/usr`, the rootfs userspace starts and the `redox login:`
   banner appears. `debugsh` now exits at startup when `disk.mmc` is registered,
-  releasing the serial console to the login. Secondary CPUs stay
+  releasing the serial console to the login. **Rootfs userspace verified
+  (experiment 12):** `ls /bin`, `ls /usr/` and `ls /usr/bin/` print complete
+  listings, `dwmmcd` reports `card ready` at `[   0.115]` and the log timestamps
+  advance (timer). Secondary CPUs stay
   offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
-  instrumentation removed, clean image rebuilt.
+  instrumentation removed, clean image rebuilt. `exit` from the rootfs shell logs
+  `procmgr: failed to send SIGCHLD to parent PID ProcessId(28)` (harmless, open).
 - **Dynamic userspace binaries (experiment 10):** the loader maps the executable at
   **0x1000** and `libc.so` at **0xa80000**, so absolute userspace PCs in an exception dump
   must be rebased before symbolising (identify the base with a register whose meaning you
@@ -193,6 +197,7 @@ patches/             # upstream additions/fixes, upstream tree preserved:
 
 - Primary development happens through GitHub Actions on Linux runners; local Linux builds are supported via `scripts/bootstrap-redox.sh` + `scripts/build-image.sh` (see README §4 "Local build, flash and serial loop"); macOS cannot run the Redox build natively (Linux-only; Podman machine may work but is not the supported path).
 - Hardware-facing milestones (Phase 3+) need a physical Pinebook Pro + UART cable; CI can only validate up to image composition + QEMU smoke tests.
+- `make image` only **assembles** the image from packages that are already built; it does not rebuild a recipe whose sources changed. After editing a checkout run `make r.<recipe> image` (or `make all`), otherwise the image can ship a stale binary with no trace in the sources (experiment 12: a leftover-instrumentation kernel produced a silent hang). `scripts/build-image.sh` runs `make all`, so the documented loop is safe.
 
 ## Quick links
 
