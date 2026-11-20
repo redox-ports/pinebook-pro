@@ -69,8 +69,57 @@ run was rebuilt with `make r.bootloader r.kernel image` and the kernel dropped f
 
 - Silent-hang mystery closed: stale artifact in the image, not a UART or bootloader
   regression. The bootloader markers were never required.
+- **Iteration 2** showed a second, independent cause for the same symptom: the
+  bootloader did not maintain the caches before jumping into the freshly loaded
+  kernel, so some image layouts execute stale instructions. Fix built, hardware
+  check pending.
 - Verified on hardware: rootfs userspace and uutils applets, timer tick, RedoxFS root
-  mount, getty login.
+  mount, getty login (marker build).
 - Build rule recorded in `AGENTS.md`: after touching a recipe's sources, rebuild that
   recipe; never assemble an image from existing packages.
 - Open: the internal keyboard (`ohcid`, experiment 8) still does not deliver input.
+
+## Iteration 2 — the rebuilt image hung again (2026-11-20 21:11)
+
+The clean rebuild (`kernel_size: 0x17ec58`, ELF entry `0xffffff00000a5ce8`) stopped in
+exactly the same place: the bootloader completes, `KernelArgs` is printed, no kernel
+output at all (`logs/serial-20261120-211139.log`). So the stale artifact was not the
+whole story.
+
+### Comparison of the captures
+
+| Capture               | kernel_size | ELF entry | Result         |
+| --------------------- | ----------- | --------- | -------------- |
+| 10:22 – 11:24         | `0x17e550`  | `0x6a108` | boots to login |
+| 15:49                 | `0x17e5d8`  | `0x6a030` | boots to login |
+| 18:09                 | `0x16e228`  | `0x63a80` | boots to login |
+| 20:37 (diag, markers) | `0x17ecc0`  | `0x4e938` | boots to login |
+| 19:59 (stale)         | `0x17ecb8`  | `0x8e468` | silent         |
+| 21:11 (clean)         | `0x17ec58`  | `0xa5ce8` | silent         |
+
+Two facts came out of it:
+
+1. The same sources build reproducibly (`touch` + rebuild gives an identical
+   binary), but adding the debug markers — 104 bytes of source — moves `kstart`
+   by 357 KiB (`0x4e938` vs `0xa5ce8`). The kernel's function layout is reshuffled
+   by a tiny source change.
+2. The UART is healthy in the silent boots too (`mcr=0x3`, loopback off), so the
+   silence is not a port state problem: the kernel never reaches its first write.
+
+### Root cause (inferred): no cache maintenance before the handover
+
+`src/os/uefi/arch/aarch64.rs` copies the kernel image into memory with normal stores
+and jumps to it without cleaning the data cache or invalidating the instruction cache.
+Instruction fetch is not coherent with the data cache on ARM, so a layout that lands on
+physical pages whose lines are still dirty, or whose instructions are still in the
+I-cache, can execute stale bytes — and whether that happens depends on which pages the
+EFI allocator hands out, i.e. on the image layout. QEMU never shows it because it does
+not model caches.
+
+### Fix
+
+`cache_sync_instructions(kernel_base, kernel_size)` in the bootloader, called right
+before `entry_fn(args)`: `dc civac` for every data-cache line of the image, then
+`dsb sy`, `ic iallu`, `dsb sy`, `isb`.
+
+Status: built and QEMU-tested (smoke test green), hardware check pending.

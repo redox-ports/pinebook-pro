@@ -1,0 +1,44 @@
+diff --git a/src/os/uefi/arch/aarch64.rs b/src/os/uefi/arch/aarch64.rs
+index daab811..38b1827 100644
+--- a/src/os/uefi/arch/aarch64.rs
++++ b/src/os/uefi/arch/aarch64.rs
+@@ -192,10 +192,39 @@ unsafe extern "C" fn kernel_entry(
+ 
+         // Call kernel entry
+         let entry_fn: extern "C" fn(*const KernelArgs) -> ! = mem::transmute(func);
++        cache_sync_instructions((*args).kernel_base, (*args).kernel_size);
+         entry_fn(args);
+     }
+ }
+ 
++/// Make freshly written code visible to instruction fetch.
++///
++/// The kernel image is copied into memory with normal stores, i.e. through the
++/// data cache, and instruction fetch is not coherent with it on ARM. Without
++/// the sequence below a jump into freshly loaded code can execute stale or
++/// partially written bytes; whether it bites depends on which physical pages
++/// the firmware handed out, so the symptom is layout-dependent and QEMU (which
++/// does not model caches) never shows it.
++unsafe fn cache_sync_instructions(base: u64, size: u64) {
++    unsafe {
++        let ctr: u64;
++        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nostack));
++        // DminLine is log2 of the number of 4-byte words in a cache line.
++        let dline = 4u64 << ((ctr >> 16) & 0xf);
++
++        let mut addr = base & !(dline - 1);
++        let end = base.saturating_add(size);
++        while addr < end {
++            // Clean to the point of coherency and drop the line, so the next
++            // read comes from memory.
++            asm!("dc civac, {}", in(reg) addr, options(nostack));
++            addr += dline;
++        }
++
++        asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack),);
++    }
++}
++
+ pub fn main() -> Result<()> {
+     LOGGER.init();
+ 
