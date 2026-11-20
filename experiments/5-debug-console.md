@@ -11,7 +11,7 @@ the way: NS16550 loopback self-test leaves `IER=0`/loopback on (early return), a
 14-byte FIFO RX threshold that swallows single keystrokes. The temporary marker/dump
 instrumentation has been removed from the build tree; the kernel now logs only
 `GICD_CTLR X -> Y` and the loopback self-test failure.
-**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-initfs-debug-console.patch`, `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `scripts/github-mirrors.sh`
+**Related:** experiment 4 (first userspace boot), README §4 (local loop), §6 Phase 3/4; `patches/base-pinebook-pro.patch` (this was `base-initfs-debug-console.patch` at the time; now folded into the combined patch), `patches/kernel-uart-16550-rx-irq.patch`, `patches/kernel-gicv3-spi-group1.patch`, `scripts/github-mirrors.sh`
 
 ## Iteration 1 results (2026-11-20)
 
@@ -37,7 +37,7 @@ What failed, and why:
    Gating `40_pcid-spawner-initfs.service` removed the spawner from the log, but
    `drivers/hwd/src/main.rs` calls `daemon::Daemon::spawn(Command::new("pcid"))`
    directly (deprecated legacy path). **Fixed** in
-   `patches/base-initfs-debug-console.patch`: hwd skips the pcid spawn on aarch64.
+   `patches/base-pinebook-pro.patch`: hwd skips the pcid spawn on aarch64.
 
 ## Iteration 2 results (2026-11-20)
 
@@ -182,7 +182,7 @@ kernel (UART2 RX IRQ -> debug scheme) -> debugsh (echo + line editing + built-in
                                       -> exec: initfs binaries (hwd, ramfs, ...)
 ```
 
-`debugsh` is added by `patches/base-initfs-debug-console.patch` (against
+`debugsh` is added by `patches/base-pinebook-pro.patch` (against
 `redox-os/base` @ `8f576d27`):
 
 - opens `/scheme/debug` (kernel debug scheme: reads = serial RX fed by the UART IRQ
