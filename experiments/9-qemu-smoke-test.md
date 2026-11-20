@@ -25,6 +25,10 @@ from its environment. The obvious QEMU setup — `-M virt` plus the packaged
 
 ## Working recipe
 
+`scripts/qemu-smoke.sh` wraps everything below, including the U-Boot download,
+the run and the log assertions. The manual steps are kept here because they are
+what the script does and what CI would have to do.
+
 Use U-Boot instead: it builds its own devicetree for `-M virt` and installs it
 through the EFI configuration table. The Debian package is enough and can be
 unpacked without root:

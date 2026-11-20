@@ -179,7 +179,7 @@ make all   # -> build/aarch64/pinebook-pro/harddrive.img
 | Image creation                 | `redox-installer` writes GPT (BIOS boot gap, ESP, RedoxFS) and populates RedoxFS; ESP gets the Redox UEFI bootloader                              |
 | CI-friendly knobs              | `CI=1` (disables TUI), `REPO_BINARY=1` (prebuilt packages, if published for aarch64), `REPO_OFFLINE=1`, `COOKBOOK_MAKE_JOBS`, `PODMAN_BUILD=0/1`  |
 | Helper                         | `./build.sh -A <target>` (`-A` = aarch64), e.g. `./build.sh -A aarch64 -c pinebook-pro all`                                                       |
-| Boot test (virtual)            | `make qemu` on aarch64 uses AAVMF + `-M virt`; U-Boot raspi3bp flow uses `-kernel u-boot.bin` + `disk=sdcard`                                     |
+| Boot test (virtual)            | `make qemu` on aarch64 uses AAVMF, which does **not** work for Redox: no devicetree (experiment 9). Use `scripts/qemu-smoke.sh` (U-Boot + `-M virt,gic-version=3`) |
 
 ### Local build, flash and serial loop (no CI required)
 
@@ -193,6 +193,16 @@ scripts/build-image.sh       # make all -> build/redox/build/aarch64/minimal/har
 scripts/flash-sd.sh          # write to the microSD (auto-detects the SU32G card, refuses the eMMC)
 scripts/serial-log.sh        # UART console at 1500000 8N1, log under logs/
 ```
+
+Before flashing, the image can be booted headless in QEMU — no hardware needed:
+
+```sh
+scripts/qemu-smoke.sh        # U-Boot + -M virt,gic-version=3, asserts the boot reaches initfs
+```
+
+The script extracts the `u-boot-qemu` package without root on first use and
+writes `build/qemu-smoke.log`. What it can and cannot check (no RK3399
+peripherals, no root filesystem) is in `experiments/9-qemu-smoke-test.md`.
 
 | Fact                     | Value                                                                                                                                                           |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
