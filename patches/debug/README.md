@@ -62,15 +62,19 @@ raise an interrupt at all when keystrokes arrive. Apply it **after**
 
 ## How to apply locally
 
+From the repository root:
+
 ```sh
-# in the local build tree created by scripts/bootstrap-redox.sh
-git -C build/redox/recipes/core/kernel/source apply ../../../patches/debug/kernel-early-uart-markers.patch
-git -C build/redox/recipes/core/bootloader/source apply ../../../patches/debug/bootloader-uart-markers.patch
+# the ticket order matters: kernel-serial-irq-dump extends dtb/irqchip.rs
+scripts/apply-patches.sh kernel bootloader
+git -C build/redox/recipes/core/kernel/source \
+    apply "$PWD/patches/debug/kernel-early-uart-markers.patch"
+git -C build/redox/recipes/core/bootloader/source \
+    apply "$PWD/patches/debug/bootloader-uart-markers.patch"
 make -C build/redox r.kernel r.bootloader image
 ```
 
-(The paths above are relative to the repository root; adjust if the build tree
-lives elsewhere via `PBP_REDOX_DIR`.)
+Adjust the build-tree path if it lives elsewhere (`PBP_REDOX_DIR`).
 
 Remove the patches once the bring-up issue is fixed; they must never reach CI or
 upstream as-is.
