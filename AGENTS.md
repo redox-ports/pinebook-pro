@@ -114,8 +114,12 @@ fix(ci): prune runner disk before redox build
   hardware (STATUS 0x6106 → 0x0106). Iterations 6–7 hardware runs also proved
   `CLKSEL_CON16` is write-mask (hiword) protected — plain writes are dropped —
   and that kernel `nanosleep` does not wake on the generic timer (a 10 ms sleep
-  blocked until a serial interrupt; `dwmmcd` now busy-waits). Enumeration test
-  pending. Secondary CPUs stay
+  blocked until a serial interrupt; `dwmmcd` now busy-waits). **Storage works
+  end-to-end (iteration 8):** the microSD enumerates (`card ready: size=30436
+  MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
+  switchroots to `/usr`, the rootfs userspace starts and the `redox login:`
+  banner appears. `debugsh` now exits at startup when `disk.mmc` is registered,
+  releasing the serial console to the login. Secondary CPUs stay
   offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt.

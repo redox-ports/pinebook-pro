@@ -121,17 +121,17 @@ the lines after them differ.)
 
 ## Expected failure modes and next actions
 
-| Symptom (last dwmmcd line)                               | Meaning                                                                      | Next action                                                                                                                                 |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init failed: Connection timed out` (no CMD*)            | iteration 1: clock update stalled on the IDMAC-state controller              | fixed for iteration 2: full controller reset first (see above)                                                                              |
-| `clksel16 ... (hiword write): X -> X` (unchanged) | CRU write-mask rejected both the hiword and the plain write | the CRU needs the write-mask convention and the value is still wrong: check `CLKSEL16_MASK` against Linux clk-rk3399.c (`SCLK_SDMMC` on CLKSEL_CON(16): mux [10:8], div [6:0]) |
-| `clock update (ident/data) failed` (CMD readback logged) | CIU never accepts the update (START stuck) or accepts and stalls             | iteration 6 fallback engages automatically (`direct clocks:`); capture `cmd`/`status` from the line and compare with U-Boot `md 0xfe32002c` |
-| `CMD0 failed: timeout` (cmd readback logged)             | controller not talking: `cmd` START set = CIU rejected it, cleared = stalled | check `post-SRST`/`direct clocks` lines; if CLKENA never latches, toggle the slot power regulator (GPIO)                                    |
-| `CMD8 ok` then `ACMD41 busy timeout`                     | card never leaves busy; identification clock too slow/fast                   | change the identification CRU rate (`CLKSEL_400K` = xin24m/30) or compare with U-Boot `mmc dev 1; mmc rescan`                               |
-| `CMD3 failed` / `card returned RCA 0`                    | RCA handshake broken (unlikely after ACMD41)                                 | compare response words with a U-Boot `mmc switch` trace                                                                                     |
-| `data error at block ... rint=0x...`                     | data CRC/timing at full speed                                                | lower the data rate: larger divider in the CRU `CLKSEL_CON16` data value                                                                    |
-| `data timeout at block ...`                              | FIFO starvation or DTO never fires                                           | check `STATUS` FIFO count in the log line, lower chunk size to 1 block                                                                      |
-| `block 0 signature` not `55aa`                           | reads return garbage (byte order/sync issue)                                 | hexdump block 0 from debugsh: `hexdump disk.mmc: 512`? (needs scheme read)                                                                  |
+| Symptom (last dwmmcd line)                               | Meaning                                                                      | Next action                                                                                                                                                                    |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `init failed: Connection timed out` (no CMD*)            | iteration 1: clock update stalled on the IDMAC-state controller              | fixed for iteration 2: full controller reset first (see above)                                                                                                                 |
+| `clksel16 ... (hiword write): X -> X` (unchanged)        | CRU write-mask rejected both the hiword and the plain write                  | the CRU needs the write-mask convention and the value is still wrong: check `CLKSEL16_MASK` against Linux clk-rk3399.c (`SCLK_SDMMC` on CLKSEL_CON(16): mux [10:8], div [6:0]) |
+| `clock update (ident/data) failed` (CMD readback logged) | CIU never accepts the update (START stuck) or accepts and stalls             | iteration 6 fallback engages automatically (`direct clocks:`); capture `cmd`/`status` from the line and compare with U-Boot `md 0xfe32002c`                                    |
+| `CMD0 failed: timeout` (cmd readback logged)             | controller not talking: `cmd` START set = CIU rejected it, cleared = stalled | check `post-SRST`/`direct clocks` lines; if CLKENA never latches, toggle the slot power regulator (GPIO)                                                                       |
+| `CMD8 ok` then `ACMD41 busy timeout`                     | card never leaves busy; identification clock too slow/fast                   | change the identification CRU rate (`CLKSEL_400K` = xin24m/30) or compare with U-Boot `mmc dev 1; mmc rescan`                                                                  |
+| `CMD3 failed` / `card returned RCA 0`                    | RCA handshake broken (unlikely after ACMD41)                                 | compare response words with a U-Boot `mmc switch` trace                                                                                                                        |
+| `data error at block ... rint=0x...`                     | data CRC/timing at full speed                                                | lower the data rate: larger divider in the CRU `CLKSEL_CON16` data value                                                                                                       |
+| `data timeout at block ...`                              | FIFO starvation or DTO never fires                                           | check `STATUS` FIFO count in the log line, lower chunk size to 1 block                                                                                                         |
+| `block 0 signature` not `55aa`                           | reads return garbage (byte order/sync issue)                                 | hexdump block 0 from debugsh: `hexdump disk.mmc: 512`? (needs scheme read)                                                                                                     |
 
 ## First hardware boot (iteration 1, `logs/serial-20261120-082135.log`)
 
@@ -436,9 +436,75 @@ Iteration 7 changes (built, hardware test pending):
   driver continues at the inherited/identification rate instead of
   exiting (a slow mount beats no mount), logging what it kept.
 
+## Iteration 8: SUCCESS — the root filesystem mounts from microSD
+
+With the write-masked CRU writes and busy-wait delays
+(`logs/serial-20261120-102252.log`), the whole chain works:
+
+```text
+dwmmcd: asserting SRST_SDMMC + SRST_SD_NOC          [0.007]
+dwmmcd: pulsed SRST_SDMMC + SRST_SD_NOC             [0.027]  <- busy-waits work
+dwmmcd: clksel16 ident-400k (hiword write): 0x0000010e -> 0x0000051d
+dwmmcd: CMD8 ok (v2.0 card, 0x000001aa)
+dwmmcd: ACMD41 ready, ocr=0xc0ff8000 ccs=true
+dwmmcd: clksel16 data-rate (hiword write): 0x0000051d -> 0x0000010e
+dwmmcd: card ready: rca=0xe624 size=30436 MiB (block addressed)
+dwmmcd: block 0 signature 55aa
+```
+
+Then the interesting part — redoxfs's mount-by-UUID probe:
+
+```text
+[ERROR redoxfs] failed to open filesystem /scheme/disk.mmc/0: No such file or directory
+removing handle: id: 3, Some(Disk(0))
+[ERROR redoxfs] failed to open filesystem /scheme/disk.mmc/0p0: No such file or directory
+removing handle: id: 4, Some(Partition(0, 0))
+[ERROR redoxfs] failed to open filesystem /scheme/disk.mmc/0p1: No such file or directory
+removing handle: id: 5, Some(Partition(0, 1))
+removing handle: id: 2, Some(List([48, 10, 48, 112, 48, 10, 48, 112, 49, 10, 48, 112, 50, 10]))
+```
+
+The three errors are the **expected misses** while probing candidates: the
+whole disk (GPT, no redoxfs header at block 0), `0p0` (BIOS) and `0p1`
+(ESP/FAT). The third partition, `0p2` (REDOX, LBA 264192, header magic
+`RedoxFS\0` verified in the image), **opened successfully** — which is why
+there is no error line and no `removing handle` for it: the mount keeps
+the handle open. The `List([...])` bytes decode to `"0\n0p0\n0p1\n0p2\n"`
+— the scheme exposes all three partitions correctly.
+
+And then the milestone:
+
+```text
+init: switchroot to /usr /etc
+########## Redox OS ##########
+# Login with the following:  #
+# `user`                     #
+# `root`:`password`          #
+##############################
+redox login:
+```
+
+The full rootfs userspace starts (`audiod` — no device, `dhcpd` — no
+netcfg: both expected until their drivers exist) and the login manager
+runs. Iteration 8 change: with storage proven, `debugsh` now exits at
+startup when `disk.mmc` is registered (it shares the serial RX stream and
+was shadowing the login prompt — typing `user` reached debugsh, not the
+getty), releasing the console to the real login.
+
+Known non-storage issues visible in the same log, for later phases:
+
+- `rm -rf /tmp` panics in relibc (`src/cxa.rs:84: RefCell already
+borrowed`), and the panic path then trips a kernel `FATAL: Not an SVC
+induced synchronous exception (ty=111100)` (EC=0x3C, BRK) — the kernel
+  treats non-SVC synchronous exceptions as fatal; the process is killed
+  and init continues. Rootfs is unaffected.
+- `audiod` and `dhcpd` lack their hardware; `net` and audio are future
+  drivers.
+
 ## Status
 
-**in progress** — iteration 7 built, hardware test pending:
+**DONE — hardware-verified (iteration 8, 2026-11-20 10:22): redoxfs
+mounts the root filesystem from the microSD card through `dwmmcd`.**
 
 - [x] flashed and booted (iteration 1, 2026-11-20 08:21)
 - [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited
@@ -446,17 +512,16 @@ Iteration 7 changes (built, hardware test pending):
 - [x] SRST pulse verified on hardware (iteration 5: STATUS 0x6106 →
       0x0106, IDMAC bits cleared)
 - [x] clock-update wait mechanism fixed to U-Boot semantics + CRU rate
-      control (iteration 6; the CRU write needed the hiword write-mask —
-      iteration 7. Not yet exercised on hardware: the iteration-6 run failed
-      at the CRU write, before the first clock-update command)
-- [x] `CLKSEL_CON16` write-mask discovered and handled (iteration 7, from
-      the iteration-6 hardware log: plain writes dropped, readback 0x10e)
-- [x] `nanosleep` stall characterized (iteration 6 log: 249 s/6.3 s blocks
-      until serial input) and removed in favor of busy-waits (iteration 7)
-- [ ] `disk.mmc` scheme registered
-- [ ] redoxfs mounted the root filesystem
-- [ ] `init: switchroot to /usr /etc`
-- [ ] rootfs userspace (getty/ion) reached
+      control (iteration 6; exercised on hardware in iteration 8: updates
+      pass on the START-bit wait)
+- [x] `CLKSEL_CON16` write-mask discovered and handled (iteration 7,
+      verified in iteration 8: `0x10e -> 0x51d` readback sticks)
+- [x] `nanosleep` stall characterized and removed in favor of busy-waits
+      (iteration 7, verified in iteration 8: 20 ms SRST delay, no stall)
+- [x] `disk.mmc` scheme registered (iteration 8)
+- [x] redoxfs mounted the root filesystem (iteration 8, `disk.mmc/0p2`)
+- [x] `init: switchroot to /usr /etc` (iteration 8)
+- [x] rootfs userspace reached — `redox login:` prompt (iteration 8)
 
 ## Notes
 
