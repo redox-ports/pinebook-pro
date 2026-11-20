@@ -235,3 +235,31 @@ to report is the last `ohcid:` line plus whatever error follows it.
   the fix under test.
 - The DMA path and the DTB handling are verified under QEMU; the RK3399 clock
   and PHY sequence needs the next hardware run.
+
+## Iteration 2 — bring-up works, enumeration does not (2026-11-20 23:07)
+
+The deliverable image (`logs/serial-20261120-230717.log`) answers the open question:
+
+- **No SoC freeze.** `cru gates inherited: con6=0x00000060 con20=0x00000000` → after
+  the fix `con6=0x00000000 con20=0x00000000`; `u2phy` host suspend fields move to `2`
+  (running). Both controllers probe, read OHCI 1.0, go operational, and the root ports
+  report connected devices. The unclocked-access stall is gone.
+- **Enumeration fails on both ports, differently**:
+  - `fe3e0000` (internal hub, full-speed): reset ok, then `enumeration failed: Halted`
+    ~33 ms later — the first `GET_DESCRIPTOR(device, 8)` at address 0 ended in a
+    STALL/ED-halt.
+  - `fe3a0000`: low-speed device, reset ok, then `Timeout("transfer descriptor")` —
+    the TD was never accessed; the device never saw a valid transaction.
+- U-Boot enumerated these same devices minutes earlier in the same boot
+  (`2 USB Device(s)` on `fe3a0000`, `4` on `fe3e0000`), so the hardware, the ports and
+  the devices are fine; the defect is in our driver's protocol logic.
+
+Next: reproduce the enumeration in emulation — QEMU provides `pci-ohci`, `usb-hub` and
+`usb-kbd`, and the packaged U-Boot binds them (`In: serial,usbkbd`). The plan: boot the
+smoke setup with `pci-ohci` attached, expose it to the DT-driven driver through a
+patched copy of QEMU's own DTB (`-machine dtb=`), and debug the TD/ED/request sequence
+at seconds per iteration instead of one flash per guess. Two small driver changes are
+needed for that: the CRU/PHY step must run only on RK3399-compatible machines (it is
+RK3399-specific but currently runs whenever any OHCI node exists), and the probe list
+must come from the devicetree (today only the two hardcoded RK3399 addresses are
+probed). Neither touches the enumeration logic under test.

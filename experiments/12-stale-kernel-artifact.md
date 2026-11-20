@@ -194,3 +194,81 @@ Interpretation: delay boots ⇒ the handover is time-sensitive (something needs 
 after the last console output); println-only boots ⇒ the console/driver activity is
 what matters; neither boots ⇒ the register reads themselves change the state the kernel
 inherits.
+
+## Iteration 5 — the reads themselves; the initfs-size theory dies (2026-11-20 22:2x)
+
+Results of the split pair (same old bootloader, clean kernel):
+
+| Image              | Where the dump was                             | Result                        |
+| ------------------ | ---------------------------------------------- | ----------------------------- |
+| `diag-delay.img`   | ~100 ms spin, no MMIO access, no output        | silent                        |
+| `diag-println.img` | one console write (`handover: console primed`) | the line printed, then silent |
+
+`logs/serial-20261120-222230.log`, `logs/serial-20261120-222445.log`.
+
+- The println variant proves the extra code ran and the console still worked at that
+  point; the kernel still never started. Not the console activity.
+- The delay rules out "something needs time to settle". Not timing.
+- U-Boot's console driver reads LSR (0x14) before every character it outputs —
+  including the `KernelArgs` print in the very boots that hang — and that does not
+  substitute.
+
+What remains is the four 32-bit loads from `0xff1a0004/0x0c/0x10/0x14`, three of which
+(IER, LCR, MCR) are registers U-Boot's console path never touches.
+
+### The whole day in one table
+
+Rebuilt from the captures (`initfs:`, `012345`, `Redox OS starting`, `redox login`
+over `logs/`):
+
+| Captures         | initfs                               | Bootloader touches UART2 registers | Kernel starts | Login              |
+| ---------------- | ------------------------------------ | ---------------------------------- | ------------- | ------------------ |
+| 00:20–02:13 (13) | 22 MiB                               | yes (markers `012345`)             | yes           | – (no storage yet) |
+| 08:21–11:24 (9)  | 23 MiB                               | yes (markers)                      | yes           | 3 ×                |
+| 13:52–18:09 (3)  | **24 MiB** (`ohcid` enters at 13:52) | yes (markers)                      | yes           | 2 ×                |
+| 19:59            | 24 MiB                               | **no** (markers removed)           | **no**        | –                  |
+| 20:37            | 24 MiB                               | yes (dump + kernel markers)        | yes           | yes                |
+| 21:11–22:24 (8)  | 24 MiB                               | no                                 | no (silent)   | –                  |
+| 22:11            | 24 MiB                               | yes (old bootloader + dump)        | yes           | yes                |
+
+The markers wrote `MCR = 0x03` (a register **write**), the dump reads IER/LCR/MCR/LSR —
+either works, nothing else does. **The "initfs grew 22→24 MiB" theory is disproven:
+24 MiB images booted repeatedly between 13:52 and 18:09, behind the markers.** The
+invariant is a bootloader access to a UART2 register that U-Boot's console driver never
+touches, before `kernel_entry`.
+
+## Iteration 6 — the deliverable image, hardware-verified (2026-11-20 23:07)
+
+`dump_uart2()` is part of the committed patch set: the regenerated
+`patches/bootloader/src/os/uefi/arch/aarch64.rs.patch` carries the cache clean and the
+dump (`scripts/apply-patches.sh --check`: 46 entries up to date). Image rebuilt with
+`scripts/build-image.sh`:
+
+- EFI = fresh build (sha256 `3821aa00…`, byte-identical inside the image, contains the
+  dump strings; no `handover: console primed` — the stale-artifact trap was checked
+  explicitly),
+- kernel = the clean artifact (sha256 `48bfe3d7…`, 1 567 832 bytes),
+- QEMU smoke green: on `virt` the dump reads zeros (`0xff1a0000` is inside the RAM
+  mapping; `uart2 pre-kernel: ier=0x0 lcr=0x0 mcr=0x0 lsr=0x0` in
+  `build/qemu-smoke.log`), so emulation cannot reproduce the dependency — it only
+  proves the dump is harmless there.
+
+**Hardware (`logs/serial-20261120-230717.log`): boots to `redox login:`, `user` logs
+in, `ls` works.** The combination — µs arch-counter menu + cache clean + GOP RGB565 +
+`dump_uart2` + clean kernel — is the deliverable. `build/diag-oldboot.img` stays as the
+proven fallback. The mechanism remains unknown (inferred candidates: EL2-stage TLB
+entries created by the reads surviving the EL2→EL1 switch; an interconnect/
+clock-domain side effect of transactions U-Boot never issues). Bisect variants are
+designed (reads-without-println, per-register, unrelated MMIO, 8-bit width) but not
+built — deprioritized behind input, see experiment 8.
+
+### USB after this boot (input for experiment 8)
+
+`ohcid` no longer freezes the SoC: CRU gates read back open, both USB2 PHYs re-powered,
+both controllers operational. Enumeration fails on both ports with different
+signatures — `fe3e0000` (internal hub, full-speed): `Halted` ~33 ms after reset (the
+first GET_DESCRIPTOR ended in STALL/ED-halt); `fe3a0000`: low-speed device, TD never
+accessed → `Timeout("transfer descriptor")`. U-Boot enumerated these same devices
+minutes earlier in the same boot, so the hardware path works and the remaining defect
+is in our driver's protocol logic — debuggable in emulation (`pci-ohci`/`usb-hub`/
+`usb-kbd` exist in QEMU and the packaged U-Boot binds them).

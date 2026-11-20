@@ -70,6 +70,7 @@ fix(ci): prune runner disk before redox build
 ### Redox aarch64 boot chain (why this port is feasible)
 
 - Bootloader (UEFI, `BOOTAA64.EFI`): drops EL2→EL1, builds page tables, reads EFI memory map, **passes DTB to kernel via env `DTB_ADDR`/`DTB_SIZE`**, framebuffer via `FRAMEBUFFER_ADDR/WIDTH/HEIGHT/STRIDE/BPP`, RedoxFS via `REDOXFS_UUID`/`REDOXFS_BLOCK`.
+- **The handover needs the bootloader to touch UART2 registers** (experiment 12): four read-only loads at `0xff1a0004/0x0c/0x10/0x14` right before `kernel_entry` (`dump_uart2()`) decide between a booting kernel and silence before its first instruction. U-Boot's own LSR reads, pure delay and console writes do not substitute; the marker-era builds worked because they wrote `MCR=0x03`. Mechanism unknown (README risk 15).
 - **The firmware framebuffer is not necessarily 32bpp:** U-Boot v2021.07 `rk_vop.c` sets `VIDEO_BPP16` for `VOP_MODE_EDP`, and its GOP reports `PixelBitMask` with masks `0xf800/0x07e0/0x001f` (RGB565); `gop_set_mode` accepts only mode 0, so the depth cannot be changed from UEFI. Our bootloader derives `FRAMEBUFFER_BPP` from `Mode.Info.PixelFormat` and the kernel `graphical_debug` plus `vesad` honour it (experiment 7). Writing 32-bit ARGB `0xFF000000` into an RGB565 surface produces black/yellow pixel pairs — that was the "yellow screen".
 - Kernel serial driver is DTB-driven and supports `snps,dw-apb-uart` (16550 with u32 MMIO) → RK3399 UART2 works out of the box.
 - IRQ: RK3399 is **GICv3** (`arm,gic-v3`, GIC-500) — not GICv2/GIC-400. `gicv3.rs` exists; `irqchip::init_ap` (secondary CPUs) currently supports only the GICv2 memory-mapped interface, so expect single-CPU until extended. Timer: ARM generic timer. PSCI 1.1 (SMC conduit) works. **GICv3 private interrupts need the redistributor, not the distributor:** SGIs (0–16) and PPIs (16–32, including the timer PPI 27) are banked per CPU and enabled through `GICR_ISENABLER0` in the redistributor's SGI frame (`RD_base + 0x10000`, one 0x20000 frame per CPU back to back, frames woken via `GICR_WAKER`), while `GICD_ISENABLER` covers only SPIs (32+). Writing GICD for a PPI id is a RES0 write that fails silently (experiment 11).
@@ -98,7 +99,10 @@ fix(ci): prune runner disk before redox build
   bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → an **OHCI** USB2 host is required for input (measured in
-  experiment 8; DWC2 and xHCI are not involved).
+  experiment 8; DWC2 and xHCI are not involved). The `ohcid` CRU/PHY bring-up is
+  **hardware-verified (23:07 boot)**: no SoC freeze, both controllers operational;
+  enumeration fails at the protocol level (`Halted` on the hub port `fe3e0000`, TD
+  timeout on `fe3a0000`) — logic debugging, QEMU `pci-ohci` rig in progress.
 - **Redox bring-up status (2026-11-20, experiments 4–6):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
@@ -140,6 +144,10 @@ MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt. `exit` from the rootfs shell logs
   `procmgr: failed to send SIGCHLD to parent PID ProcessId(28)` (harmless, open).
+  **Deliverable image hardware-verified (2026-11-20 23:07,
+  `logs/serial-20261120-230717.log`):** the committed bootloader (µs menu + cache
+  clean + RGB565 + `dump_uart2`) + clean kernel boots to `redox login:`; the open
+  front is USB enumeration (experiment 8, iteration 2).
 - **Dynamic userspace binaries (experiment 10):** the loader maps the executable at
   **0x1000** and `libc.so` at **0xa80000**, so absolute userspace PCs in an exception dump
   must be rebased before symbolising (identify the base with a register whose meaning you

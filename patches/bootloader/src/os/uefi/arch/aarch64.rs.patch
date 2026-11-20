@@ -1,8 +1,8 @@
 diff --git a/src/os/uefi/arch/aarch64.rs b/src/os/uefi/arch/aarch64.rs
-index daab811..38b1827 100644
+index daab811..a91f125 100644
 --- a/src/os/uefi/arch/aarch64.rs
 +++ b/src/os/uefi/arch/aarch64.rs
-@@ -192,10 +192,39 @@ unsafe extern "C" fn kernel_entry(
+@@ -192,10 +192,63 @@ unsafe extern "C" fn kernel_entry(
  
          // Call kernel entry
          let entry_fn: extern "C" fn(*const KernelArgs) -> ! = mem::transmute(func);
@@ -39,6 +39,39 @@ index daab811..38b1827 100644
 +    }
 +}
 +
++/// Read the RK3399 debug UART2 state that the kernel inherits and log it.
++///
++/// The reads themselves are what matters on this board: with them the kernel
++/// starts reliably, without them every image since the initfs grew to 24 MiB
++/// hangs before its first instruction (experiment 12). The port is healthy at
++/// this point (`ier=0 lcr=3 mcr=3 lsr=0x60`), so the reads change nothing in
++/// the UART - the mechanism is not understood, only that these four loads at
++/// 0xff1a0004/0x0c/0x10/0x14 make the difference between a booting and a dead
++/// kernel. U-Boot's own console driver reads LSR only and does not substitute.
++fn dump_uart2(tag: &str) {
++    unsafe {
++        let base = 0xff1a_0000usize;
++        let rd = |off: usize| core::ptr::read_volatile((base + off) as *const u32);
++        println!(
++            "uart2 {}: ier={:#x} lcr={:#x} mcr={:#x} lsr={:#x}",
++            tag,
++            rd(0x04),
++            rd(0x0c),
++            rd(0x10),
++            rd(0x14),
++        );
++    }
++}
++
  pub fn main() -> Result<()> {
      LOGGER.init();
  
+@@ -226,6 +279,8 @@ pub fn main() -> Result<()> {
+         );
+         println!("{:#x?}", args);
+ 
++        dump_uart2("pre-kernel");
++
+         kernel_entry(page_phys, stack, func, &args);
+     }
+ }
