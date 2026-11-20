@@ -1,0 +1,25 @@
+diff --git a/src/context/signal.rs b/src/context/signal.rs
+index 5ec26470..e1282af8 100644
+--- a/src/context/signal.rs
++++ b/src/context/signal.rs
+@@ -41,6 +41,20 @@ pub fn signal_handler(token: &mut CleanLockToken) {
+         // TODO: prioritize signals over regular program execution
+         return;
+     }
++    // Never deliver a signal while a syscall is still executing. The userspace
++    // resume point stored below is the instruction after `svc`, and the value
++    // saved as the "archdep" register (x0 on aarch64) is read from the
++    // interrupt frame *before* the arch syscall epilogue writes the syscall
++    // result into it. Restoring that stale argument as the result makes the
++    // caller misread the syscall. Measured on the Pinebook Pro: relibc's
++    // `Sys::verify()` yield (x0 = -1 on entry) resumed with x0 = -1 and trapped
++    // in `brk #1`, silently killing uutils binaries at startup.
++    // The arch syscall epilogue delivers pending signals instead, right after
++    // the result has been stored in the frame.
++    if crate::percpu::PercpuBlock::current().inside_syscall.get() {
++        return;
++    }
++
+     let control_flags =
+         SigcontrolFlags::from_bits_retain(thread_ctl.control_flags.load(Ordering::Acquire));
+ 

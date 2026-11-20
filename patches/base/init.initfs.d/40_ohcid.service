@@ -1,0 +1,7 @@
+[unit]
+description = "Rockchip RK3399 OHCI USB2 host controller driver"
+condition_architecture = ["aarch64"]
+
+[service]
+cmd = "ohcid"
+type = "notify"

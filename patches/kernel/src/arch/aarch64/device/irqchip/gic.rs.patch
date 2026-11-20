@@ -1,23 +1,3 @@
-# redox-os/kernel @ 719e8f5c: route all GICv3 SPIs as Group 1 NS to the BSP
-#
-# Target repository : https://github.com/redox-os/kernel (mirror of
-#                     https://gitlab.redox-os.org/redox-os/kernel.git)
-# Base commit       : 719e8f5c (master, 2026-11)
-# Reason            : Pinebook Pro serial console bring-up (experiment 5).
-#                     GicDistIf::init() never programmed GICD_IGROUPR or
-#                     GICD_IROUTER. On this GIC-500 the UART2 SPI (100) ended
-#                     up enabled, Group 1, pending at the distributor
-#                     (verified by register dumps) but never delivered:
-#                     with affinity routing an SPI whose IROUTER entry does
-#                     not select the running CPU is held pending forever.
-#                     The patch marks every SPI non-secure Group 1, routes
-#                     every SPI to the boot CPU (affinity 0.0.0.0), and
-#                     switches GICD_CTLR to read-modify-write so the
-#                     firmware-owned mode bits (ARE and friends) are not
-#                     wiped. All of this is harmless on GICv2 (IGROUPR/
-#                     IROUTER RAZ/WI) and on a single-security-state GIC.
-#
-# Apply from src (repo root):  git apply <this file>
 diff --git a/src/arch/aarch64/device/irqchip/gic.rs b/src/arch/aarch64/device/irqchip/gic.rs
 index a89befc1..1b49f268 100644
 --- a/src/arch/aarch64/device/irqchip/gic.rs

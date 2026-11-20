@@ -1,0 +1,12 @@
+[package]
+name = "debugsh"
+description = "Interactive debug shell on the kernel debug scheme"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+daemon = { path = "../daemon" }
+libredox.workspace = true
+
+[lints]
+workspace = true

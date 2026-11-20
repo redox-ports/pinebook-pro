@@ -1,0 +1,13 @@
+diff --git a/src/arch/aarch64/device/serial.rs b/src/arch/aarch64/device/serial.rs
+index 122c5411..dfcc4a94 100644
+--- a/src/arch/aarch64/device/serial.rs
++++ b/src/arch/aarch64/device/serial.rs
+@@ -32,7 +32,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+             error!("diagnostic serial port not found in devicetree");
+             return;
+         };
+-        let Some(irq) = get_interrupt(&node, 0) else {
++        let Some(irq) = get_interrupt(fdt, &node, 0) else {
+             error!("diagnostic serial port interrupt not found");
+             return;
+         };

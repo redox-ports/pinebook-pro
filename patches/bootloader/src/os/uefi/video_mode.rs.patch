@@ -1,0 +1,13 @@
+diff --git a/src/os/uefi/video_mode.rs b/src/os/uefi/video_mode.rs
+index b6e020a..8dad8b8 100644
+--- a/src/os/uefi/video_mode.rs
++++ b/src/os/uefi/video_mode.rs
+@@ -46,6 +46,8 @@ impl Iterator for VideoModeIter {
+                     width,
+                     height,
+                     stride,
++                    // Refined by set_video_mode from the live mode information
++                    bpp: 32,
+                     // Base is retrieved later by setting the mode
+                     base: 0,
+                 });

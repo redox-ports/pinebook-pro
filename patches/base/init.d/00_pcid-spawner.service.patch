@@ -1,0 +1,13 @@
+diff --git a/init.d/00_pcid-spawner.service b/init.d/00_pcid-spawner.service
+index 8ba6fc6c..65768d55 100644
+--- a/init.d/00_pcid-spawner.service
++++ b/init.d/00_pcid-spawner.service
+@@ -1,5 +1,8 @@
+ [unit]
+ description = "PCI driver spawner"
++# pcid falls back to `todo!()` for configuration space access on aarch64;
++# keep the spawner on x86 until a driver exists (Pinebook Pro port).
++condition_architecture = ["x86", "x86_64"]
+ 
+ [service]
+ cmd = "pcid-spawner"

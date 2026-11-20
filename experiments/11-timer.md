@@ -6,7 +6,7 @@
 produces a syscall.
 
 **Related:** experiment 4 (GICv3 bring-up), README §7 risk 13;
-`patches/kernel-gicv3-redistributor-ppi.patch`.
+`patches/kernel/src/arch/aarch64/device/irqchip/gicv3.rs.patch`.
 
 ## Symptom (device owner, 2026-11-20)
 

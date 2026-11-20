@@ -1,0 +1,21 @@
+diff --git a/src/devices/serial.rs b/src/devices/serial.rs
+index 1b3435dc..5a2e0bbe 100644
+--- a/src/devices/serial.rs
++++ b/src/devices/serial.rs
+@@ -31,13 +31,12 @@ impl SerialKind {
+ 
+     #[cfg(target_arch = "aarch64")]
+     pub fn enable_irq(&mut self) {
+-        //TODO: implement for NS16550
+         match self {
+             Self::NotPresent => {}
+             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+-            Self::Ns16550Pio(_) => {}
+-            Self::Ns16550u8(_) => {}
+-            Self::Ns16550u32(_) => {}
++            Self::Ns16550Pio(inner) => inner.enable_irq(),
++            Self::Ns16550u8(inner) => inner.enable_irq(),
++            Self::Ns16550u32(inner) => inner.enable_irq(),
+             Self::Meson(inner) => inner.enable_irq(),
+             Self::Pl011(inner) => inner.enable_irq(),
+         }

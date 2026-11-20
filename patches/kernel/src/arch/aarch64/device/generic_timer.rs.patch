@@ -1,0 +1,13 @@
+diff --git a/src/arch/aarch64/device/generic_timer.rs b/src/arch/aarch64/device/generic_timer.rs
+index 4eeec257..393e8b50 100644
+--- a/src/arch/aarch64/device/generic_timer.rs
++++ b/src/arch/aarch64/device/generic_timer.rs
+@@ -51,7 +51,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+         return;
+     };
+     let irq_index = if use_virtual { 2 } else { 1 };
+-    let Some(irq) = get_interrupt(&node, irq_index) else {
++    let Some(irq) = get_interrupt(fdt, &node, irq_index) else {
+         error!("architected timer is missing interrupt index {}", irq_index);
+         return;
+     };

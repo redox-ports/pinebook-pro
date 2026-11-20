@@ -1,0 +1,77 @@
+diff --git a/drivers/graphics/vesad/src/main.rs b/drivers/graphics/vesad/src/main.rs
+index 5aa1e755..7d370c9d 100644
+--- a/drivers/graphics/vesad/src/main.rs
++++ b/drivers/graphics/vesad/src/main.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ use std::env;
+ 
+ use driver_graphics::GraphicsScheme;
+-use event::{user_data, EventQueue};
++use event::{EventQueue, user_data};
+ 
+ use crate::scheme::{FbAdapter, FrameBuffer};
+ 
+@@ -39,10 +39,33 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+         16,
+     )
+     .expect("failed to parse FRAMEBUFFER_STRIDE");
++    // The bootloader environment reaches us both as the process environment
++    // and as /scheme/sys/env; prefer the file so the value is found even when
++    // init did not forward it.
++    let bootloader_env = std::fs::read_to_string("/scheme/sys/env")
++        .unwrap_or_default()
++        .lines()
++        .filter_map(|line| line.split_once('='))
++        .map(|(env, value)| (env.to_owned(), value.to_owned()))
++        .collect::<HashMap<String, String>>();
++
++    // Firmware framebuffers are not always 32 bits per pixel; U-Boot programs
++    // RGB565 for the RK3399 eDP panel. Unknown/absent values keep 32 bpp.
++    let bpp = match bootloader_env
++        .get("FRAMEBUFFER_BPP")
++        .cloned()
++        .or_else(|| env::var("FRAMEBUFFER_BPP").ok())
++    {
++        Some(value) => match usize::from_str_radix(&value, 16) {
++            Ok(16) => 16,
++            _ => 32,
++        },
++        None => 32,
++    };
+ 
+     println!(
+-        "vesad: {}x{} stride {} at 0x{:X}",
+-        width, height, stride, phys
++        "vesad: {}x{} stride {} bpp {} at 0x{:X}",
++        width, height, stride, bpp, phys
+     );
+ 
+     if phys == 0 {
+@@ -51,24 +74,16 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+         std::process::exit(0);
+     }
+ 
+-    let mut framebuffers = vec![unsafe { FrameBuffer::new(phys, width, height, stride) }];
++    let mut framebuffers = vec![unsafe { FrameBuffer::new(phys, width, height, stride, bpp) }];
+ 
+     //TODO: ideal maximum number of outputs?
+-    let bootloader_env = std::fs::read_to_string("/scheme/sys/env")
+-        .expect("failed to read env")
+-        .lines()
+-        .map(|line| {
+-            let (env, value) = line.split_once('=').unwrap();
+-            (env.to_owned(), value.to_owned())
+-        })
+-        .collect::<HashMap<String, String>>();
+     for i in 1..1024 {
+         match bootloader_env.get(&format!("FRAMEBUFFER{}", i)) {
+             Some(var) => match unsafe { FrameBuffer::parse(var) } {
+                 Some(fb) => {
+                     println!(
+-                        "vesad: framebuffer {}: {}x{} stride {} at 0x{:X}",
+-                        i, fb.width, fb.height, fb.stride, fb.phys
++                        "vesad: framebuffer {}: {}x{} stride {} bpp {} at 0x{:X}",
++                        i, fb.width, fb.height, fb.stride, fb.bpp, fb.phys
+                     );
+                     framebuffers.push(fb);
+                 }

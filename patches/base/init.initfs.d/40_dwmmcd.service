@@ -1,0 +1,7 @@
+[unit]
+description = "Rockchip RK3399 DW MMC microSD driver"
+condition_architecture = ["aarch64"]
+
+[service]
+cmd = "dwmmcd"
+type = "notify"

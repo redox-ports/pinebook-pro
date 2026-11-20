@@ -5,8 +5,8 @@
 worked, but every uutils applet crashed.
 
 **Related:** experiment 6 (storage/rootfs, where the crashes were first seen),
-README §7 risk 14; `patches/relibc-cxa-reentrancy.patch`,
-`patches/kernel-signal-delivery-after-syscall.patch`.
+README §7 risk 14; `patches/relibc/src/cxa.rs.patch`,
+`patches/kernel/src/context/signal.rs.patch`.
 
 ## Symptom (device owner, 2026-11-20)
 
@@ -85,7 +85,7 @@ in the log. `relibc_panic` prints and then `abort()`s, which is the `brk #1`,
 and buffered stdout is lost. `__cxa_finalize()` had the same shape with its spin
 mutex (destructors called while the lock is held).
 
-**Fix, step 1** (`patches/relibc-cxa-reentrancy.patch`, first revision): pop one
+**Fix, step 1** (`patches/relibc/src/cxa.rs.patch`, first revision): pop one
 entry under a scoped borrow and run the destructor after the borrow is released.
 On hardware this was **not enough** — the panic moved from `src/cxa.rs:84` to
 `src/cxa.rs:93` (the same `DTORS.borrow_mut()` in `__cxa_thread_atexit_impl`,
@@ -160,7 +160,7 @@ with `x0 = -1`, took the abort branch, and died silently. A freshly spawned
 process can already have a pending signal (that is why `rm`/`mkdir` got past
 startup and `ls`/`pwd` did not), so this was not a narrow race.
 
-**Fix** (`patches/kernel-signal-delivery-after-syscall.patch`):
+**Fix** (`patches/kernel/src/context/signal.rs.patch`):
 `signal_handler()` returns early while `percpu.inside_syscall` is set (the
 signal stays pending; `being_sigkilled` is still honoured before that check),
 and the aarch64 syscall epilogue calls it immediately after

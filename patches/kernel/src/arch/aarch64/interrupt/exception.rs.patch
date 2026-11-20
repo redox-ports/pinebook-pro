@@ -1,0 +1,19 @@
+diff --git a/src/arch/aarch64/interrupt/exception.rs b/src/arch/aarch64/interrupt/exception.rs
+index 793a6191..cf34e52b 100644
+--- a/src/arch/aarch64/interrupt/exception.rs
++++ b/src/arch/aarch64/interrupt/exception.rs
+@@ -196,6 +196,14 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
+                     scratch.x5, &mut token,
+                 );
+                 stack.scratch.x0 = ret;
++
++                // Deliver pending signals only now that x0 holds the syscall
++                // result: the handler resume point is the instruction after
++                // `svc`, and `sig_archdep_reg()` reports x0. Delivering any
++                // earlier (as `sched_yield` used to) saves the syscall argument
++                // instead of its result, and the caller then misreads the
++                // return value. See `context::signal::signal_handler`.
++                crate::context::signal::signal_handler(&mut token);
+             }
+ 
+             ty => {

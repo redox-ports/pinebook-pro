@@ -1,0 +1,13 @@
+diff --git a/src/arch/riscv64/device/serial.rs b/src/arch/riscv64/device/serial.rs
+index f0981529..a71c0ab9 100644
+--- a/src/arch/riscv64/device/serial.rs
++++ b/src/arch/riscv64/device/serial.rs
+@@ -29,7 +29,7 @@ impl InterruptHandler for Com1Irq {
+ pub unsafe fn init(fdt: &Fdt) -> Option<()> {
+     unsafe {
+         if let Some(node) = fdt.all_compatible(&["ns16550a", "snps,dw-apb-uart"]).next() {
+-            let intr = get_interrupt(&node, 0).unwrap();
++            let intr = get_interrupt(fdt, &node, 0).unwrap();
+             let interrupt_parent = interrupt_parent(fdt, node)?;
+             let phandle = interrupt_parent.property::<PHandle>()?;
+             let ic_idx = IRQ_CHIP.phandle_to_ic_idx(phandle)?;

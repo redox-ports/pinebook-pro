@@ -1,0 +1,9 @@
+[unit]
+description = "Debug shell on the serial console"
+# initfs-only bring-up console for the Pinebook Pro port (no root filesystem
+# required). x86_64 boots get their console from the rootfs getty services.
+condition_architecture = ["aarch64"]
+
+[service]
+cmd = "debugsh"
+type = "notify"

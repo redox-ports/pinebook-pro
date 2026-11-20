@@ -1,0 +1,59 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index bc96c6ed..e3265b4f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -560,6 +560,14 @@ dependencies = [
+  "redox_syscall 0.9.5",
+ ]
+ 
++[[package]]
++name = "debugsh"
++version = "0.1.0"
++dependencies = [
++ "daemon",
++ "libredox 0.2.0",
++]
++
+ [[package]]
+ name = "defmt"
+ version = "1.2.0"
+@@ -711,6 +719,19 @@ dependencies = [
+  "linux-raw-sys 0.9.4",
+ ]
+ 
++[[package]]
++name = "dwmmcd"
++version = "0.1.0"
++dependencies = [
++ "common",
++ "daemon",
++ "driver-block",
++ "fdt",
++ "libredox 0.2.0",
++ "redox_event",
++ "redox_syscall 0.9.5",
++]
++
+ [[package]]
+ name = "e1000d"
+ version = "0.1.0"
+@@ -1563,6 +1584,19 @@ dependencies = [
+  "smallvec",
+ ]
+ 
++[[package]]
++name = "ohcid"
++version = "0.1.0"
++dependencies = [
++ "common",
++ "daemon",
++ "fdt",
++ "inputd",
++ "libredox 0.2.0",
++ "orbclient",
++ "redox_syscall 0.9.5",
++]
++
+ [[package]]
+ name = "once_cell"
+ version = "1.21.4"

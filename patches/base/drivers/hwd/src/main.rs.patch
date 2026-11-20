@@ -1,0 +1,18 @@
+diff --git a/drivers/hwd/src/main.rs b/drivers/hwd/src/main.rs
+index 79360e34..e6e7f53c 100644
+--- a/drivers/hwd/src/main.rs
++++ b/drivers/hwd/src/main.rs
+@@ -37,8 +37,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+ 
+     //TODO: launch pcid based on backend information?
+     // Must launch after acpid but before probe calls /scheme/acpi/symbols
+-    #[allow(deprecated, reason = "we can't yet move this to init")]
+-    daemon::Daemon::spawn(process::Command::new("pcid"));
++    // pcid has no PCI configuration space access on aarch64 yet and panics.
++    if !cfg!(target_arch = "aarch64") {
++        #[allow(deprecated, reason = "we can't yet move this to init")]
++        daemon::Daemon::spawn(process::Command::new("pcid"));
++    }
+ 
+     daemon.ready();
+ 

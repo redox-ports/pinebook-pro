@@ -13,7 +13,7 @@ We are porting **Redox OS (aarch64)** to the **PINE64 Pinebook Pro** (Rockchip R
 - **Language:** all repository content (docs, comments, commit messages, workflow names, log messages) is written in **English**.
 - Docs are markdown; keep tables/mermaid valid. The README checklist uses GitHub task syntax (`- [ ]` / `- [x]`).
 - Do not commit build artifacts, images, or generated `.config`.
-- We do **not fork** upstream Redox repos. CI clones upstream (`gitlab.redox-os.org` primary) and we inject our own files: filesystem config(s), `.config`, scripts, patches (when unavoidable). If an upstream patch becomes necessary, store it under `patches/` with a header explaining target repo + commit + reason, and apply it in CI.
+- We do **not fork** upstream Redox repos. CI clones upstream (`gitlab.redox-os.org` primary) and we inject our own files: filesystem config(s), `.config`, scripts, patches (when unavoidable). Upstream changes live in `patches/<repo>/` and **mirror the upstream tree path**: a file upstream does not have is stored **verbatim** (`patches/base/drivers/storage/dwmmcd/src/main.rs`), a change to an existing file is **exactly one `<path>.patch`** per file (`patches/kernel/src/context/signal.rs.patch`), so two changes never share a patch file. `scripts/apply-patches.sh` copies the new files and applies the diffs; every repo directory has a `README.md` with its base commit and the reason for each entry. Details: `patches/README.md`.
 - Verify claims against sources before adding "facts" to README/AGENTS. Mark inferences explicitly (`inferred`, `TBD`). Prefer linking evidence (upstream file + symbol).
 - **Commits:** follow [Conventional Commits](https://en.wikipedia.org/wiki/Conventional_Commits) — see "Commit style" below.
 
@@ -126,7 +126,7 @@ fix(ci): prune runner disk before redox build
   programmed — in GICv3 SGIs/PPIs are banked per CPU and enabled through
   `GICR_ISENABLER0`, while `GICD_ISENABLER` only covers SPIs, so `irq_enable(27)`
   wrote a RES0 bit and silently enabled nothing. Fixed in
-  `patches/kernel-gicv3-redistributor-ppi.patch`; verified in QEMU
+  `patches/kernel/src/arch/aarch64/device/irqchip/gicv3.rs.patch`; verified in QEMU
   (`sleep(10ms)` → 10.9 ms, `sleep(250ms)` → 250.2 ms). **Storage works
   end-to-end (iteration 8):** the microSD enumerates (`card ready: size=30436
 MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
@@ -149,8 +149,8 @@ MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   `sched_yield()`/the timer tick, i.e. **before** the arch syscall epilogue stores
   the result, so a signal delivered mid-syscall saved the syscall _argument_ as the
   return value (relibc's `Sys::verify()` yield resumed with `x0 = -1` and took its
-  abort branch). Fixes: `patches/relibc-cxa-reentrancy.patch`,
-  `patches/kernel-signal-delivery-after-syscall.patch`. QEMU cannot exercise this
+  abort branch). Fixes: `patches/relibc/src/cxa.rs.patch`,
+  `patches/kernel/src/context/signal.rs.patch`. QEMU cannot exercise this
   path: no root filesystem and the initfs holds only static binaries.
 
 ### Target SD image layout (produced by our repack)
@@ -173,9 +173,13 @@ LICENSE
 .gitignore
 experiments/         # chronological hardware experiment logs (append-only)
 .github/workflows/   # build.yml (Phase 1+)
-scripts/             # local loop: bootstrap-redox.sh, build-image.sh, flash-sd.sh, serial-log.sh; later: repack-pbp.sh, qemu-smoke.sh
+scripts/             # local loop: bootstrap-redox.sh, build-image.sh, flash-sd.sh, serial-log.sh,
+                     # qemu-smoke.sh, apply-patches.sh; later: repack-pbp.sh
 config/              # filesystem config overlay for the redox build (Phase 2+)
-patches/             # upstream patches, only if unavoidable
+patches/             # upstream additions/fixes, upstream tree preserved:
+                     #   <repo>/<upstream path>       new file, copied verbatim
+                     #   <repo>/<upstream path>.patch change to an existing file
+                     # see patches/README.md and scripts/apply-patches.sh
 ```
 
 ## Workflow conventions

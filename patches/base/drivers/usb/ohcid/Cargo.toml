@@ -1,0 +1,18 @@
+[package]
+name = "ohcid"
+version = "0.1.0"
+description = "OHCI host controller driver for the Rockchip RK3399 USB2 ports"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+common = { path = "../../common" }
+daemon = { path = "../../../daemon" }
+fdt.workspace = true
+inputd = { path = "../../inputd" }
+libredox.workspace = true
+orbclient.workspace = true
+redox_syscall = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,192 @@
+diff --git a/src/os/uefi/mod.rs b/src/os/uefi/mod.rs
+index f55d8e8..f7ef3e9 100644
+--- a/src/os/uefi/mod.rs
++++ b/src/os/uefi/mod.rs
+@@ -4,11 +4,13 @@ use std::proto::Protocol;
+ use uefi::{
+     Handle,
+     boot::LocateSearchType,
++    graphics::{GraphicsOutputModeInfo, GraphicsPixelFormat},
+     memory::MemoryType,
+     reset::ResetType,
+     status::{Result, Status},
+     system::SystemTable,
+     text::TextInputKey,
++    time::{Time, TimeCapabilities},
+ };
+ 
+ use crate::os::{Os, OsHwDesc, OsKey, OsVideoMode};
+@@ -38,6 +40,49 @@ pub(crate) fn page_size() -> usize {
+     4096
+ }
+ 
++/// Translate a firmware key stroke into the bootloader's key enum.
++fn map_key(key: &TextInputKey) -> OsKey {
++    match key.ScanCode {
++        0 => match key.UnicodeChar {
++            8 => OsKey::Backspace,
++            13 => OsKey::Enter,
++            w => match char::from_u32(w as u32) {
++                Some(c) => OsKey::Char(c),
++                None => OsKey::Other,
++            },
++        },
++        1 => OsKey::Up,
++        2 => OsKey::Down,
++        3 => OsKey::Right,
++        4 => OsKey::Left,
++        8 => OsKey::Delete,
++        _ => OsKey::Other,
++    }
++}
++
++/// Bits per pixel of the linear framebuffer described by a GOP mode info.
++///
++/// UEFI only guarantees the byte layout for the two 8-bit-per-channel formats;
++/// anything else (notably the RGB565 surface U-Boot programs for eDP panels)
++/// is described by bit masks, so derive the pixel width from them. Returns 0
++/// when the mode has no linear framebuffer or the width cannot be derived.
++fn pixel_bits_per_pixel(info: &GraphicsOutputModeInfo) -> u32 {
++    match info.PixelFormat {
++        GraphicsPixelFormat::PixelRedGreenBlueReserved8BitPerColor
++        | GraphicsPixelFormat::PixelBlueGreenRedReserved8BitPerColor => 32,
++        GraphicsPixelFormat::PixelBitMask => {
++            let masks = &info.PixelInformation;
++            let used = masks.RedMask | masks.GreenMask | masks.BlueMask;
++            if used == 0 {
++                0
++            } else {
++                32 - used.leading_zeros()
++            }
++        }
++        _ => 0,
++    }
++}
++
+ pub(crate) fn alloc_zeroed_page_aligned(size: usize) -> *mut u8 {
+     assert!(size != 0);
+ 
+@@ -268,6 +313,7 @@ impl Os for OsEfi {
+         mode.width = output.0.Mode.Info.HorizontalResolution;
+         mode.height = output.0.Mode.Info.VerticalResolution;
+         mode.base = output.0.Mode.FrameBufferBase as u64;
++        mode.bpp = pixel_bits_per_pixel(&output.0.Mode.Info);
+     }
+ 
+     fn best_resolution(&self, output_i: usize) -> Option<(u32, u32)> {
+@@ -296,8 +342,6 @@ impl Os for OsEfi {
+     }
+ 
+     fn get_key(&self) -> OsKey {
+-        //TODO: do not unwrap
+-
+         let mut index = 0;
+         status_to_result((self.st.BootServices.WaitForEvent)(
+             1,
+@@ -318,21 +362,65 @@ impl Os for OsEfi {
+         })
+         .unwrap();
+ 
+-        match key.ScanCode {
+-            0 => match key.UnicodeChar {
+-                8 => OsKey::Backspace,
+-                13 => OsKey::Enter,
+-                w => match char::from_u32(w as u32) {
+-                    Some(c) => OsKey::Char(c),
+-                    None => OsKey::Other,
+-                },
+-            },
+-            1 => OsKey::Up,
+-            2 => OsKey::Down,
+-            3 => OsKey::Right,
+-            4 => OsKey::Left,
+-            8 => OsKey::Delete,
+-            _ => OsKey::Other,
++        map_key(&key)
++    }
++
++    fn get_key_timeout(&self, milliseconds: u32) -> OsKey {
++        // `ReadKeyStroke` is non-blocking, so poll it. The `uefi` crate only
++        // exposes `SetTimer` with an unusable signature, and a timer event
++        // would need it, so the deadline comes from the firmware RTC.
++        //
++        // Boot services are still active here, so `GetTime` may be called.
++        // Some boards have no working RTC in firmware (Pinebook Pro: U-Boot
++        // has no driver for the RK808 RTC), and a constant "clock" would
++        // turn this loop into a hang. Probe whether the value actually
++        // advances before trusting it.
++        let clock_start = self.time_10ms();
++        let clock_ticks = match clock_start {
++            Some(start) => {
++                for _ in 0..20_000 {
++                    core::hint::spin_loop();
++                }
++                matches!(self.time_10ms(), Some(now) if now > start)
++            }
++            None => false,
++        };
++
++        let mut key = TextInputKey {
++            ScanCode: 0,
++            UnicodeChar: 0,
++        };
++        let mut spins = 0u32;
++        loop {
++            match (self.st.ConsoleIn.ReadKeyStroke)(self.st.ConsoleIn, &mut key) {
++                Status::SUCCESS => return map_key(&key),
++                Status::NOT_READY => (),
++                // A broken console must not hang the boot.
++                _ => return OsKey::Timeout,
++            }
++
++            if clock_ticks {
++                match (clock_start, self.time_10ms()) {
++                    (Some(start), Some(now)) => {
++                        if now.saturating_sub(start) >= u64::from(milliseconds) / 10 {
++                            return OsKey::Timeout;
++                        }
++                    }
++                    // The clock disappeared after the probe: stop waiting.
++                    _ => return OsKey::Timeout,
++                }
++            } else {
++                // No usable clock: wait for a bounded number of iterations
++                // (roughly a fraction of a second) and then boot.
++                spins += 1;
++                if spins > 400_000 {
++                    return OsKey::Timeout;
++                }
++            }
++
++            for _ in 0..2_000 {
++                core::hint::spin_loop();
++            }
+         }
+     }
+ 
+@@ -363,6 +451,25 @@ impl Os for OsEfi {
+     }
+ }
+ 
++impl OsEfi {
++    /// Firmware time of day in units of 10 ms, or `None` when the platform has
++    /// no RTC (some firmware returns an error, some returns a constant).
++    fn time_10ms(&self) -> Option<u64> {
++        let mut time = Time::default();
++        let mut capabilities = TimeCapabilities::default();
++        match (self.st.RuntimeServices.GetTime)(&mut time, &mut capabilities) {
++            Status::SUCCESS => Some(
++                u64::from(time.Day) * 8_640_000
++                    + u64::from(time.Hour) * 360_000
++                    + u64::from(time.Minute) * 6_000
++                    + u64::from(time.Second) * 100
++                    + u64::from(time.Nanosecond / 10_000_000),
++            ),
++            _ => None,
++        }
++    }
++}
++
+ fn status_to_result(status: Status) -> Result<usize> {
+     match status {
+         Status(ok) if status.is_success() => Ok(ok),

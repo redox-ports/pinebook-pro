@@ -1,0 +1,18 @@
+[package]
+name = "dwmmcd"
+version = "0.1.0"
+description = "Synopsys DesignWare MMC (dw_mshc) microSD driver for the Rockchip RK3399"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+common = { path = "../../common" }
+daemon = { path = "../../../daemon" }
+driver-block = { path = "../driver-block" }
+fdt.workspace = true
+libredox.workspace = true
+redox_syscall = { workspace = true, features = ["std"] }
+redox_event.workspace = true
+
+[lints]
+workspace = true

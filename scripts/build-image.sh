@@ -48,6 +48,14 @@ done
 mkdir -p "$REDOX_DIR/config/aarch64/pinebook-pro"
 cp -f "$OVERLAY_SRC" "$REDOX_DIR/config/aarch64/pinebook-pro/minimal.toml"
 
+# Same for the upstream changes. Idempotent: identical files are skipped and an
+# already-applied diff is reported as up to date, so this normally just verifies
+# the checkout. It matters after a fresh bootstrap or whenever a source tree was
+# reset. Sources that are not fetched yet are skipped (the cookbook clones them
+# during the build).
+echo "==> applying patches"
+"$REPO_ROOT/scripts/apply-patches.sh"
+
 echo "==> build settings"
 grep -E '^(ARCH|CONFIG_NAME|FILESYSTEM_CONFIG|PODMAN_BUILD|REPO_BINARY)' "$REDOX_DIR/.config" || true
 echo "==> building (the first run is long; later runs are incremental)"

@@ -1,0 +1,14 @@
+diff --git a/init.initfs.d/40_pcid-spawner-initfs.service b/init.initfs.d/40_pcid-spawner-initfs.service
+index 6945b9ea..0829375d 100644
+--- a/init.initfs.d/40_pcid-spawner-initfs.service
++++ b/init.initfs.d/40_pcid-spawner-initfs.service
+@@ -1,6 +1,8 @@
+ [unit]
+ description = "PCI driver spawner"
+-requires_weak = ["10_inputd.service", "20_graphics.target", "40_hwd.service"]
++# pcid falls back to `todo!()` for configuration space access on aarch64;
++# keep the spawner on x86 until a driver exists (Pinebook Pro port).
++condition_architecture = ["x86", "x86_64"]
+ 
+ [service]
+ cmd = "pcid-spawner"

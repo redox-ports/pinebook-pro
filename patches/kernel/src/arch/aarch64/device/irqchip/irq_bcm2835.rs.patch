@@ -1,0 +1,22 @@
+diff --git a/src/arch/aarch64/device/irqchip/irq_bcm2835.rs b/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
+index ed9a9b2e..6e975882 100644
+--- a/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
++++ b/src/arch/aarch64/device/irqchip/irq_bcm2835.rs
+@@ -74,7 +74,7 @@ impl Bcm2835ArmInterruptController {
+             return Err(Error::new(EINVAL));
+         }
+     }
+-    unsafe fn parse_inner(fdt: &Fdt, node: &FdtNode) -> Result<(usize, usize, Option<usize>)> {
++    unsafe fn parse_inner<'a>(fdt: &Fdt<'a>, node: &FdtNode<'a>) -> Result<(usize, usize, Option<usize>)> {
+         unsafe {
+             //assert address_cells == 0x1, size_cells == 0x1
+             let mem = node
+@@ -90,7 +90,7 @@ impl Bcm2835ArmInterruptController {
+ 
+             if let Some(interrupt_parent) = node.raw_property("interrupt-parent") {
+                 let phandle = PHandle::new(interrupt_parent.as_value::<u32>().unwrap());
+-                let irq = get_interrupt(node, 0).unwrap();
++                let irq = get_interrupt(fdt, node, 0).unwrap();
+                 let ic_idx = IRQ_CHIP.phandle_to_ic_idx(phandle).unwrap();
+                 //PHYS_NONSECURE_PPI only
+                 let virq = IRQ_CHIP.irq_chip_list.chips[ic_idx]

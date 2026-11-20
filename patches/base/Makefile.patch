@@ -1,0 +1,22 @@
+diff --git a/Makefile b/Makefile
+index 6c2970fe..081eb81d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,7 +13,7 @@ TARGET_DIR = $(BUILD_DIR)/$(TARGET)/$(BUILD_TYPE)
+ BUILD_FLAGS +=  --target-dir $(BUILD_DIR)
+ 
+ INITFS_BINS = ipcd init logd ramfs randd udsd zerod \
+-	acpid fbbootlogd hwd inputd lived \
++	acpid debugsh fbbootlogd hwd inputd lived \
+ 	pcid pcid-spawner rtcd vesad
+ INITFS_DRIVERS_BINS = nvmed virtio-blkd virtio-gpud
+ BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
+@@ -37,7 +37,7 @@ ifeq (,$(filter i586-unknown-redox i686-unknown-redox,$(TARGET)))
+ endif
+ 
+ ifeq ($(TARGET),aarch64-unknown-redox)
+-	INITFS_BINS += bcm2835-sdhcid
++	INITFS_BINS += bcm2835-sdhcid dwmmcd ohcid
+ endif
+ 
+ # For testing/benchmarking only

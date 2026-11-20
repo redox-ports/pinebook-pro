@@ -1,0 +1,28 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 202fd178..659814fd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,7 @@ members = [
+     "config",
+     "daemon",
+     "dhcpd",
++    "debugsh",
+     "getty",
+     "init",
+     "initfs",
+@@ -59,6 +60,7 @@ members = [
+ 
+     "drivers/storage/ahcid",
+     "drivers/storage/bcm2835-sdhcid",
++    "drivers/storage/dwmmcd",
+     "drivers/storage/driver-block",
+     "drivers/storage/ided",
+     "drivers/storage/lived",          # TODO: not really a driver...
+@@ -68,6 +70,7 @@ members = [
+     "drivers/storage/virtio-blkd",
+     "drivers/storage/virtio-fsd",
+ 
++    "drivers/usb/ohcid",
+     "drivers/usb/xhcid",
+     "drivers/usb/usbctl",
+     "drivers/usb/usbhubd",

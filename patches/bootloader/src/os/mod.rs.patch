@@ -1,0 +1,37 @@
+diff --git a/src/os/mod.rs b/src/os/mod.rs
+index df22102..781892a 100644
+--- a/src/os/mod.rs
++++ b/src/os/mod.rs
+@@ -53,6 +53,8 @@ pub enum OsKey {
+     Enter,
+     Char(char),
+     Other,
++    /// No key arrived before the requested timeout expired.
++    Timeout,
+ }
+ 
+ // Keep synced with BootloaderMemoryKind in kernel
+@@ -79,7 +81,10 @@ pub struct OsVideoMode {
+     pub id: u32,
+     pub width: u32,
+     pub height: u32,
++    /// Scan line length in pixels
+     pub stride: u32,
++    /// Bits per pixel of the linear framebuffer (16 or 32)
++    pub bpp: u32,
+     pub base: u64,
+ }
+ 
+@@ -110,6 +115,12 @@ pub trait Os {
+     fn best_resolution(&self, output_i: usize) -> Option<(u32, u32)>;
+ 
+     fn get_key(&self) -> OsKey;
++    /// Wait at most `milliseconds` for a keypress; returns [`OsKey::Timeout`] if
++    /// nothing arrives. Platforms without a usable clock keep the blocking
++    /// behaviour of [`get_key`].
++    fn get_key_timeout(&self, _milliseconds: u32) -> OsKey {
++        self.get_key()
++    }
+ 
+     fn clear_text(&self);
+     fn get_text_position(&self) -> (usize, usize);

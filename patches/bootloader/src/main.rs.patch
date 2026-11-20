@@ -1,0 +1,61 @@
+diff --git a/src/main.rs b/src/main.rs
+index 28d1e24..5ada896 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -170,7 +170,7 @@ fn select_mode(
+     }
+     println!();
+ 
+-    println!("Arrow keys and enter select mode");
++    println!("Arrow keys and enter select mode (booting in 3 s)");
+     let live_mode = os.get_text_position();
+     if *live {
+         println!("Press l to disable live mode");
+@@ -201,8 +201,15 @@ fn select_mode(
+             row += 1;
+         }
+ 
+-        // Read keypress
+-        match os.get_key() {
++        // Read keypress; the menu falls back to the highlighted mode when no
++        // key arrives in time, so headless boots need no input device.
++        match os.get_key_timeout(3_000) {
++            OsKey::Timeout => {
++                if let Some((mode, _text)) = modes.iter().find(|(mode, _)| mode.id == selected) {
++                    mode_opt = Some(*mode);
++                }
++                break;
++            }
+             OsKey::Left => {
+                 if let Some(mut mode_i) = modes.iter().position(|x| x.0.id == selected) {
+                     if mode_i < rows {
+@@ -663,12 +670,20 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+         for output_i in 0..os.video_outputs() {
+             if let Some(mode) = mode_opts[output_i] {
+                 if output_i == 0 {
++                    // The firmware may hand out a surface that is not 32 bits per
++                    // pixel (U-Boot programs RGB565 for the RK3399 eDP panel), so
++                    // the size and the reported format must follow the real mode.
++                    // Consumers treat 0 (unknown) as 32 bits per pixel.
++                    let bpp = match mode.bpp {
++                        16 | 32 => mode.bpp,
++                        _ => 32,
++                    };
+                     let virt = unsafe {
+                         paging_framebuffer(
+                             os,
+                             page_phys,
+                             mode.base,
+-                            (mode.stride * mode.height * 4) as u64,
++                            (mode.stride * mode.height * (bpp / 8)) as u64,
+                         )
+                     }
+                     .expect("Failed to map framebuffer");
+@@ -678,6 +693,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+                     writeln!(w, "FRAMEBUFFER_WIDTH={:016x}", mode.width).unwrap();
+                     writeln!(w, "FRAMEBUFFER_HEIGHT={:016x}", mode.height).unwrap();
+                     writeln!(w, "FRAMEBUFFER_STRIDE={:016x}", mode.stride).unwrap();
++                    writeln!(w, "FRAMEBUFFER_BPP={:016x}", mode.bpp).unwrap();
+                 } else {
+                     writeln!(
+                         w,

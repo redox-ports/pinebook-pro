@@ -58,8 +58,7 @@ The bootloader markers use the physical address `0xFF1A0000` (identity map).
 time and on the first three serial interrupts. It answers: is the receive
 interrupt enabled in the UART, is the SPI enabled in the GIC, does the UART
 raise an interrupt at all when keystrokes arrive. Apply it **after**
-`patches/kernel-inherited-interrupt-parent.patch`, from the kernel `src`
-directory.
+`patches/kernel/src/dtb/irqchip.rs.patch`, from the kernel `src` directory.
 
 ## How to apply locally
 

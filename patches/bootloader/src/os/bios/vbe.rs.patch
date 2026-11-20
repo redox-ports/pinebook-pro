@@ -1,0 +1,12 @@
+diff --git a/src/os/bios/vbe.rs b/src/os/bios/vbe.rs
+index 9498b8d..18fdfa3 100644
+--- a/src/os/bios/vbe.rs
++++ b/src/os/bios/vbe.rs
+@@ -139,6 +139,7 @@ impl Iterator for VideoModeIter {
+                     width,
+                     height,
+                     stride,
++                    bpp: 32,
+                     base: mode_info.physbaseptr as u64,
+                 });
+             } else {
