@@ -36,9 +36,16 @@
 #                        clock-update commands, each awaited by polling the
 #                        CMD START bit exactly like dwmci_setup_bus (U-Boot
 #                        v2021.07 never waits for CDONE on clock-only
-#                        commands; neither does this IP raise it). If an
-#                        update never completes, the driver falls back to
-#                        plain register writes with no CIU involvement. All
+#                        commands; neither does this IP raise it). CLKSEL_CON16
+#                        follows the Rockchip write-mask convention (mux
+#                        [10:8] + div [6:0], mask in [31:16]; plain writes
+#                        are dropped by the hardware), so every rate write
+#                        is hiword-masked and read back. If an update never
+#                        completes, the driver falls back to plain register
+#                        writes with no CIU involvement, and clock failures
+#                        degrade to a slower bus instead of aborting. Delays
+#                        are busy-waits: the bring-up kernel never wakes
+#                        nanosleep on the generic timer. All
 #                        timeouts use the kernel monotonic clock so a dead
 #                        card cannot hang the boot. Register map follows
 #                        Linux drivers/mmc/host/dw_mmc.h and U-Boot v2021.07
@@ -612,10 +619,10 @@ index 00000000..1461a920
 +workspace = true
 diff --git a/drivers/storage/dwmmcd/src/dwmmc.rs b/drivers/storage/dwmmcd/src/dwmmc.rs
 new file mode 100644
-index 00000000..bcd6455b
+index 00000000..2c6156d9
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/dwmmc.rs
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1401 @@
 +//! Synopsys DesignWare Mobile Storage Host Controller (dw_mshc) driver for
 +//! the Rockchip RK3399 microSD slot (`sdmmc@fe320000`).
 +//!
@@ -819,6 +826,13 @@ index 00000000..bcd6455b
 +/// card sees half the CRU rate.
 +/// Identification: xin24m / 30 / 2 = 400 kHz (U-Boot writes 0x51d here).
 +const CLKSEL_400K: u32 = 0x51d;
++/// Field mask of CLKSEL_CON16: mux bits [10:8] and divider bits [6:0].
++/// Linux declares SCLK_SDMMC with CLK_MUX_HIWORD_MASK |
++/// CLK_DIVIDER_HIWORD_MASK (clk-rk3399.c), i.e. this register follows the
++/// Rockchip write-mask convention: only bits whose mask bit in [31:16]
++/// is set are written. A plain read-modify-write is silently dropped —
++/// measured on hardware (readback stayed 0x10e after writing 0x51d).
++const CLKSEL16_MASK: u32 = 0x77f;
 +/// Data-rate fallback: gpll (594 MHz) / 12 / 2 = 24.75 MHz, SD default
 +/// speed. Normally the inherited CLKSEL_CON16 (the rate U-Boot read the
 +/// ESP at) is preferred; this constant only covers an implausible
@@ -883,15 +897,15 @@ index 00000000..bcd6455b
 +}
 +
 +fn sleep_ms(ms: u64) {
-+    let req = syscall::TimeSpec {
-+        tv_sec: (ms / 1000) as i64,
-+        tv_nsec: ((ms % 1000) * 1_000_000) as i32,
-+    };
-+    let mut rem = syscall::TimeSpec {
-+        tv_sec: 0,
-+        tv_nsec: 0,
-+    };
-+    let _ = syscall::nanosleep(&req, &mut rem);
++    // Busy-wait instead of nanosleep: the bring-up kernel does not wake a
++    // sleeping thread on the generic timer (experiment 6 iteration 7: a
++    // 10 ms sleep blocked for seconds/minutes until a serial interrupt
++    // arrived). All delays in this driver are short and the driver runs
++    // on a single CPU, so spinning is the robust choice here.
++    let deadline = now_ms() + ms;
++    while now_ms() < deadline {
++        core::hint::spin_loop();
++    }
 +}
 +
 +/// One executed command: response words plus the raw interrupt status seen
@@ -1055,6 +1069,8 @@ index 00000000..bcd6455b
 +            // reset only clears the BIU side and did not unwedge it
 +            // (iterations 2-4: clock updates never reached command-done).
 +            // Assert both the controller and its noc bridge, wait, release.
++            self.log
++                .log(format_args!("dwmmcd: asserting SRST_SDMMC + SRST_SD_NOC"));
 +            cru.write(
 +                SRST_SDMMC_CON,
 +                (1 << 16 + SRST_SDMMC_BIT) | (1 << SRST_SDMMC_BIT),
@@ -1247,14 +1263,29 @@ index 00000000..bcd6455b
 +        };
 +        unsafe {
 +            let old = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
-+            let new = (old & !0x7ff) | value;
-+            cru.write(CRU_CLKSEL_CON16_SCLK_SDMMC, new);
-+            let readback = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            // Write-mask (hiword) convention: mask in [31:16], value in
++            // [15:0]. A plain write is dropped by the hardware.
++            cru.write(
++                CRU_CLKSEL_CON16_SCLK_SDMMC,
++                (CLKSEL16_MASK << 16) | value,
++            );
++            let mut readback = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            let mut how = "hiword";
++            if readback & CLKSEL16_MASK != value {
++                // Some Rockchip revisions accept plain writes; try that
++                // before giving up so one code path covers both.
++                cru.write(
++                    CRU_CLKSEL_CON16_SCLK_SDMMC,
++                    (old & !CLKSEL16_MASK) | value,
++                );
++                readback = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++                how = "plain";
++            }
 +            self.log.log(format_args!(
-+                "dwmmcd: clksel16 {}: 0x{:08x} -> 0x{:08x}",
-+                label, old, readback
++                "dwmmcd: clksel16 {} ({} write): 0x{:08x} -> 0x{:08x}",
++                label, how, old, readback
 +            ));
-+            if readback != new {
++            if readback & CLKSEL16_MASK != value {
 +                return Err(Error::new(EIO));
 +            }
 +        }
@@ -1315,9 +1346,23 @@ index 00000000..bcd6455b
 +    fn set_data_rate(&mut self) -> Result<()> {
 +        let value = self.data_clksel();
 +        if self.cru_clocking {
-+            return self.cru_set_clksel(value, "data-rate");
++            if let Err(err) = self.cru_set_clksel(value, "data-rate") {
++                self.log.log(format_args!(
++                    "dwmmcd: data-rate CRU switch failed ({}), keeping the current rate",
++                    err
++                ));
++            }
++            return Ok(());
 +        }
-+        self.cru_set_clksel(value, "data-rate")?;
++        if let Err(err) = self.cru_set_clksel(value, "data-rate") {
++            // Keep running at the identification rate rather than dying:
++            // a mount at 400 kHz is slow but works.
++            self.log.log(format_args!(
++                "dwmmcd: data-rate CRU switch failed ({}), keeping the identification rate",
++                err
++            ));
++            return Ok(());
++        }
 +        if let Err(err) = self.clkena_cycle("data") {
 +            self.log.log(format_args!(
 +                "dwmmcd: data-rate clock update failed ({}), switching to direct clocking",
@@ -1459,7 +1504,12 @@ index 00000000..bcd6455b
 +                err
 +            ));
 +            self.cru_clocking = true;
-+            self.clocks_direct()?;
++            if let Err(err) = self.clocks_direct() {
++                self.log.log(format_args!(
++                    "dwmmcd: direct clocking failed ({}), continuing at the inherited rate",
++                    err
++                ));
++            }
 +        }
 +
 +        // Software-reset the internal DMA engine now, after the clocks are
