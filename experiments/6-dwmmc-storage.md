@@ -100,6 +100,10 @@ init: switchroot to /usr /etc              <-- root filesystem!
 4. If mount works: rootfs units start (getty etc.), `ion` shell on the
    serial console — record everything.
 5. If it fails: capture the exact `dwmmcd:` line where it stopped.
+   `debugsh` now has a `reboot` builtin (writes `reset` to the kernel
+   `sys:kstop` scheme -> PSCI SYSTEM_RESET), so the board can be re-tested
+   without power-cycling; the debugsh prompt also supports bare `ls` (cwd
+   is `/scheme/initfs`) and `ls /` (lists `/scheme`).
 
 ## Expected failure modes and next actions
 

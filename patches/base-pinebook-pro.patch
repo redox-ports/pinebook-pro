@@ -11,7 +11,7 @@
 #                        `debugsh` is a small static initfs daemon that opens
 #                        the kernel `debug` scheme (/scheme/debug), gives the
 #                        UART a line discipline (echo, backspace) plus
-#                        built-ins (ls/cat/echo>/hexdump/env/exec), sets its
+#                        built-ins (ls/cat/echo>/hexdump/env/exec/reboot), sets its
 #                        working directory to /scheme/initfs so a bare `ls`
 #                        works, and maps `ls /` to the scheme namespace.
 #                        `hwd` no longer spawns `pcid` on aarch64 (hwd spawns
@@ -46,7 +46,9 @@
 #                        registered.
 #
 # Contents:
-#   * debugsh/                  new initfs-only crate (static binary)
+#   * debugsh/                  new initfs-only crate (static binary;
+#                               `reboot` writes `reset` to the kernel sys:kstop
+#                               scheme -> PSCI SYSTEM_RESET)
 #   * drivers/storage/dwmmcd/   new initfs-only crate (static binary)
 #   * Makefile                  add debugsh and dwmmcd to INITFS_BINS
 #   * Cargo.toml, Cargo.lock    workspace members + lock entries
@@ -160,10 +162,10 @@ index 00000000..2baaa745
 +workspace = true
 diff --git a/debugsh/src/main.rs b/debugsh/src/main.rs
 new file mode 100644
-index 00000000..f241cd09
+index 00000000..3bc789fe
 --- /dev/null
 +++ b/debugsh/src/main.rs
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,396 @@
 +//! debugsh - interactive debug shell on the kernel debug scheme.
 +//!
 +//! Runs during the initfs phase of boot, before a root filesystem is
@@ -325,6 +327,7 @@ index 00000000..f241cd09
 +        "hexdump" => hexdump(&args, stdout),
 +        "env" => env(stdout),
 +        "exec" => exec(&args, stdout),
++        "reboot" => reboot(stdout),
 +        "exit" => {
 +            let mut lock = stdout.lock();
 +            let _ = writeln!(lock, "debugsh: bye");
@@ -361,6 +364,7 @@ index 00000000..f241cd09
 +        "  hexdump FILE [BYTES]     hex dump a file (default 256 bytes)",
 +        "  env                      print environment variables",
 +        "  exec CMD [ARGS...]       run a binary (PATH=/scheme/initfs/bin)",
++        "  reboot                   reset the board (kernel sys:kstop, PSCI)",
 +        "  exit                     leave the debug shell",
 +    ] {
 +        writeln!(lock, "{}", line)?;
@@ -508,6 +512,23 @@ index 00000000..f241cd09
 +        writeln!(lock, "{}={}", key, value)?;
 +    }
 +    lock.flush()
++}
++
++fn reboot(stdout: &io::Stdout) -> io::Result<()> {
++    // PSCI SYSTEM_RESET through the kernel sys scheme; on success this
++    // never returns.
++    match fs::write("sys:kstop", b"reset") {
++        Ok(()) => {
++            let mut lock = stdout.lock();
++            writeln!(lock, "debugsh: reset requested, waiting...")?;
++            lock.flush()
++        }
++        Err(err) => {
++            let mut lock = stdout.lock();
++            writeln!(lock, "debugsh: failed to reset: {}", err)?;
++            lock.flush()
++        }
++    }
 +}
 +
 +fn exec(args: &[&str], stdout: &io::Stdout) -> io::Result<()> {
