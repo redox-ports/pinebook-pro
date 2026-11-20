@@ -1,0 +1,93 @@
+# redox-os/kernel @ 719e8f5c: deliver signals after the syscall result is stored
+#
+# Target repository : https://github.com/redox-os/kernel (mirror of
+#                     https://gitlab.redox-os.org/redox-os/kernel.git)
+# Base commit       : 719e8f5c (master, 2026-11)
+# Reason            : uutils binaries (/usr/bin/ls, pwd, rm, mkdir - one
+#                     multicall binary) died silently on the Pinebook Pro with
+#                     `brk #1` and no message (experiment 10). The aarch64
+#                     exception dump pinned the trap inside relibc's
+#                     `relibc_start_v1`, at the trap that follows its
+#                     `Sys::verify()` syscall:
+#
+#                         mov  w8, #158      ; SYS_YIELD
+#                         mov  x0..x4, #-1   ; syscall5(YIELD, !0 x5)
+#                         svc  #0
+#                         cmn  w0, #0x84     ; is_ok()?
+#                         b.hs -> brk #1
+#
+#                     with X0 still holding the *argument* (-1) instead of the
+#                     result. The module base could be derived from the dump
+#                     (executable 0x1000 -- `X19` was `main` -- and libc.so
+#                     0xa80000), which placed both recorded crash sites on
+#                     `brk` instructions in libc.so and the callers on
+#                     `relibc_crt0`/`main`, so the trap site is certain.
+#
+#                     Cause: `signal_handler()` is called from `sched_yield()`
+#                     and from `context::switch::tick()`, i.e. while a syscall
+#                     is still executing. It records `regs.sig_archdep_reg()`
+#                     (x0 on aarch64) together with the resume address (the
+#                     instruction after `svc`) for the userspace signal
+#                     trampoline, but the arch syscall epilogue only writes the
+#                     syscall result into `scratch.x0` after `syscall()`
+#                     returns. A signal delivered in that window therefore
+#                     saved the syscall *argument* as the return value, and
+#                     `sigreturn` made the caller resume with it; the
+#                     `is_ok()` test then saw -1 and took the abort path.
+#                     A freshly spawned process can already have a pending
+#                     signal (the run-to-run pattern was: rm/mkdir got past
+#                     startup, ls/pwd did not), so this was not a rare race.
+#
+#                     Fix: `signal_handler()` refuses to run while
+#                     `percpu.inside_syscall` is set (the signal stays pending;
+#                     `being_sigkilled` is still honoured first), and the
+#                     aarch64 syscall epilogue calls it right after
+#                     `stack.scratch.x0 = ret`. Delivery from timer ticks in
+#                     userspace is unaffected, and the x86_64 path keeps
+#                     working (signals are then delivered on the next tick).
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/arch/aarch64/interrupt/exception.rs b/src/arch/aarch64/interrupt/exception.rs
+index 793a6191..cf34e52b 100644
+--- a/src/arch/aarch64/interrupt/exception.rs
++++ b/src/arch/aarch64/interrupt/exception.rs
+@@ -196,6 +196,14 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
+                     scratch.x5, &mut token,
+                 );
+                 stack.scratch.x0 = ret;
++
++                // Deliver pending signals only now that x0 holds the syscall
++                // result: the handler resume point is the instruction after
++                // `svc`, and `sig_archdep_reg()` reports x0. Delivering any
++                // earlier (as `sched_yield` used to) saves the syscall argument
++                // instead of its result, and the caller then misreads the
++                // return value. See `context::signal::signal_handler`.
++                crate::context::signal::signal_handler(&mut token);
+             }
+ 
+             ty => {
+diff --git a/src/context/signal.rs b/src/context/signal.rs
+index 5ec26470..e1282af8 100644
+--- a/src/context/signal.rs
++++ b/src/context/signal.rs
+@@ -41,6 +41,20 @@ pub fn signal_handler(token: &mut CleanLockToken) {
+         // TODO: prioritize signals over regular program execution
+         return;
+     }
++    // Never deliver a signal while a syscall is still executing. The userspace
++    // resume point stored below is the instruction after `svc`, and the value
++    // saved as the "archdep" register (x0 on aarch64) is read from the
++    // interrupt frame *before* the arch syscall epilogue writes the syscall
++    // result into it. Restoring that stale argument as the result makes the
++    // caller misread the syscall. Measured on the Pinebook Pro: relibc's
++    // `Sys::verify()` yield (x0 = -1 on entry) resumed with x0 = -1 and trapped
++    // in `brk #1`, silently killing uutils binaries at startup.
++    // The arch syscall epilogue delivers pending signals instead, right after
++    // the result has been stored in the frame.
++    if crate::percpu::PercpuBlock::current().inside_syscall.get() {
++        return;
++    }
++
+     let control_flags =
+         SigcontrolFlags::from_bits_retain(thread_ctl.control_flags.load(Ordering::Acquire));
+ 

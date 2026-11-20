@@ -128,6 +128,20 @@ MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, init
   offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt.
+- **Dynamic userspace binaries (experiment 10):** the loader maps the executable at
+  **0x1000** and `libc.so` at **0xa80000**, so absolute userspace PCs in an exception dump
+  must be rebased before symbolising (identify the base with a register whose meaning you
+  can name, e.g. `X19` = `main` in `relibc_start_v1`; both recorded crash PCs then landed
+  on `brk` instructions in `libc.so`). Two defects killed every uutils applet:
+  `__cxa_thread_finalize()` held the thread-local `DTORS` borrow across destructor calls
+  (panics at `src/cxa.rs:84` when a destructor registers another thread-atexit handler;
+  `brk #1` at exit, buffered stdout lost), and `signal_handler()` runs from
+  `sched_yield()`/the timer tick, i.e. **before** the arch syscall epilogue stores the
+  result, so a signal delivered mid-syscall saved the syscall _argument_ as the return
+  value (relibc's `Sys::verify()` yield resumed with `x0 = -1` and took its abort branch).
+  Fixes: `patches/relibc-cxa-reentrancy.patch`,
+  `patches/kernel-signal-delivery-after-syscall.patch`. QEMU cannot exercise this path:
+  no root filesystem and the initfs holds only static binaries.
 
 ### Target SD image layout (produced by our repack)
 

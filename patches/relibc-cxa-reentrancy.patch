@@ -1,0 +1,110 @@
+# redox-os/relibc @ b83feabc: fix re-entrant atexit/thread-atexit finalization
+#
+# Target repository : https://github.com/redox-os/relibc (mirror of
+#                     https://gitlab.redox-os.org/redox-os/relibc.git)
+# Base commit       : b83feabc (master, 2026-11)
+# Reason            : every uutils binary panicked at exit on the Pinebook Pro
+#                     (experiment 10):
+#
+#                         RELIBC PANIC: panicked at src/cxa.rs:84:11:
+#                         RefCell already borrowed
+#
+#                     `__cxa_thread_finalize()` held `DTORS.borrow_mut()`
+#                     across the destructor calls. A destructor that registers
+#                     another thread-atexit handler re-enters
+#                     `__cxa_thread_atexit_impl()`, whose `DTORS.borrow_mut()`
+#                     (line 84) then panics, `relibc_panic` aborts with
+#                     `brk #1`, and the process loses any buffered stdout -
+#                     which is why `rm`/`mkdir` printed the panic while `ls`
+#                     appeared to die with no output at all.
+#
+#                     `__cxa_finalize()` had the same class of bug with its
+#                     spin mutex: it called destructors while holding the lock,
+#                     so a destructor registering an atexit handler (or a
+#                     second thread finalizing) would deadlock.
+#
+#                     Fix: pop one thread-atexit entry under a scoped borrow
+#                     and run it after the borrow is released (LIFO order is
+#                     preserved, and handlers registered by a destructor run in
+#                     the following iteration), and collect the atexit entries
+#                     to run under the lock, drop the lock, then call them.
+#
+# Apply from src (repo root):  git apply <this file>
+diff --git a/src/cxa.rs b/src/cxa.rs
+index c1d77247..03fc0b85 100644
+--- a/src/cxa.rs
++++ b/src/cxa.rs
+@@ -53,24 +53,33 @@ pub unsafe extern "C" fn __cxa_atexit(
+ 
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn __cxa_finalize(dso: *mut c_void) {
+-    let mut funcs = CXA_ATEXIT_FUNCS.lock();
+-
+-    let dso_usize = dso as usize;
++    // Destructors are arbitrary code and may register new atexit handlers.
++    // Collect what has to run under the lock, drop the lock, then run it:
++    // calling them while holding the spin mutex would deadlock instead.
++    let mut to_run: Vec<CxaAtExitFunc> = Vec::new();
++    {
++        let mut funcs = CXA_ATEXIT_FUNCS.lock();
++        let dso_usize = dso as usize;
++
++        for slot in funcs.iter_mut().rev() {
++            if let Some(entry) = slot.as_ref()
++                && (dso.is_null() || entry.dso == dso_usize)
++            {
++                to_run.push(*entry);
++                *slot = None;
++            }
++        }
+ 
+-    for slot in funcs.iter_mut().rev() {
+-        if let Some(entry) = slot.as_ref()
+-            && (dso.is_null() || entry.dso == dso_usize)
+-            && let Some(entry_to_run) = slot.take()
+-        {
+-            (entry_to_run.func)(entry_to_run.arg as *mut c_void);
++        // clean up remaining list
++        if dso.is_null() {
++            funcs.clear();
++        } else {
++            funcs.retain(Option::is_some);
+         }
+     }
+ 
+-    // clean up remaining list
+-    if dso.is_null() {
+-        funcs.clear();
+-    } else {
+-        funcs.retain(Option::is_some);
++    for entry in to_run {
++        (entry.func)(entry.arg as *mut c_void);
+     }
+ }
+ 
+@@ -86,9 +95,22 @@ pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+ 
+ // called internally
+ pub unsafe fn __cxa_thread_finalize() {
+-    let mut dtors = DTORS.borrow_mut();
+-    while let Some(entry) = dtors.pop() {
+-        (entry.func)(entry.obj);
++    // A destructor may initialize another thread-local, which registers a new
++    // thread-atexit handler through `__cxa_thread_atexit_impl`. Taking the
++    // `DTORS` borrow for the whole loop made that re-registration panic with
++    // "RefCell already borrowed" (observed on hardware for every uutils
++    // binary: `rm`, `mkdir`, `ls`, `pwd`), which then aborted the process and
++    // lost its buffered output. Pop one entry under the borrow, release it,
++    // and only then run the destructor.
++    loop {
++        let entry = {
++            let mut dtors = DTORS.borrow_mut();
++            dtors.pop()
++        };
++        match entry {
++            Some(entry) => (entry.func)(entry.obj),
++            None => break,
++        }
+     }
+ }
+ 

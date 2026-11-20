@@ -2448,10 +2448,10 @@ index 00000000..850c96d5
 +}
 diff --git a/drivers/storage/dwmmcd/src/main.rs b/drivers/storage/dwmmcd/src/main.rs
 new file mode 100644
-index 00000000..175b67f0
+index 00000000..9b921da9
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/main.rs
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,192 @@
 +//! dwmmcd - DesignWare MMC (dw_mshc) microSD driver for the RK3399.
 +//!
 +//! Serves the `disk.mmc` scheme for the `sdmmc@fe320000` controller found in
@@ -2552,7 +2552,9 @@ index 00000000..175b67f0
 +    }
 +
 +    let Some((reg_addr, reg_len, fifo_depth)) = node_opt else {
-+        log.log(format_args!("dwmmcd: no sdmmc@fe320000 in the devicetree, exiting"));
++        log.log(format_args!(
++            "dwmmcd: no sdmmc@fe320000 in the devicetree, exiting"
++        ));
 +        process::exit(0);
 +    };
 +
@@ -2568,9 +2570,7 @@ index 00000000..175b67f0
 +    } as usize;
 +    log.log(format_args!(
 +        "dwmmcd: mapped 0x{:08x} (len 0x{:x}) to 0x{:08x}",
-+        reg_addr,
-+        reg_len,
-+        addr
++        reg_addr, reg_len, addr
 +    ));
 +
 +    // Map the CRU as well (read-diagnostics plus un-gating the SDMMC
@@ -2604,15 +2604,11 @@ index 00000000..175b67f0
 +            let signature = [block[510], block[511]];
 +            host.log_line(format_args!(
 +                "dwmmcd: block 0 signature {:02x}{:02x}",
-+                signature[0],
-+                signature[1]
++                signature[0], signature[1]
 +            ));
 +        }
 +        Err(err) => {
-+            host.log_line(format_args!(
-+                "dwmmcd: block 0 self-test failed: {}",
-+                err
-+            ));
++            host.log_line(format_args!("dwmmcd: block 0 self-test failed: {}", err));
 +            process::exit(1);
 +        }
 +    }
