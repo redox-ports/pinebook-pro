@@ -1,5 +1,5 @@
 diff --git a/src/os/uefi/mod.rs b/src/os/uefi/mod.rs
-index f55d8e8..f7ef3e9 100644
+index f55d8e8..c062be4 100644
 --- a/src/os/uefi/mod.rs
 +++ b/src/os/uefi/mod.rs
 @@ -4,11 +4,13 @@ use std::proto::Protocol;
@@ -83,7 +83,7 @@ index f55d8e8..f7ef3e9 100644
          let mut index = 0;
          status_to_result((self.st.BootServices.WaitForEvent)(
              1,
-@@ -318,21 +362,65 @@ impl Os for OsEfi {
+@@ -318,21 +362,63 @@ impl Os for OsEfi {
          })
          .unwrap();
  
@@ -108,13 +108,11 @@ index f55d8e8..f7ef3e9 100644
 +    fn get_key_timeout(&self, milliseconds: u32) -> OsKey {
 +        // `ReadKeyStroke` is non-blocking, so poll it. The `uefi` crate only
 +        // exposes `SetTimer` with an unusable signature, and a timer event
-+        // would need it, so the deadline comes from the firmware RTC.
-+        //
-+        // Boot services are still active here, so `GetTime` may be called.
-+        // Some boards have no working RTC in firmware (Pinebook Pro: U-Boot
-+        // has no driver for the RK808 RTC), and a constant "clock" would
-+        // turn this loop into a hang. Probe whether the value actually
-+        // advances before trusting it.
++        // would need it, so the deadline comes from a counter: the architected
++        // timer on aarch64, otherwise the firmware RTC. Some boards have no
++        // working RTC in firmware (Pinebook Pro: U-Boot has no driver for the
++        // RK808 RTC), and a constant "clock" would turn this loop into a hang,
++        // so probe whether the value actually advances before trusting it.
 +        let clock_start = self.time_10ms();
 +        let clock_ticks = match clock_start {
 +            Some(start) => {
@@ -164,14 +162,49 @@ index f55d8e8..f7ef3e9 100644
          }
      }
  
-@@ -363,6 +451,25 @@ impl Os for OsEfi {
+@@ -363,6 +449,60 @@ impl Os for OsEfi {
      }
  }
  
++/// 10 ms ticks from the aarch64 architected counter.
++///
++/// `CNTPCT_EL0` is guaranteed readable at EL2 and above; at EL1 the access is
++/// controlled by `CNTHCTL_EL2`, so there the firmware clock is used instead.
++/// The counter does not depend on an RTC driver, which is exactly what the
++/// Pinebook Pro firmware lacks (no RK808 RTC in U-Boot), so the boot menu can
++/// honour its timeout there.
++#[cfg(target_arch = "aarch64")]
++fn arch_counter_10ms() -> Option<u64> {
++    let current_el: u64;
++    let frequency: u64;
++    let counter: u64;
++    unsafe {
++        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack));
++        if (current_el >> 2) & 3 < 2 {
++            return None;
++        }
++        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) frequency, options(nomem, nostack));
++        core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) counter, options(nomem, nostack));
++    }
++    if frequency == 0 {
++        return None;
++    }
++    Some(counter.checked_mul(100)? / frequency)
++}
++
 +impl OsEfi {
-+    /// Firmware time of day in units of 10 ms, or `None` when the platform has
-+    /// no RTC (some firmware returns an error, some returns a constant).
++    /// Time in units of 10 ms, or `None` when the platform has no usable clock.
++    ///
++    /// The architected counter is preferred on aarch64; the firmware RTC is the
++    /// fallback (and is the only option on other architectures).
 +    fn time_10ms(&self) -> Option<u64> {
++        #[cfg(target_arch = "aarch64")]
++        {
++            if let Some(ticks) = arch_counter_10ms() {
++                return Some(ticks);
++            }
++        }
++
 +        let mut time = Time::default();
 +        let mut capabilities = TimeCapabilities::default();
 +        match (self.st.RuntimeServices.GetTime)(&mut time, &mut capabilities) {
