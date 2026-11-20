@@ -23,18 +23,74 @@
 #                     so a destructor registering an atexit handler (or a
 #                     second thread finalizing) would deadlock.
 #
-#                     Fix: pop one thread-atexit entry under a scoped borrow
-#                     and run it after the borrow is released (LIFO order is
-#                     preserved, and handlers registered by a destructor run in
-#                     the following iteration), and collect the atexit entries
-#                     to run under the lock, drop the lock, then call them.
+#                     A first attempt - pop one entry under a scoped borrow and
+#                     run it after the borrow is released - was NOT enough on
+#                     hardware: the panic moved from src/cxa.rs:84 to the same
+#                     `DTORS.borrow_mut()` in `__cxa_thread_atexit_impl` but
+#                     was still hit, because the borrow flag is set for the
+#                     whole borrow_mut/push/drop sequence, and a registration
+#                     that lands inside it (from a nested finalize, or from a
+#                     signal handler that the userspace signal trampoline runs
+#                     in the middle of the drain - this kernel delivers signals
+#                     from timer ticks and syscall epilogues) trips the flag.
+#
+#                     Final fix: the thread-atexit stack is an intrusive list
+#                     behind a `Cell<*mut ThreadAtExitNode>`. Registering only
+#                     allocates and links a node, so it can never observe the
+#                     state of a drain in progress, and `__cxa_thread_finalize`
+#                     detaches the whole stack before walking it, looping until
+#                     no new nodes appear (LIFO order preserved; handlers
+#                     registered by destructors run in the next pass).
+#                     `__cxa_finalize()` additionally collects the atexit
+#                     entries under its lock, drops the lock, then calls them.
 #
 # Apply from src (repo root):  git apply <this file>
 diff --git a/src/cxa.rs b/src/cxa.rs
-index c1d77247..03fc0b85 100644
+index c1d77247..eb5bcd81 100644
 --- a/src/cxa.rs
 +++ b/src/cxa.rs
-@@ -53,24 +53,33 @@ pub unsafe extern "C" fn __cxa_atexit(
+@@ -1,6 +1,6 @@
+ use crate::platform::types::{c_int, c_void};
+-use alloc::vec::Vec;
+-use core::cell::RefCell;
++use alloc::{boxed::Box, vec::Vec};
++use core::{cell::Cell, ptr};
+ use spin::Mutex;
+ 
+ #[derive(Clone, Copy)]
+@@ -10,16 +10,27 @@ struct CxaAtExitFunc {
+     dso: usize,
+ }
+ 
+-#[derive(Clone, Copy)]
+-struct CxaThreadAtExitFunc {
++/// Entry of the thread-atexit handler stack.
++///
++/// `__cxa_thread_atexit_impl` may be called at any time, including from a
++/// destructor that `__cxa_thread_finalize` is already running and from a signal
++/// handler that the userspace signal trampoline invoked in the middle of the
++/// drain. An intrusive list behind a `Cell` therefore replaces the former
++/// `RefCell<Vec<...>>`: registering only pushes a node and never observes (or
++/// conflicts with) the state of the list being walked, whereas any borrow flag
++/// turned those re-entrant registrations into
++/// `panicked at src/cxa.rs: ...: RefCell already borrowed` -> `abort()` ->
++/// `brk #1`, losing the process's buffered stdout (measured on the Pinebook
++/// Pro for every uutils applet: `ls`, `pwd`, `rm`, `mkdir`, `head`).
++struct ThreadAtExitNode {
+     func: extern "C" fn(*mut c_void),
+     obj: *mut c_void,
+-    dso: *mut c_void,
++    next: *mut ThreadAtExitNode,
+ }
+ 
+ static CXA_ATEXIT_FUNCS: Mutex<Vec<Option<CxaAtExitFunc>>> = Mutex::new(Vec::new());
+ #[thread_local]
+-static DTORS: RefCell<Vec<CxaThreadAtExitFunc>> = RefCell::new(Vec::new());
++static DTORS: Cell<*mut ThreadAtExitNode> = Cell::new(ptr::null_mut());
+ 
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn __cxa_atexit(
+@@ -53,24 +64,33 @@ pub unsafe extern "C" fn __cxa_atexit(
  
  #[unsafe(no_mangle)]
  pub unsafe extern "C" fn __cxa_finalize(dso: *mut c_void) {
@@ -82,28 +138,40 @@ index c1d77247..03fc0b85 100644
      }
  }
  
-@@ -86,9 +95,22 @@ pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+@@ -80,15 +100,32 @@ pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+     obj: *mut c_void,
+     dso: *mut c_void,
+ ) {
+-    let entry = CxaThreadAtExitFunc { func, obj, dso };
+-    DTORS.borrow_mut().push(entry);
++    let _ = dso;
++    let node = Box::into_raw(Box::new(ThreadAtExitNode {
++        func,
++        obj,
++        next: DTORS.get(),
++    }));
++    DTORS.set(node);
+ }
  
  // called internally
  pub unsafe fn __cxa_thread_finalize() {
 -    let mut dtors = DTORS.borrow_mut();
 -    while let Some(entry) = dtors.pop() {
 -        (entry.func)(entry.obj);
-+    // A destructor may initialize another thread-local, which registers a new
-+    // thread-atexit handler through `__cxa_thread_atexit_impl`. Taking the
-+    // `DTORS` borrow for the whole loop made that re-registration panic with
-+    // "RefCell already borrowed" (observed on hardware for every uutils
-+    // binary: `rm`, `mkdir`, `ls`, `pwd`), which then aborted the process and
-+    // lost its buffered output. Pop one entry under the borrow, release it,
-+    // and only then run the destructor.
 +    loop {
-+        let entry = {
-+            let mut dtors = DTORS.borrow_mut();
-+            dtors.pop()
-+        };
-+        match entry {
-+            Some(entry) => (entry.func)(entry.obj),
-+            None => break,
++        // Detach the whole stack first. Handlers registered from here on (by a
++        // destructor, or by a signal handler interrupting this drain) start a
++        // fresh stack, which the next iteration of this loop picks up, so
++        // registration never touches the list currently being walked.
++        let mut node = DTORS.replace(ptr::null_mut());
++        if node.is_null() {
++            break;
++        }
++
++        while !node.is_null() {
++            let current = unsafe { Box::from_raw(node) };
++            node = current.next;
++            (current.func)(current.obj);
 +        }
      }
  }

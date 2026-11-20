@@ -10,9 +10,8 @@ README §7 risk 14; `patches/relibc-cxa-reentrancy.patch`,
 
 ## Symptom (device owner, 2026-11-20)
 
-> "1) ls также падает, надо побороть в первую очередь!
->  2) Клавиатура на ноутбуке не работает, но пока консоль работает, давай пока
->  оставим на потом"
+> "1) ls также падает, надо побороть в первую очередь! 2) Клавиатура на ноутбуке не работает, но пока консоль работает, давай пока
+> оставим на потом"
 
 After `redox login:` / `ion` came up, `/usr/bin/ls` produced no output at all
 and the shell returned immediately. `/usr/bin/rm -rf /tmp` and
@@ -49,12 +48,12 @@ executable at address 0. From the same dump, `X19` is `relibc_start_v1`'s second
 argument (`main`, saved by the first instructions) and the frame-pointer chain
 holds `relibc_crt0` / `relibc_panic` return addresses:
 
-| Dumped value   | Symbol (offset in the file)   | Implied base |
-| -------------- | ----------------------------- | ------------ |
-| `X19=1F1834`   | `main` @ `1F0834`             | executable `0x1000` |
-| `PC=EF034`     | `relibc_crt0` @ `EE034`       | executable `0x1000` |
-| `PC=EF048`     | `relibc_panic` @ `EE048`      | executable `0x1000` |
-| `X17=C0973C`   | `relibc_start_v1` @ `18973C`  | `libc.so` `0xA80000` |
+| Dumped value | Symbol (offset in the file)  | Implied base         |
+| ------------ | ---------------------------- | -------------------- |
+| `X19=1F1834` | `main` @ `1F0834`            | executable `0x1000`  |
+| `PC=EF034`   | `relibc_crt0` @ `EE034`      | executable `0x1000`  |
+| `PC=EF048`   | `relibc_panic` @ `EE048`     | executable `0x1000`  |
+| `X17=C0973C` | `relibc_start_v1` @ `18973C` | `libc.so` `0xA80000` |
 
 With `libc.so` at `0xA80000` both recorded crash PCs land on `brk #1`
 instructions inside `libc.so`:
@@ -86,10 +85,24 @@ in the log. `relibc_panic` prints and then `abort()`s, which is the `brk #1`,
 and buffered stdout is lost. `__cxa_finalize()` had the same shape with its spin
 mutex (destructors called while the lock is held).
 
-**Fix** (`patches/relibc-cxa-reentrancy.patch`): pop one entry under a scoped
-borrow, release it, then run the destructor (LIFO order and "handlers registered
-by a destructor run next" are preserved); and for `__cxa_finalize`, collect the
-entries under the lock, drop it, then run them.
+**Fix, step 1** (`patches/relibc-cxa-reentrancy.patch`, first revision): pop one
+entry under a scoped borrow and run the destructor after the borrow is released.
+On hardware this was **not enough** — the panic moved from `src/cxa.rs:84` to
+`src/cxa.rs:93` (the same `DTORS.borrow_mut()` in `__cxa_thread_atexit_impl`,
+shifted by the added comments) and still fired for _every_ applet, including
+`ls`, `pwd` and `head`, which now got past startup (the kernel fix below). The
+reason: a `RefCell` borrow flag is set for the whole
+`borrow_mut`/`push`/`drop` sequence, and a registration that lands inside it —
+from a nested finalize, or from a signal handler that the userspace signal
+trampoline runs in the middle of the drain — trips it.
+
+**Fix, step 2** (same patch, final revision): the thread-atexit stack is an
+intrusive list behind `Cell<*mut ThreadAtExitNode>`. Registering only allocates
+and links a node, so it can never observe a drain in progress;
+`__cxa_thread_finalize` detaches the whole stack before walking it and repeats
+until no new nodes appear (LIFO order preserved, handlers registered by a
+destructor run in the next pass). `__cxa_finalize` collects the atexit entries
+under its lock, drops the lock, then calls them.
 
 ## Root cause 2 — a signal delivered inside a syscall returns its argument (startup path)
 
@@ -141,7 +154,7 @@ let ret = syscall::syscall(...);
 stack.scratch.x0 = ret;
 ```
 
-So a signal delivered in that window saves the syscall *argument*, and
+So a signal delivered in that window saves the syscall _argument_, and
 `sigreturn` restores it as the return value. `ls`/`pwd` resumed at `0x18977c`
 with `x0 = -1`, took the abort branch, and died silently. A freshly spawned
 process can already have a pending signal (that is why `rm`/`mkdir` got past
@@ -160,11 +173,16 @@ and the aarch64 syscall epilogue calls it immediately after
   (same comparison).
 - QEMU smoke test still passes (`scripts/qemu-smoke.sh`): U-Boot devicetree,
   UART bind, initfs userspace, `debugsh` console.
+- **Hardware run 2 (kernel signal fix, step 1 of the relibc fix):** the startup
+  crash is gone from the log — `ls`, `pwd` and `head` now reach `main` and the
+  `ELR_EL1` that used to point into `relibc_start_v1` no longer appears. All
+  applets then panic at exit with `panicked at src/cxa.rs:93:11: RefCell
+already borrowed`, which is what step 2 above addresses.
+- **Hardware result of step 2: `FILL IN`** — log in and run `ls`, `pwd`,
+  `rm -rf /tmp`, `mkdir -m a=rwxt /tmp`, then `ls /usr/bin | head`.
 - QEMU cannot exercise the fix end to end: it has no root filesystem (no
   virtio-mmio block driver), and the initfs contains only static binaries, so
   no dynamic `libc.so` startup happens there.
-- **Hardware result: `FILL IN`** — log in and run `ls`, `pwd`, `rm -rf /tmp`,
-  `mkdir -m a=rwxt /tmp`, then `ls /usr/bin | head`.
 
 ## Follow-ups
 
@@ -172,6 +190,6 @@ and the aarch64 syscall epilogue calls it immediately after
   kernel fix makes that harmless, but clearing them on `exec` is still the
   correct behaviour and would remove the "inherited signal" trigger entirely.
 - `[src/procmgr.rs:2071 ERROR] failed to send SIGCHLD to parent PID
-  ProcessId(28): Operation not permitted` is still unexplained; signals are
+ProcessId(28): Operation not permitted` is still unexplained; signals are
   plain `sigcontrol` state in this kernel generation, so the `EPERM` comes from
   the userspace side of the protocol.
