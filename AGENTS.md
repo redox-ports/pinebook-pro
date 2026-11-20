@@ -111,7 +111,11 @@ fix(ci): prune runner disk before redox build
   iterations characterized a clock-update timeout that iteration 6 traced to the
   wait mechanism (the driver polled RINTSTS CDONE; U-Boot polls CMD START and this
   IP never raises CDONE for clock-only commands); SRST_SDMMC pulse verified on
-  hardware (STATUS 0x6106 → 0x0106). Enumeration test pending. Secondary CPUs stay
+  hardware (STATUS 0x6106 → 0x0106). Iterations 6–7 hardware runs also proved
+  `CLKSEL_CON16` is write-mask (hiword) protected — plain writes are dropped —
+  and that kernel `nanosleep` does not wake on the generic timer (a 10 ms sleep
+  blocked until a serial interrupt; `dwmmcd` now busy-waits). Enumeration test
+  pending. Secondary CPUs stay
   offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt.
