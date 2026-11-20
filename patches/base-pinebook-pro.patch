@@ -14,9 +14,10 @@
 #                        built-ins (ls/cat/echo>/hexdump/env/exec/reboot), sets its
 #                        working directory to /scheme/initfs so a bare `ls`
 #                        works, and maps `ls /` to the scheme namespace. It
-#                        exits immediately when a `disk.mmc` scheme is
-#                        registered: storage works, so the real login owns
-#                        the serial console instead of the initfs shell.
+#                        waits up to 3 s for a `disk.mmc` scheme at startup
+#                        (and rechecks on each keypress) and exits when it
+#                        appears: storage works, so the real login owns the
+#                        serial console instead of the initfs shell.
 #                        `hwd` no longer spawns `pcid` on aarch64 (hwd spawns
 #                        it directly, bypassing init services, and pcid's
 #                        PCI 3.0 configuration-space fallback is `todo!()`
@@ -178,10 +179,10 @@ index 00000000..2baaa745
 +workspace = true
 diff --git a/debugsh/src/main.rs b/debugsh/src/main.rs
 new file mode 100644
-index 00000000..4acb1919
+index 00000000..3f4b321e
 --- /dev/null
 +++ b/debugsh/src/main.rs
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,457 @@
 +//! debugsh - interactive debug shell on the kernel debug scheme.
 +//!
 +//! Runs during the initfs phase of boot, before a root filesystem is
@@ -220,6 +221,27 @@ index 00000000..4acb1919
 +    daemon::Daemon::new(run);
 +}
 +
++/// How long to wait for the storage driver at startup. dwmmcd registers its
++/// scheme within a fraction of a second of the system starting; the login
++/// prompt appears much later, so a short wait is enough to decide.
++const STORAGE_WAIT_MS: u64 = 3000;
++
++/// Spin (with yields, so the single CPU still runs the driver) until
++/// `disk.mmc` appears or the timeout expires. Sleeping is not an option:
++/// the bring-up kernel never wakes `nanosleep` on the timer.
++fn wait_for_storage(timeout_ms: u64) -> bool {
++    let start = std::time::Instant::now();
++    loop {
++        if storage_ready() {
++            return true;
++        }
++        if start.elapsed().as_millis() as u64 >= timeout_ms {
++            return false;
++        }
++        std::thread::yield_now();
++    }
++}
++
 +/// True when a `disk.mmc` scheme is registered in the scheme namespace.
 +fn storage_ready() -> bool {
 +    match fs::read_dir("/scheme") {
@@ -253,11 +275,12 @@ index 00000000..4acb1919
 +
 +    // Once storage works, the real system provides a login prompt on the
 +    // same serial console, and this shell would steal its input (both read
-+    // the UART RX stream). init starts this service only after
-+    // 40_drivers.target, which blocks on the notify-type dwmmcd service, so
-+    // a registered disk.mmc scheme here means the root filesystem can be
-+    // mounted: step aside and let the login own the console.
-+    if storage_ready() {
++    // the UART RX stream). init starts the initfs services concurrently
++    // with the driver target (measured: this shell starts before dwmmcd
++    // registers its scheme), so wait a bounded time for `disk.mmc` and
++    // step aside when it appears. If it never does (storage failed), the
++    // shell stays as the bring-up console.
++    if wait_for_storage(STORAGE_WAIT_MS) {
 +        let mut lock = io::stdout().lock();
 +        let _ = writeln!(
 +            lock,
@@ -286,7 +309,20 @@ index 00000000..4acb1919
 +    loop {
 +        match stdin.read(&mut byte) {
 +            Ok(0) => continue,
-+            Ok(_) => {}
++            Ok(_) => {
++                // Storage may have come up after the startup wait (slow
++                // card, delayed driver): drop the console on the first
++                // keypress instead of eating the whole login attempt.
++                if storage_ready() {
++                    let mut lock = stdout.lock();
++                    let _ = writeln!(
++                        lock,
++                        "debugsh: disk.mmc is up, releasing the console to the login"
++                    );
++                    let _ = lock.flush();
++                    std::process::exit(0);
++                }
++            }
 +            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
 +            Err(err) => {
 +                let mut lock = stdout.lock();
