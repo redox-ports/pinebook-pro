@@ -46,7 +46,10 @@ fix(ci): prune runner disk before redox build
 
 - Boot ROM loads next stage at **byte 32768 (sector 64)**; U-Boot proper goes at **sector 16384 (8 MiB)**. The on-disk RK3399 header is the **v1** format (512 bytes, RC4-encoded, plaintext magic `0x0ff0aa55`); the payload starts at `+0x800` with `RK33`. ASCII `RKNS` is the **v2** magic (RK3568/RK3588 class), **not** RK3399. Boot order: SPI NOR → eMMC → microSD → USB OTG. NVMe (PCIe) is **not** ROM-bootable.
 - Serial console = **UART2, 1500000 baud 8N1, 3.3 V**, via headphone jack (internal switch). Compatible string in DT: `snps,dw-apb-uart` / `rockchip,rk3399-uart`.
-- Storage controllers: microSD = **DW MMC**; eMMC = **SDHCI (arasan)** @ `fe330000`; both lack upstream Redox drivers (biggest gap).
+- Storage controllers: microSD = **DW MMC** (`fe320000`, compatible `rockchip,rk3399-dw-mshc` + `rk3288-dw-mshc`, IRQ GIC_SPI 65, fifo-depth 0x100, max-freq 150 MHz per `rk3399.dtsi`); eMMC = **SDHCI (arasan)** @ `fe330000`. Our `dwmmcd` driver covers microSD; eMMC stays untouched.
+- DW MMC register map (verified from Linux `dw_mmc.h` + U-Boot v2021.07 `dwmmc.h`): `CTRL 0x000, PWREN 0x004, CLKDIV 0x008, CLKSRC 0x00c, CLKENA 0x010, TMOUT 0x014, CTYPE 0x018, BLKSIZ 0x01c, BYTCNT 0x020, INTMASK 0x024, CMDARG 0x028, CMD 0x02c, RESP0-3 0x030-0x03c, MINTSTS 0x040, RINTSTS 0x044 (W1C), STATUS 0x048 (FIFO_EMPTY bit2, FIFO_FULL bit3, BUSY bit9, FCNT bits 17-29), FIFOTH 0x04c, VERID 0x06c, HCON 0x070`; FIFO data register at **0x200** for IP >= 2.40a (U-Boot hardcodes 0x200 for RK3399). `RINTSTS`: CD bit0, RE 1, CDONE 2, DTO 3, TXDR 4, RXDR 5, RCRC 6, DCRC 7, RTO 8, DRTO 9, HTO 10, FRUN 11, HLE 12, SBE 13, ACD 14, EBE 15.
+- initfs service ordering gotcha: redoxfs (`50_rootfs.service`) scans `/scheme` once with **no retry**; notify-type services block init until `daemon.ready()`, so a driver service in `40_drivers.target` is guaranteed registered before redoxfs starts. A driver that exits before ready is logged ("exited without notifying readiness") and boot continues.
+- Build env pitfall: `COOKBOOK_OFFLINE` is parsed as a Rust bool — the value must be `true`; `COOKBOOK_OFFLINE=1` silently means **online** and `repo cook` stalls on `git fetch` to the slow Redox GitLab (base has no GitHub mirror).
 - Keyboard + touchpad are internal **USB HID** devices (behind a hub) → need USB host + HID stack, not PS/2/I2C.
 - SPI NOR (16 MiB) ships **empty**; flashing it with U-Boot/TOW-Boot is an alternative to embedding U-Boot in the SD image.
 - Mainline U-Boot defconfig: `pinebook-pro-rk3399_defconfig`; BL31 from ATF `PLAT=rk3399`; artifacts `idbloader.img` + `u-boot.itb`. TOW-Boot board name: `pine64-pinebookPro`.
@@ -91,18 +94,19 @@ fix(ci): prune runner disk before redox build
   bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
-- **Redox bring-up status (2026-11-20, experiments 4–5):** the kernel boots to initfs
+- **Redox bring-up status (2026-11-20, experiments 4–6):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
-  the panel). Root RedoxFS mount is blocked: no microSD (DW MMC) driver, so `init` cannot
-  switchroot; the system then idles with the interim console (no reboot loop — risk #11
-  resolved). **Interactive root console on UART2 works (experiment 5):** `debugsh`
+  the panel). **Interactive root console on UART2 works (experiment 5):** `debugsh`
   initfs daemon (echo, line editing, ls/cat/echo>/hexdump/env/exec) verified on
   hardware. Kernel fixes kept under `patches/`: NS16550 rx path (loopback self-test
   left IER=0 + 14-byte FIFO threshold swallowed keystrokes), GICv3 SPI delivery
   (`GICD_IGROUPR`/`IROUTER` never programmed; `GICD_CTLR` overwrite wiped the
   firmware `ARE_S` bit — SPIs pended forever), `pcid` gated to x86 (its aarch64 PCI
-  fallback panics; `hwd` spawned it directly). Secondary CPUs stay offline (GICv3
+  fallback panics; `hwd` spawned it directly). **DW MMC microSD driver written and
+  built (experiment 6):** `dwmmcd` initfs daemon (FIFO/PIO polling, inherited U-Boot
+  clocking, `disk.mmc` scheme, ordered before `50_rootfs.service`); first hardware
+  boot pending. Secondary CPUs stay offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt.
 
