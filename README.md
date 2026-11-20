@@ -119,7 +119,7 @@ Sources: `redox-os/kernel`, `redox-os/bootloader`, `redox-os/redox` (build syste
 ### What is missing for a usable Pinebook Pro
 
 1. **Storage drivers** for non-PCI hosts: DW MMC (microSD), SDHCI-arasan (eMMC). This is the biggest gap — it is why the RPi 3 B+ only reaches a serial console. Without it there is no root filesystem.
-2. **USB host (DWC3/DWC2) + HID** — needed for keyboard/touchpad (they are internal USB devices).
+2. **USB host + HID** — needed for keyboard/touchpad (they are internal USB devices). Experiments 4 and 8 showed they sit on the **OHCI** companion of a RK3399 USB2 controller (U-Boot brings up no EHCI), so only an OHCI driver is required, not DWC2 or xHCI.
 3. **Display**: framebuffer comes from the bootloader (`FRAMEBUFFER_ADDR` env) via EFI GOP; this only works if U-Boot exposes GOP (video driver for eDP in U-Boot). Otherwise console is serial-only until a Rockchip VOP/eDP driver exists. Note: U-Boot programs **RGB565** for the eDP panel (`rk_vop.c` forces `VIDEO_BPP16` for `VOP_MODE_EDP`) and reports it as a bit-mask format, so consumers must honour `FRAMEBUFFER_BPP` (experiment 7).
 4. Optional/later: PCIe (NVMe), Wi-Fi AP6256, audio ES8316, RTC, battery/PMIC (RK808/CW2015).
 
@@ -257,7 +257,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [x] GICv3 (GIC-500) + generic timer initialized (`architected timer virq = 27`)
 - [x] Kernel reaches initfs and starts userspace (`init`, drivers, `vesad` 1920x1080 framebuffer)
 - [x] Interactive serial console without storage: `debugsh` on the kernel debug scheme (experiment 5) — echo/line-editing/built-ins verified on hardware; kernel fixes in `patches/` (NS16550 rx, GICv3 SPI delivery)
-- [ ] Serial login prompt from the rootfs (getty/login) — blocked on storage: the root RedoxFS mount needs a microSD DW MMC driver; the initfs console above is the interim replacement
+- [x] Serial login prompt from the rootfs (getty/login) — reached once the DW MMC driver landed (experiment 6): `init` switchroots to `/usr`, `redox login:` appears on UART2, `user` and `root`/`password` log in
 
 ### Phase 4 — Storage, input, display
 
@@ -265,7 +265,7 @@ Legend: `[x]` done, `[ ]` open. Keep this section in sync with reality (see `AGE
 - [x] DW MMC driver written and built: `dwmmcd` (experiment 6) — FIFO/PIO polling, U-Boot v2021.07 rk3399 clocking model (CRU `CLKSEL_CON16` rates, controller `CLKDIV=0` bypass, clock updates awaited on the CMD START bit like `dwmci_setup_bus`), registers per Linux `dw_mmc.h` + U-Boot `dwmmc.h`; `40_dwmmcd.service` ordered before `50_rootfs.service`
 - [x] DW MMC driver hardware-verified (experiment 6, iteration 8, 2026-11-20): `dwmmcd` enumerates the microSD on hardware (`card ready: size=30436 MiB`, block 0 `55aa`), redoxfs mounts the root from `disk.mmc/0p2`, `init` switchroots to `/usr`, the full userspace starts and the `redox login:` banner appears
 - [ ] SDHCI-arasan driver (eMMC; must stay read-only/untouched — holds the baseline OS)
-- [ ] USB: DWC2 host (USB 2.0 internal hub + keyboard/touchpad, HID) and DWC3/xHCI (USB 3.0) — internal input devices are on USB 2.0
+- [ ] USB 3.0: DWC3/xHCI (`usbdrd3_0`/`usbdrd3_1`, host mode in the DT) — the USB-A and USB-C ports; the internal input devices do **not** need it (they are on OHCI, experiment 8)
 - [ ] USB input: OHCI host driver `ohcid` — the internal hub (4 devices in U-Boot's scan) is on **`usb_host1_ohci`** `fe3e0000` and U-Boot brings up no EHCI, so everything runs at full speed on the companion OHCI. Hub enumeration + boot-protocol HID keyboard reports into `inputd` (experiment 8); written and built, awaiting hardware verification. DWC3/xHCI (USB 3.0 ports) still missing
 - [x] Display: U-Boot GOP → `FRAMEBUFFER_*` env → `vesad` 1920x1080 framebuffer + `fbbootlogd` (experiment 4; kernel `graphical_debug` visible on the panel)
 - [ ] Display colour: firmware framebuffer is **RGB565** (U-Boot forces `VIDEO_BPP16` for eDP, GOP reports a bit-mask format) while Redox assumed 32bpp — the VT background `0xFF000000` became a black/yellow dither. Fix: bootloader exports `FRAMEBUFFER_BPP`, kernel `graphical_debug` and `vesad` honour it (experiment 7); awaiting hardware verification

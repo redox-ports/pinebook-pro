@@ -94,7 +94,8 @@ fix(ci): prune runner disk before redox build
   at sector 16384**. The hardware boot partitions (`boot0`/`boot1`, 4 MiB each) contain no
   bootloader and are unused. **Never write to any part of the eMMC** (it holds the baseline OS).
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
-  (`05e3:0608`) → USB2 host (DWC2) is required for input, not DWC3/xHCI.
+  (`05e3:0608`) → an **OHCI** USB2 host is required for input (measured in
+  experiment 8; DWC2 and xHCI are not involved).
 - **Redox bring-up status (2026-11-20, experiments 4–6):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on
