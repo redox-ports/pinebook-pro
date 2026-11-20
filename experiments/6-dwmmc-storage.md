@@ -236,9 +236,41 @@ internally ("dwmmc controller have internal div 2", U-Boot
 (mux value 5) for the 400 kHz identification clock — relevant once the
 gate theory is confirmed or disproved.
 
+## Iteration 4 result (`logs/serial-20261120-085752.log`)
+
+The CRU dump settled the clock-gate theory — against it:
+
+```text
+dwmmcd: cru hclk_sd sel=0x00000361 sclk_sdmmc sel=0x0000010e
+dwmmcd: cru gates: con6=0x00000060 con12=0x00000000 con33=0x00000000
+dwmmcd: sclk_sdmmc source gpll div 14
+dwmmcd: controller reset ok (ctrl was 0x02000000)
+dwmmcd: clock update (stop) failed: Connection timed out rint=0x00000000 status=0x00006106
+```
+
+Decoded: HCLK_SD = cpll/4 = 200 MHz (the dtsi `assigned-clock-rates`
+value — U-Boot applied it), SCLK_SDMMC = gpll/15 ≈ 39.6 MHz with the
+CIU gate (CON6 bit 1) **open**; the 0x60 bits in CON6 are the unused
+USB2PHY reference gates. All three SDMMC clocks run, the controller
+reset completes, and the CIU still refuses to execute the clock update
+(`RINTSTS = 0`: the command never started). The remaining explanation:
+the EFI loader's IDMAC traffic left the CIU wedged mid-command, and the
+BIU-side CTRL reset cannot unwedge it (this also fits the persistent
+`STATUS` bit 9 BUSY).
+
+Iteration 5 changes (built):
+
+- The driver pulses the controller reset lines through the CRU before
+  any controller access, exactly like Linux `dw_mci_probe` (which gets
+  `SRST_SDMMC` via `resets = <&cru SRST_SDMMC>`): SRST_SDMMC = 122 →
+  `SOFTRST_CON(7)` bit 10, plus SRST_SD_NOC = 189 → `SOFTRST_CON(11)`
+  bit 13, assert both, 10 ms, release, 10 ms. Reset lines are hiword
+  (mask [31:16], data [15:0], data 1 = assert). Verified from Linux
+  `dt-bindings/clock/rk3399-cru.h` (same file in U-Boot v2021.07).
+
 ## Status
 
-**in progress** — iteration 4 built and flashed-pending:
+**in progress** — iteration 5 built and flashed-pending:
 
 - [x] flashed and booted (iteration 1, 2026-11-20 08:21)
 - [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited
