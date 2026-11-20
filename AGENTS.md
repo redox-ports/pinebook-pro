@@ -104,9 +104,15 @@ fix(ci): prune runner disk before redox build
   (`GICD_IGROUPR`/`IROUTER` never programmed; `GICD_CTLR` overwrite wiped the
   firmware `ARE_S` bit — SPIs pended forever), `pcid` gated to x86 (its aarch64 PCI
   fallback panics; `hwd` spawned it directly). **DW MMC microSD driver written and
-  built (experiment 6):** `dwmmcd` initfs daemon (FIFO/PIO polling, inherited U-Boot
-  clocking, `disk.mmc` scheme, ordered before `50_rootfs.service`); first hardware
-  boot pending. Secondary CPUs stay offline (GICv3
+  built (experiment 6):** `dwmmcd` initfs daemon (FIFO/PIO polling, U-Boot v2021.07
+  rk3399 clocking model — CRU `CLKSEL_CON16` rates, controller `CLKDIV=0` bypass,
+  clock updates awaited on the CMD START bit per `dwmci_setup_bus`, no-CIU fallback,
+  `disk.mmc` scheme, ordered before `50_rootfs.service`). Hardware: five boot
+  iterations characterized a clock-update timeout that iteration 6 traced to the
+  wait mechanism (the driver polled RINTSTS CDONE; U-Boot polls CMD START and this
+  IP never raises CDONE for clock-only commands); SRST_SDMMC pulse verified on
+  hardware (STATUS 0x6106 → 0x0106). Enumeration test pending. Secondary CPUs stay
+  offline (GICv3
   `init_ap` gap); RK808 RTC/entropy drivers missing; temporary marker/dump
   instrumentation removed, clean image rebuilt.
 

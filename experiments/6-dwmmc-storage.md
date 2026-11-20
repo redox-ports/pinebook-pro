@@ -18,7 +18,7 @@ documented), README §6 Phase 4; `patches/base-pinebook-pro.patch`,
   U-Boot installed on this Pinebook Pro, so its `fifo_mode` PIO code path is
   the reference model (polling, no IDMAC, no controller interrupts).
 - Node selection: `fdt.all_compatible(["rockchip,rk3399-dw-mshc",
-  "rockchip,rk3288-dw-mshc"])` filtered by first `reg` entry
+"rockchip,rk3288-dw-mshc"])` filtered by first `reg` entry
   **0xfe320000**. The SDIO controller (`fe310000`) shares the compatible
   string, and the eMMC (`fe330000`, SDHCI) holds the baseline OS — the
   address filter guarantees neither is ever probed.
@@ -27,14 +27,16 @@ documented), README §6 Phase 4; `patches/base-pinebook-pro.patch`,
   runtime like Linux does.
 - `fifo-depth` from the devicetree (`<0x100>` per `rk3399.dtsi`), fallback
   256 words.
-- Clock strategy ("inherited state", Phase A): U-Boot leaves the CRU
-  `cclk_sdmmc` rate and CIU dividers in the state that just read the ESP and
-  the kernel from this card. The driver never touches the CRU or `CLKSRC`;
-  it reprograms `CLKDIV` through the CIU clock-update command
-  (stop clock -> write divider -> restart, `CMD_UPD_CLK`) to `64` for the
-  100-400 kHz identification window (inherited card clock is SD high speed,
-  <= 50 MHz, so cclk/128 lands in range), and restores the inherited divider
-  before selecting the card.
+- Clock strategy (iteration 6, U-Boot rk3399 model): controller `CLKDIV`
+  stays 0 — the block divides cclk by 2 internally and the card rate is
+  controlled entirely from the CRU `CLKSEL_CON16` (identification:
+  `0x51d` = xin24m/30 → 400 kHz card clock; data: the inherited `0x10e` =
+  gpll/15 ≈ 19.8 MHz). CLKENA changes are wrapped in two CIU
+  clock-update commands exactly like `dwmci_setup_bus`, each awaited by
+  polling the **CMD START bit** self-clearing (U-Boot never checks CDONE
+  for clock-only commands; this IP does not raise it — see iteration 6).
+  If an update never completes, the driver falls back to plain register
+  writes with no CIU involvement.
 - Card enumeration: CMD0 (with `CMD_INIT` 80-clock preamble) -> CMD8 ->
   ACMD41 loop (2 s budget, 10 ms sleep between attempts) -> CMD2 -> CMD3
   (RCA) -> CMD9 (CSD, capacity via Linux `UNSTUFF_BITS` for CSD v1/v2) ->
@@ -54,9 +56,11 @@ documented), README §6 Phase 4; `patches/base-pinebook-pro.patch`,
   **blocks** on notify-type services until `daemon.ready()`
   (`DiskScheme::new` calls it), so redoxfs scans `/scheme` only after
   `disk.mmc` is registered (redoxfs does not retry).
-- Bring-up logging: every driver message goes to stderr (log scheme) AND
-  `/scheme/debug` (kernel debug scheme -> UART), so the whole enumeration is
-  visible in the serial capture. The fd is opened before `setrens`.
+- Bring-up logging: every driver message goes to `/scheme/debug` (kernel
+  debug scheme -> UART; stderr is not written — init children inherit
+  init's stdio, which is already the debug scheme, so writing both
+  duplicates every line, observed in iteration 1), each line timestamped
+  `[s.ss]` since driver start. The fd is opened before `setrens`.
 - Self-test at startup: read block 0 and log the MBR signature (should be
   `55aa` — the image is GPT with a protective MBR).
 
@@ -89,13 +93,23 @@ dwmmcd: mapped 0xfe320000 (len 0x...) to 0x...
 dwmmcd: inherited verid=... hcon=... ctrl=...
 dwmmcd: inherited clkdiv=... clksrc=... clkena=... ctype=... fifoth=...
 dwmmcd: fifo depth 256 words, data reg at +0x200
+dwmmcd: pulsed SRST_SDMMC + SRST_SD_NOC
+dwmmcd: post-SRST ctrl=... clkena=... clkdiv=... (was ...) clksrc=... status=...
+dwmmcd: clksel16 ident-400k: 0x0000010e -> 0x0000051d     <-- CRU rate set
 dwmmcd: CMD8 ok (v2.0 card, 0x1aa)
 dwmmcd: ACMD41 ready, ocr=0xc0ff8000 ccs=true
+dwmmcd: clksel16 data-rate: 0x0000051d -> 0x0000010e     <-- back to data rate
 dwmmcd: card ready: rca=0x.... size=... MiB (block addressed)
 dwmmcd: block 0 signature 55aa
 [INFO redoxfs] mounted filesystem ...      <-- success
 init: switchroot to /usr /etc              <-- root filesystem!
 ```
+
+(`clksel16` line values are the expected ones: `0x10e` = the inherited
+U-Boot data rate, `0x51d` = the U-Boot 400 kHz identification rate. If
+instead a `clock update (ident) failed` line appears, the run switched to
+the fallback and logs `direct clocks:` next — both paths are valid, only
+the lines after them differ.)
 
 4. If mount works: rootfs units start (getty etc.), `ion` shell on the
    serial console — record everything.
@@ -107,16 +121,16 @@ init: switchroot to /usr /etc              <-- root filesystem!
 
 ## Expected failure modes and next actions
 
-| Symptom (last dwmmcd line)                    | Meaning                                                        | Next action                                                                    |
-| --------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `init failed: Connection timed out` (no CMD*) | iteration 1: clock update stalled on the IDMAC-state controller | fixed for iteration 2: full controller reset first (see above)                 |
-| `clock update (stop/div/start) failed`        | CIU still not accepting updates after the reset                | capture the logged `rint`/`status`, compare with U-Boot `md 0xfe32002c`        |
-| `CMD0 failed: timeout`                        | controller not talking (clocking/power state unexpected)       | dump `CLKDIV/CLKENA/CLKSRC` from the log, try U-Boot `md 0xfe320008` pre-boot  |
-| `CMD8 ok` then `ACMD41 busy timeout`          | card never leaves busy; identification clock too slow/fast      | try `INIT_CLKDIV` 32/128, measure with U-Boot `mmc dev 1; mmc rescan`          |
-| `CMD3 failed` / `card returned RCA 0`         | RCA handshake broken (unlikely after ACMD41)                   | compare response words with a U-Boot `mmc switch` trace                        |
-| `data error at block ... rint=0x...`          | data CRC/timing at full speed                                  | keep the identification divider (run at cclk/130) as a workaround, then CRU    |
-| `data timeout at block ...`                   | FIFO starvation or DTO never fires                             | check `STATUS` FIFO count in the log line, lower chunk size to 1 block          |
-| `block 0 signature` not `55aa`                | reads return garbage (byte order/sync issue)                   | hexdump block 0 from debugsh: `hexdump disk.mmc: 512`? (needs scheme read)     |
+| Symptom (last dwmmcd line)                               | Meaning                                                          | Next action                                                                                                                                 |
+| -------------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init failed: Connection timed out` (no CMD*)            | iteration 1: clock update stalled on the IDMAC-state controller  | fixed for iteration 2: full controller reset first (see above)                                                                              |
+| `clock update (ident/data) failed` (CMD readback logged) | CIU never accepts the update (START stuck) or accepts and stalls | iteration 6 fallback engages automatically (`direct clocks:`); capture `cmd`/`status` from the line and compare with U-Boot `md 0xfe32002c` |
+| `CMD0 failed: timeout` (cmd readback logged) | controller not talking: `cmd` START set = CIU rejected it, cleared = stalled | check `post-SRST`/`direct clocks` lines; if CLKENA never latches, toggle the slot power regulator (GPIO) |
+| `CMD8 ok` then `ACMD41 busy timeout` | card never leaves busy; identification clock too slow/fast | change the identification CRU rate (`CLKSEL_400K` = xin24m/30) or compare with U-Boot `mmc dev 1; mmc rescan` |
+| `CMD3 failed` / `card returned RCA 0`                    | RCA handshake broken (unlikely after ACMD41)                     | compare response words with a U-Boot `mmc switch` trace                                                                                     |
+| `data error at block ... rint=0x...` | data CRC/timing at full speed | lower the data rate: larger divider in the CRU `CLKSEL_CON16` data value |
+| `data timeout at block ...`                              | FIFO starvation or DTO never fires                               | check `STATUS` FIFO count in the log line, lower chunk size to 1 block                                                                      |
+| `block 0 signature` not `55aa`                           | reads return garbage (byte order/sync issue)                     | hexdump block 0 from debugsh: `hexdump disk.mmc: 512`? (needs scheme read)                                                                  |
 
 ## First hardware boot (iteration 1, `logs/serial-20261120-082135.log`)
 
@@ -256,7 +270,8 @@ reset completes, and the CIU still refuses to execute the clock update
 (`RINTSTS = 0`: the command never started). The remaining explanation:
 the EFI loader's IDMAC traffic left the CIU wedged mid-command, and the
 BIU-side CTRL reset cannot unwedge it (this also fits the persistent
-`STATUS` bit 9 BUSY).
+`STATUS` bits 12/13 — see the bit-decode correction in the iteration 5
+section below).
 
 Iteration 5 changes (built):
 
@@ -264,19 +279,120 @@ Iteration 5 changes (built):
   any controller access, exactly like Linux `dw_mci_probe` (which gets
   `SRST_SDMMC` via `resets = <&cru SRST_SDMMC>`): SRST_SDMMC = 122 →
   `SOFTRST_CON(7)` bit 10, plus SRST_SD_NOC = 189 → `SOFTRST_CON(11)`
+  `SOFTRST_CON(11)`
   bit 13, assert both, 10 ms, release, 10 ms. Reset lines are hiword
   (mask [31:16], data [15:0], data 1 = assert). Verified from Linux
   `dt-bindings/clock/rk3399-cru.h` (same file in U-Boot v2021.07).
 
+Also corrected a bit-decode error from iteration 4: `STATUS 0x6106` does
+**not** have bit 9 (BUSY) set — `0x6106` = bits 1, 2, 8, 12, 13. Bits 12/13
+are the IDMAC request/acknowledge pair (the trace of U-Boot's DMA reads);
+only bit 2 (FIFO_EMPTY, named in the U-Boot `dwmmc.h`) is a documented
+status bit among the rest.
+
+## Iteration 5 result (`logs/serial-20261120-090926.log`)
+
+The SRST pulse **works** — the controller state visibly changed — but the
+clock update still fails identically:
+
+```text
+dwmmcd: pulsed SRST_SDMMC + SRST_SD_NOC
+dwmmcd: controller reset ok (ctrl was 0x02000000)
+dwmmcd: clock update (stop) failed: Connection timed out rint=0x00000000 status=0x00000106
+```
+
+`STATUS` dropped from `0x6106` to `0x0106`: the SRST cleared the IDMAC
+handshake bits 12/13 (and bit 8), while the FIFO status bits (1, 2)
+remain — i.e. the reset line genuinely resets the block, and the
+controller-reset, clock-gate and SRST theories are all dead as
+explanations for the update failure. What survives scrutiny is the
+failure observation itself: `RINTSTS = 0` on every attempt, on every
+iteration — the CIU never _reports_ anything, not even an error.
+
+The inherited state dump also confirms the full U-Boot clock model on
+this board: `clkdiv=0` (controller bypass) with `sclk_sdmmc sel=0x10e`
+(gpll/15 ≈ 39.6 MHz cclk, ~19.8 MHz card clock) and
+`clkena=0x00010001` (ENABLE | LOW_PWR).
+
+## Iteration 6: the wait mechanism was wrong (root cause found in the U-Boot source)
+
+Re-reading the exact U-Boot that runs on this laptop (v2021.07,
+`drivers/mmc/dw_mmc.c`) turned up the discrepancy that explains every
+iteration so far:
+
+```c
+/* dwmci_setup_bus */
+dwmci_writel(host, DWMCI_CMD, DWMCI_CMD_PRV_DAT_WAIT |
+                DWMCI_CMD_UPD_CLK | DWMCI_CMD_START);
+do {
+        status = dwmci_readl(host, DWMCI_CMD);
+        if (timeout-- < 0) { ... return -ETIMEDOUT; }
+} while (status & DWMCI_CMD_START);
+```
+
+U-Boot waits for a clock update by polling the **CMD START bit
+self-clearing** and never looks at CDONE. This driver polled
+`RINTSTS` for CDONE — which this IP evidently does not raise for
+clock-only commands (`RINTSTS` read 0 on every failed attempt). Every
+"timeout" in iterations 1–5 may therefore have been a measurement
+artifact: the update may have completed while the driver waited for an
+interrupt flag that never comes.
+
+The same source confirms the clocking model (also stated verbatim in the
+`include/dwmmc.h` `get_mmc_clk` documentation: "If you want to handle the
+clock external to DWMMC, use @freq to select the frequency and return
+that value too. Then DWMMC will put itself in bypass mode"):
+
+- `rockchip_dwmmc_get_mmc_clk` calls `clk_set_rate` (CRU) and returns the
+  requested frequency, so `dwmci_setup_bus` always computes `div = 0`
+  (bypass) on rk3399 — the card rate is controlled entirely from the CRU,
+  and the controller divides cclk by 2 internally.
+- A rate change is exactly two clock-update commands (CLKENA 0 → update,
+  CLKENA ENABLE|LOW_PWR → update), not three.
+
+Iteration 6 changes (built, hardware test pending):
+
+- `clk_update_try` now polls `CMD & CMD_START == 0` (U-Boot semantics)
+  instead of `RINTSTS` CDONE.
+- The clock setup is rewritten as the U-Boot rk3399 model: CRU
+  `CLKSEL_CON16` provides the rate (`0x51d` = xin24m/30 → 400 kHz card
+  clock for identification; the inherited `0x10e` for data), controller
+  `CLKDIV` stays 0, and `clkena_cycle` mirrors the two-command
+  `dwmci_setup_bus` sequence.
+- Fallback path: if a clock update still never completes (START stuck),
+  the driver re-resets the controller and programs `CLKDIV/CLKSRC/CLKENA`
+  as plain register writes with no CIU involvement, driving the rate
+  from the CRU only — testing whether the CIU latch is needed at all.
+- Observability: a post-SRST register dump (CTRL/CLKENA/CLKDIV/CLKSRC/
+  STATUS) proves what the pulse reset; CMD0 failures log the CMD register
+  readback (START still set = CIU never accepted the command; START
+  cleared = accepted but stalled); every log line is timestamped
+  (`[s.ss]` since driver start) so step durations are measurable.
+
+Expected outcomes of the next hardware test:
+
+| Outcome                                              | Meaning                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------ |
+| `clksel16 ident-400k: 0x10e -> 0x51d`, updates pass, | iterations 1–5 were the CDONE polling artifact; enumeration  |
+| enumeration completes, `card ready`                  | proceeds at 400 kHz, data at the inherited rate              |
+| updates still fail (START stuck), fallback engages,  | the CIU really is wedged; direct writes bypass it — if the   |
+| `CMD0 failed ... cmd=0x8...` START set               | card answers, no CIU latch is needed at all                  |
+| fallback engages, CMD0 ok but CMD8/ACMD41 timeout    | cclk_out never reached the card (direct CLKENA write did not |
+|                                                      | take effect) — next: card power-cycle via the slot's GPIO    |
+|                                                      | regulator, or GRF SDMMC_CON0/1 phase delays                  |
+
 ## Status
 
-**in progress** — iteration 5 built and flashed-pending:
+**in progress** — iteration 6 built, hardware test pending:
 
 - [x] flashed and booted (iteration 1, 2026-11-20 08:21)
 - [x] dwmmcd enumeration lines seen on UART (node walk, mapping, inherited
       state)
-- [ ] `disk.mmc` scheme registered (iteration 1 failed at clock update;
-      reset-based iteration 2 pending)
+- [x] SRST pulse verified on hardware (iteration 5: STATUS 0x6106 →
+      0x0106, IDMAC bits cleared)
+- [x] clock-update wait mechanism fixed to U-Boot semantics + CRU rate
+      control (iteration 6, pending hardware test)
+- [ ] `disk.mmc` scheme registered
 - [ ] redoxfs mounted the root filesystem
 - [ ] `init: switchroot to /usr /etc`
 - [ ] rootfs userspace (getty/ion) reached
