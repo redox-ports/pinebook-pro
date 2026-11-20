@@ -48,11 +48,22 @@ done
 mkdir -p "$REDOX_DIR/config/aarch64/pinebook-pro"
 cp -f "$OVERLAY_SRC" "$REDOX_DIR/config/aarch64/pinebook-pro/minimal.toml"
 
-# Same for the upstream changes. Idempotent: identical files are skipped and an
-# already-applied diff is reported as up to date, so this normally just verifies
-# the checkout. It matters after a fresh bootstrap or whenever a source tree was
-# reset. Sources that are not fetched yet are skipped (the cookbook clones them
-# during the build).
+# The changes have to be injected after the cookbook has fetched a recipe's
+# sources and before anything is compiled from them, so a fresh tree needs that
+# fetch first. The cookbook skips sources that already exist and leaves local
+# modifications alone, so this is a no-op on every later run.
+for dir in "$REPO_ROOT"/patches/*/; do
+    repo="$(basename "$dir")"
+    [ "$repo" = debug ] && continue
+    [ -d "$REDOX_DIR/recipes/core/$repo/source" ] && continue
+    echo "==> fetching $repo sources"
+    make -C "$REDOX_DIR" "f.$repo"
+done
+
+# Same idea for the upstream changes. Idempotent: identical files are skipped
+# and an already-applied diff is reported as up to date, so this normally just
+# verifies the checkout. It matters after a fresh bootstrap or whenever a source
+# tree was reset.
 echo "==> applying patches"
 "$REPO_ROOT/scripts/apply-patches.sh"
 
