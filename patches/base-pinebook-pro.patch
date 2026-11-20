@@ -2699,10 +2699,10 @@ index 00000000..132e2df7
 +}
 diff --git a/drivers/usb/ohcid/src/main.rs b/drivers/usb/ohcid/src/main.rs
 new file mode 100644
-index 00000000..17f55b33
+index 00000000..f06815f7
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/main.rs
-@@ -0,0 +1,957 @@
+@@ -0,0 +1,976 @@
 +//! ohcid - OHCI host controller driver for the RK3399 USB2 ports.
 +//!
 +//! The Pinebook Pro's internal keyboard and touchpad sit behind a Genesys hub
@@ -2795,7 +2795,8 @@ index 00000000..17f55b33
 +
 +struct Driver {
 +    log: Logger,
-+    hc: Option<Ohci>,
++    /// One entry per controller that was brought up successfully.
++    hcs: Vec<Ohci>,
 +    hids: Vec<HidDevice>,
 +    input: ProducerHandle,
 +}
@@ -2812,7 +2813,7 @@ index 00000000..17f55b33
 +        };
 +        Driver {
 +            log,
-+            hc: None,
++            hcs: Vec::new(),
 +            hids: Vec::new(),
 +            input,
 +        }
@@ -2860,32 +2861,35 @@ index 00000000..17f55b33
 +        hc.power_ports()?;
 +
 +        let ports = hc.num_ports();
-+        let mut en = Enumeration {
-+            hc: &mut hc,
-+            log: &self.log,
-+            next_addr: 1,
-+            next_ed: 4, // slots 0..3 are the control pipe
-+            next_td: 4,
-+            next_slot: 0,
-+            found: Vec::new(),
-+        };
++        let hc_index = self.hcs.len();
++        let found = {
++            let mut en = Enumeration {
++                hc: &mut hc,
++                log: &self.log,
++                hc_index,
++                next_addr: 1,
++                next_ed: 4, // slots 0..3 are the control pipe
++                next_td: 4,
++                next_slot: 0,
++                found: Vec::new(),
++            };
 +
-+        for port in 0..ports {
-+            let status = en.hc.port_status(port);
-+            en.log.log(format_args!(
-+                "ohcid: 0x{:08x}: port {} status 0x{:08x}{}",
-+                base,
-+                port + 1,
-+                status,
-+                if status & 1 != 0 { " (connected)" } else { "" }
-+            ));
-+            if status & 1 == 0 {
-+                continue;
-+            }
++            for port in 0..ports {
++                let status = en.hc.port_status(port);
++                en.log.log(format_args!(
++                    "ohcid: 0x{:08x}: port {} status 0x{:08x}{}",
++                    base,
++                    port + 1,
++                    status,
++                    if status & 1 != 0 { " (connected)" } else { "" }
++                ));
++                if status & 1 == 0 {
++                    continue;
++                }
 +
-+            match en.hc.reset_root_port(port) {
-+                Ok((connected, low_speed, enabled)) => {
-+                    en.log.log(format_args!(
++                match en.hc.reset_root_port(port) {
++                    Ok((connected, low_speed, enabled)) => {
++                        en.log.log(format_args!(
 +                        "ohcid: 0x{:08x}: port {} reset (connected {}, low-speed {}, enabled {})",
 +                        base,
 +                        port + 1,
@@ -2893,30 +2897,31 @@ index 00000000..17f55b33
 +                        low_speed,
 +                        enabled
 +                    ));
-+                    if !connected {
-+                        continue;
++                        if !connected {
++                            continue;
++                        }
++                        // USB 2.0, 7.1.7.5: 2 ms of recovery, generously padded.
++                        en.hc.delay_ms(20);
++                        if let Err(err) = en.enumerate_at_zero(low_speed, 0) {
++                            en.log.log(format_args!(
++                                "ohcid: 0x{:08x}: port {} enumeration failed: {:?}",
++                                base,
++                                port + 1,
++                                err
++                            ));
++                        }
 +                    }
-+                    // USB 2.0, 7.1.7.5: 2 ms of recovery, generously padded.
-+                    en.hc.delay_ms(20);
-+                    if let Err(err) = en.enumerate_at_zero(low_speed, 0) {
-+                        en.log.log(format_args!(
-+                            "ohcid: 0x{:08x}: port {} enumeration failed: {:?}",
-+                            base,
-+                            port + 1,
-+                            err
-+                        ));
-+                    }
++                    Err(err) => en.log.log(format_args!(
++                        "ohcid: 0x{:08x}: port {} reset failed: {:?}",
++                        base,
++                        port + 1,
++                        err
++                    )),
 +                }
-+                Err(err) => en.log.log(format_args!(
-+                    "ohcid: 0x{:08x}: port {} reset failed: {:?}",
-+                    base,
-+                    port + 1,
-+                    err
-+                )),
 +            }
-+        }
 +
-+        let found = en.found;
++            en.found
++        };
 +        self.log.log(format_args!(
 +            "ohcid: 0x{:08x}: {} HID device(s)",
 +            base,
@@ -2924,18 +2929,19 @@ index 00000000..17f55b33
 +        ));
 +        self.hids.extend(found);
 +        // Keep the controller alive for the poll loop.
-+        self.hc = Some(hc);
++        self.hcs.push(hc);
 +        Ok(())
 +    }
 +
 +    fn poll_forever(&mut self) -> ! {
++        // Disjoint field borrows: each device polls its own controller.
++        let hcs = &mut self.hcs;
++        let hids = &mut self.hids;
++        let input = &mut self.input;
++        let log = &self.log;
 +        loop {
-+            for hid in self.hids.iter_mut() {
-+                hid.poll(
-+                    self.hc.as_mut().expect("controller"),
-+                    &mut self.input,
-+                    &self.log,
-+                );
++            for hid in hids.iter_mut() {
++                hid.poll(&mut hcs[hid.hc_index], input, log);
 +            }
 +            thread::yield_now();
 +        }
@@ -2987,6 +2993,7 @@ index 00000000..17f55b33
 +struct Enumeration<'a> {
 +    hc: &'a mut Ohci,
 +    log: &'a Logger,
++    hc_index: usize,
 +    next_addr: u8,
 +    next_ed: usize,
 +    next_td: usize,
@@ -3355,6 +3362,7 @@ index 00000000..17f55b33
 +        ));
 +
 +        self.found.push(HidDevice {
++            hc_index: self.hc_index,
 +            ed,
 +            td,
 +            dummy,
@@ -3400,6 +3408,7 @@ index 00000000..17f55b33
 +fn find_hid_keyboard(config: &[u8]) -> Option<HidInfo> {
 +    let mut i = 0usize;
 +    let mut current: Option<(u8, u8)> = None;
++    let mut fallback: Option<HidInfo> = None;
 +    while i + 2 <= config.len() {
 +        let len = usize::from(config[i]);
 +        if len < 2 || i + len > config.len() {
@@ -3423,23 +3432,33 @@ index 00000000..17f55b33
 +                let is_in = address & 0x80 != 0;
 +                if is_interrupt && is_in {
 +                    let mps = u16::from_le_bytes([config[i + 4], config[i + 5]]) & 0x07ff;
-+                    return Some(HidInfo {
++                    let info = HidInfo {
 +                        interface,
 +                        protocol,
 +                        ep_address: address,
 +                        ep_number: address & 0x0f,
 +                        ep_mps: mps,
 +                        ep_interval: config[i + 6],
-+                    });
++                    };
++                    // A boot keyboard (protocol 1) is the best match; other
++                    // HID interfaces (consumer control, mouse) are only kept
++                    // as a fallback.
++                    if protocol == 1 {
++                        return Some(info);
++                    }
++                    if fallback.is_none() {
++                        fallback = Some(info);
++                    }
 +                }
 +            }
 +        }
 +        i += len;
 +    }
-+    None
++    fallback
 +}
 +
 +struct HidDevice {
++    hc_index: usize,
 +    ed: usize,
 +    td: usize,
 +    dummy: usize,
@@ -3662,10 +3681,10 @@ index 00000000..17f55b33
 +}
 diff --git a/drivers/usb/ohcid/src/ohci.rs b/drivers/usb/ohcid/src/ohci.rs
 new file mode 100644
-index 00000000..d580931b
+index 00000000..24595669
 --- /dev/null
 +++ b/drivers/usb/ohcid/src/ohci.rs
-@@ -0,0 +1,641 @@
+@@ -0,0 +1,652 @@
 +//! Minimal Open Host Controller Interface (OHCI) driver core.
 +//!
 +//! Register layout and descriptor bit fields follow the OHCI 1.0a
@@ -3908,11 +3927,11 @@ index 00000000..d580931b
 +        self.write(REG_HCCA, hcca_phys as u32);
 +
 +        // Frame timing: 11999 means one frame every 1 ms. FSMPS (largest
-+        // packet) is derived from the interval like Linux does.
++        // packet) and PeriodicStart follow Linux `periodic_reinit()`.
 +        let fi = 0x2edfu32;
 +        let fsmps = (fi - 210) * 6 / 7;
 +        self.write(REG_FMINTERVAL, (fsmps << 16) | fi);
-+        self.write(REG_PERIODICSTART, fi * 9 / 10);
++        self.write(REG_PERIODICSTART, fsmps * 9 / 10);
 +        self.write(REG_LSTHRESH, 0x628);
 +
 +        // Go operational with all three lists enabled; the driver toggles
@@ -3980,6 +3999,15 @@ index 00000000..d580931b
 +                if status & RH_PS_CSC != 0 {
 +                    self.write(reg, RH_PS_CSC);
 +                }
++                let mut status = self.read(reg);
++                // The OHCI root hub leaves enabling to software: after a
++                // successful reset the port must be enabled explicitly
++                // (SetPortFeature(PORT_ENABLE) == writing PES).
++                if status & RH_PS_PES == 0 {
++                    self.write(reg, RH_PS_PES);
++                    self.delay_ms(10);
++                    status = self.read(reg);
++                }
 +                let connected = status & RH_PS_CCS != 0;
 +                let low_speed = status & RH_PS_LSDA != 0;
 +                let enabled = status & RH_PS_PES != 0;
@@ -4014,7 +4042,6 @@ index 00000000..d580931b
 +    pub fn ed_phys(&self, index: usize) -> usize {
 +        self.eds.physical() + index * size_of::<Ed>()
 +    }
-+
 +
 +    fn td_mut(&mut self, index: usize) -> &mut Td {
 +        &mut self.tds[index]
@@ -4133,8 +4160,10 @@ index 00000000..d580931b
 +            );
 +        }
 +
-+        // Status stage: opposite direction, DATA1, zero length.
-+        let status_info = if data_in || data_len == 0 {
++        // Status stage: opposite direction to the data stage, DATA1,
++        // zero length. With no data stage the status stage is an IN.
++        // (Linux `td_submit_urb`: `(is_out || !data_len) ? DP_IN : DP_OUT`.)
++        let status_info = if data_in && data_len > 0 {
 +            TD_CC | TD_DP_OUT | TD_T_DATA1
 +        } else {
 +            TD_CC | TD_DP_IN | TD_T_DATA1
@@ -4193,6 +4222,11 @@ index 00000000..d580931b
 +                    return Err(Error::Halted);
 +                }
 +                return Err(Error::Td(cc));
++            }
++            // A STALL or an error halts the ED instead of retiring the last
++            // TD, so watch the halt bit as well.
++            if self.ed(ed_index).head & 0x1 != 0 {
++                return Err(Error::Halted);
 +            }
 +            if now_ms() >= deadline {
 +                return Err(Error::Timeout("transfer descriptor"));
@@ -4291,10 +4325,6 @@ index 00000000..d580931b
 +            0
 +        }
 +    }
-+
-+
-+
-+
 +}
 +
 +pub fn now_ms() -> u64 {
