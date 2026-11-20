@@ -123,3 +123,43 @@ before `entry_fn(args)`: `dc civac` for every data-cache line of the image, then
 `dsb sy`, `ic iallu`, `dsb sy`, `isb`.
 
 Status: built and QEMU-tested (smoke test green), hardware check pending.
+
+## Iteration 3 — the kernel's first instruction never ran (2026-11-20 21:51)
+
+A build with **one single marker** (`A`, the first instruction of `kstart`, before the
+BSS test and the stack setup) produced **no `A` at all** (`logs/serial-20261120-215145.log`,
+checked byte-by-byte with `od`). The marker is a plain MMIO store to the UART through the
+physmap, the same code that printed `ABCDEF` in the working run. So in that boot the
+kernel either never started, or its very first store never reached the port.
+
+### What actually differs between the working run and the failures
+
+| Time  | Bootloader                             | Kernel           | Result                   |
+| ----- | -------------------------------------- | ---------------- | ------------------------ |
+| 19:59 | old (firmware-clock menu)              | stale `0x17ecb8` | silent (explained above) |
+| 20:37 | old + UART dump                        | markers A…P      | **boots to login**       |
+| 21:11 | + arch-counter menu (10 ms units)      | clean            | silent                   |
+| 21:35 | + arch-counter menu (µs) + cache clean | clean            | silent                   |
+| 21:51 | + arch-counter menu (µs) + cache clean | marker `A` only  | silent, **no `A`**       |
+
+Every boot after 20:37 carries the two bootloader changes made that evening (the
+architected-counter menu clock at 20:22 and the cache clean at 21:23). The arch-counter
+path is **never executed in QEMU** (QEMU runs the bootloader at EL1, the code requires
+EL2), so it was only ever exercised on hardware — in the three failing boots.
+
+Build determinism was re-verified (`touch` + rebuild gives an identical binary), the
+marker-A kernel was disassembled (`kstart` and the `bl early_marker` are correct, `start`
+resolved), and the kernel bytes were found intact inside the flashed image, so neither a
+broken artifact nor a bad handoff address explains the missing `A`.
+
+### Next experiment
+
+Two images isolate the remaining variables (both with the clean kernel):
+
+1. `build/diag-oldboot-clean.img` — bootloader reverted to the state that worked at 20:37
+   (firmware-clock menu, no UART dump, no cache clean);
+2. `build/diag-oldboot.img` — the same plus the read-only UART dump.
+
+Interpretation: if (1) boots, one of the two bootloader changes broke the handover; if
+only (2) boots, the dump itself matters; if both stay silent, the marker code in the
+kernel is required for the boot and the marker side effects must be understood.
