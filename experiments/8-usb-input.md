@@ -26,25 +26,30 @@ Three conclusions:
 
 1. **Only OHCI buses are registered.** There is no `USB EHCI 1.00` line, even
    though all four host nodes (`usb_host0/1_ehci/ohci`) are `status = "okay"` in
-   U-Boot's `rk3399-pinebook-pro.dts`. The EHCI halves are therefore not
-   initialised on this board, so the USB2 PHYs and ports stay routed to the
-   companion OHCI controllers and *every* device — including the hub — operates
-   at full speed. An OHCI driver alone is enough; EHCI split transactions are
-   not needed.
-2. `usb@fe3e0000` is `usb_host0_ohci` (the internal hub with 4 devices);
-   `usb@fe3a0000` is `usb_host1_ohci`.
-3. `CONFIG_USB_EHCI_HCD` being unusable here is a property of the installed
-   firmware, not of the SoC: nothing in Redox depends on it.
+   U-Boot's `rk3399-pinebook-pro.dts`. **Inferred:** the EHCI halves either
+   failed to probe or are not built into this U-Boot (`CONFIG_USB_EHCI_HCD`),
+   and since U-Boot enumerated the hub and its devices on the OHCI bus, the
+   whole tree is running at full speed there. For Redox this means an OHCI
+   driver alone is enough — EHCI split transactions are not needed. The exact
+   reason is not verified; only the observed state matters here.
+2. `usb@fe3e0000` is **`usb_host1_ohci`** (the internal hub: 4 devices);
+   `usb@fe3a0000` is **`usb_host0_ohci`** (2 devices). The EHCI companions are
+   `usb@fe3c0000` and `usb@fe380000` respectively (`rk3399.dtsi`; Linux and
+   U-Boot agree). The DT compatible string is `generic-ohci`, not a
+   Rockchip-specific one.
+3. The driver does **not** depend on that inference being the whole story: if a
+   port were routed to EHCI, OHCI would simply report no connection and the
+   log would say so (`port N status 0x...`, no `(connected)`).
 
 ## Design
 
 New initfs daemon `drivers/usb/ohcid` (static binary, `40_ohcid.service`,
 `condition_architecture = ["aarch64"]`, part of `40_drivers.target`).
 
-- **Node selection:** `reg` address `0xfe3e0000` / `0xfe3a0000`, cross-checked
-  against the `rockchip,rk3399-ohci` nodes in the devicetree when it is
-  available. If the DTB has no such nodes the driver falls back to the known
-  addresses; it never probes by index.
+- **Node selection:** `reg` address `0xfe3e0000` (internal hub) and
+  `0xfe3a0000`, cross-checked against the `generic-ohci` nodes in the
+  devicetree when it is available. If the DTB has no such nodes the driver
+  falls back to the known addresses; it never probes by index.
 - **Registers:** mapped with `common::physmap(..., MemoryType::DeviceMemory)`,
   layout and bit fields from the OHCI 1.0a spec and Linux
   `drivers/usb/host/ohci.h` (identical to U-Boot's `ohci.h`).
