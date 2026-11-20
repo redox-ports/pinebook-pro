@@ -27,12 +27,18 @@
 #                        the compatible string; the eMMC at fe330000 holds
 #                        the baseline OS and must never be probed). FIFO/PIO
 #                        mode only, polled, no IDMAC and no controller
-#                        interrupts (U-Boot fifo_mode model). Clock strategy:
-#                        U-Boot leaves the CRU cclk and the CIU dividers in
-#                        a working state, so the driver only reprograms
-#                        CLKDIV through the CIU clock-update command to slow
-#                        the card into the 100-400 kHz identification window
-#                        and restores the inherited divider afterwards. All
+#                        interrupts (U-Boot fifo_mode model). Clock strategy
+#                        (iteration 6, U-Boot rk3399 model): controller
+#                        CLKDIV stays 0 (bypass, internal /2) and the card
+#                        rate comes from CRU CLKSEL_CON16 (xin24m/30 = 400
+#                        kHz identification, the U-Boot-inherited value for
+#                        data); CLKENA changes are wrapped in two CIU
+#                        clock-update commands, each awaited by polling the
+#                        CMD START bit exactly like dwmci_setup_bus (U-Boot
+#                        v2021.07 never waits for CDONE on clock-only
+#                        commands; neither does this IP raise it). If an
+#                        update never completes, the driver falls back to
+#                        plain register writes with no CIU involvement. All
 #                        timeouts use the kernel monotonic clock so a dead
 #                        card cannot hang the boot. Register map follows
 #                        Linux drivers/mmc/host/dw_mmc.h and U-Boot v2021.07
@@ -606,10 +612,10 @@ index 00000000..1461a920
 +workspace = true
 diff --git a/drivers/storage/dwmmcd/src/dwmmc.rs b/drivers/storage/dwmmcd/src/dwmmc.rs
 new file mode 100644
-index 00000000..baac3fd1
+index 00000000..bcd6455b
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/dwmmc.rs
-@@ -0,0 +1,1215 @@
+@@ -0,0 +1,1358 @@
 +//! Synopsys DesignWare Mobile Storage Host Controller (dw_mshc) driver for
 +//! the Rockchip RK3399 microSD slot (`sdmmc@fe320000`).
 +//!
@@ -619,14 +625,16 @@ index 00000000..baac3fd1
 +//! controller interrupts, everything is polled. This mirrors the U-Boot
 +//! `fifo_mode` code path.
 +//!
-+//! Clocking strategy (bring-up, "inherited state"): U-Boot leaves the CRU
-+//! `cclk_sdmmc` rate and the controller dividers in a state that just read
-+//! the ESP and the kernel from this card. This driver never touches the CRU
-+//! or `CLKSRC` semantics; it only reprograms `CLKDIV` (through the CIU
-+//! clock-update command) to slow the card clock into the identification
-+//! window, and restores the inherited divider afterwards. If the card fails
-+//! to enumerate the driver exits and init continues without a `disk.mmc`
-+//! scheme.
++//! Clocking strategy (bring-up): the U-Boot rk3399 model. The controller
++//! `CLKDIV` stays at 0 (bypass — the block divides cclk by 2 internally)
++//! and the card rate comes entirely from the CRU `CLKSEL_CON16`
++//! (identification at xin24m/30, data at the U-Boot-inherited rate).
++//! U-Boot's `dwmci_setup_bus` wraps the CLKENA register in two CIU
++//! clock-update commands and waits for each by polling the CMD START bit;
++//! this driver does the same, and falls back to plain register writes
++//! with no CIU involvement if the updates never complete. If the card
++//! still fails to enumerate the driver exits and init continues without
++//! a `disk.mmc` scheme.
 +
 +use core::fmt;
 +
@@ -802,10 +810,20 @@ index 00000000..baac3fd1
 +/// Upper bound for a single PIO data command (blocks per CMD18/CMD25).
 +const MAX_BLOCKS_PER_COMMAND: u64 = 8;
 +
-+/// Divider applied on top of the inherited one while identifying the card:
-+/// the inherited state runs at SD high speed (<= 50 MHz card clock), and
-+/// cclk/(2*128) lands inside the 100-400 kHz identification window.
-+const INIT_CLKDIV: u32 = 64;
++/// SCLK_SDMMC rate targets, written straight into CLKSEL_CON16 (a plain
++/// read-modify-write register, unlike the hiword gate/reset registers).
++/// Layout: mux bits [10:8] (0=cpll, 1=gpll, 2=npll, 3=ppll, 4=upll,
++/// 5=xin24m), divider bits [6:0] with div = reg + 1. With controller
++/// CLKDIV = 0 the block divides cclk by 2 internally (U-Boot rk3399:
++/// "dwmmc controller have internal div 2, provide double in cru"), so the
++/// card sees half the CRU rate.
++/// Identification: xin24m / 30 / 2 = 400 kHz (U-Boot writes 0x51d here).
++const CLKSEL_400K: u32 = 0x51d;
++/// Data-rate fallback: gpll (594 MHz) / 12 / 2 = 24.75 MHz, SD default
++/// speed. Normally the inherited CLKSEL_CON16 (the rate U-Boot read the
++/// ESP at) is preferred; this constant only covers an implausible
++/// inherited value.
++const CLKSEL_DATA: u32 = 0x10b;
 +
 +pub struct DwmmcRegs {
 +    base: *mut u32,
@@ -925,6 +943,11 @@ index 00000000..baac3fd1
 +    pub size: u64,
 +    inherited_clkdiv: u32,
 +    inherited_ctrl: u32,
++    /// CLKSEL_CON16 as left by U-Boot (the working data-transfer rate).
++    inherited_clksel16: u32,
++    /// True when card rates are driven by plain CRU writes because CIU
++    /// clock-update commands never complete.
++    cru_clocking: bool,
 +    log: Logger,
 +}
 +
@@ -947,6 +970,8 @@ index 00000000..baac3fd1
 +            size: 0,
 +            inherited_clkdiv: 0,
 +            inherited_ctrl: 0,
++            inherited_clksel16: 0,
++            cru_clocking: false,
 +            log,
 +        }
 +    }
@@ -1045,8 +1070,25 @@ index 00000000..baac3fd1
 +            self.log
 +                .log(format_args!("dwmmcd: pulsed SRST_SDMMC + SRST_SD_NOC"));
 +
++            // Prove the pulse reset the controller block: the CIU-side
++            // clock registers should now read their reset defaults
++            // (CLKENA 0) instead of the U-Boot-inherited state.
++            {
++                let regs = self.regs.read().unwrap();
++                self.log.log(format_args!(
++                    "dwmmcd: post-SRST ctrl=0x{:08x} clkena=0x{:08x} clkdiv={} (was {}) clksrc={} status=0x{:08x}",
++                    regs.read(CTRL),
++                    regs.read(CLKENA),
++                    regs.read(CLKDIV),
++                    self.inherited_clkdiv,
++                    regs.read(CLKSRC),
++                    regs.read(STATUS)
++                ));
++            }
++
 +            let sel13 = cru.read(CRU_CLKSEL_CON13_HCLK_SD);
 +            let sel16 = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            self.inherited_clksel16 = sel16;
 +            let gate6 = cru.read(SDMMC_CIU_GATE_CON);
 +            let gate12 = cru.read(HCLK_SD_GATE_CON);
 +            let gate33 = cru.read(HCLK_SDMMC_GATE_CON);
@@ -1084,28 +1126,19 @@ index 00000000..baac3fd1
 +                self.log.log(format_args!(
 +                    "dwmmcd: sclk_sdmmc gate closed, enabling"
 +                ));
-+                cru.write(
-+                    SDMMC_CIU_GATE_CON,
-+                    (1 << 16 + SDMMC_CIU_GATE_BIT),
-+                );
++                cru.write(SDMMC_CIU_GATE_CON, 1 << 16 + SDMMC_CIU_GATE_BIT);
 +            }
 +            if gate12 & HCLK_SD_GATE_BIT != 0 {
 +                self.log.log(format_args!(
 +                    "dwmmcd: hclk_sd gate closed, enabling"
 +                ));
-+                cru.write(
-+                    HCLK_SD_GATE_CON,
-+                    (1 << 16 + HCLK_SD_GATE_BIT),
-+                );
++                cru.write(HCLK_SD_GATE_CON, 1 << 16 + HCLK_SD_GATE_BIT);
 +            }
 +            if gate33 & HCLK_SDMMC_GATE_BIT != 0 {
 +                self.log.log(format_args!(
 +                    "dwmmcd: hclk_sdmmc gate closed, enabling"
 +                ));
-+                cru.write(
-+                    HCLK_SDMMC_GATE_CON,
-+                    (1 << 16 + HCLK_SDMMC_GATE_BIT),
-+                );
++                cru.write(HCLK_SDMMC_GATE_CON, 1 << 16 + HCLK_SDMMC_GATE_BIT);
 +            }
 +        }
 +    }
@@ -1164,46 +1197,135 @@ index 00000000..baac3fd1
 +        Ok(())
 +    }
 +
-+    /// Reprogram CLKDIV through the CIU clock-update sequence (stop clock,
-+    /// write divider, restart). The clock-update "command" only talks to
-+    /// the CIU, never to the card (U-Boot dwmci_update_div).
-+    fn set_clkdiv(&mut self, div: u32) -> Result<()> {
++    /// Stop and restart cclk around a register change, exactly U-Boot
++    /// dwmci_setup_bus: CLKENA 0, dividers to bypass, one clock-update
++    /// command, CLKENA enable, a second clock-update command. The
++    /// clock-update "command" only talks to the CIU, never to the card.
++    fn clkena_cycle(&mut self, stage: &str) -> Result<()> {
 +        let regs = self.regs.read().unwrap();
 +        unsafe {
 +            regs.write(CLKENA, 0);
-+            if let Err(err) = clk_update(&regs, "stop") {
-+                self.log.log(format_args!(
-+                    "dwmmcd: clock update (stop) failed: {} rint=0x{:08x} status=0x{:08x}",
-+                    err,
-+                    regs.read(RINTSTS),
-+                    regs.read(STATUS)
-+                ));
-+                return Err(err);
-+            }
-+
-+            regs.write(CLKDIV, div);
 +            regs.write(CLKSRC, 0); // slot 0
-+            if let Err(err) = clk_update(&regs, "div") {
-+                self.log.log(format_args!(
-+                    "dwmmcd: clock update (div={}) failed: {} rint=0x{:08x} status=0x{:08x}",
-+                    div,
-+                    err,
-+                    regs.read(RINTSTS),
-+                    regs.read(STATUS)
-+                ));
++            regs.write(CLKDIV, 0); // bypass: the rate comes from the CRU
++            if let Err(err) = clk_update(&regs) {
++                self.log_update_failure(stage, &err);
 +                return Err(err);
 +            }
-+
 +            regs.write(CLKENA, CLKENA_ENABLE | CLKENA_LOW_PWR);
-+            if let Err(err) = clk_update(&regs, "start") {
-+                self.log.log(format_args!(
-+                    "dwmmcd: clock update (start) failed: {} rint=0x{:08x} status=0x{:08x}",
-+                    err,
-+                    regs.read(RINTSTS),
-+                    regs.read(STATUS)
-+                ));
++            if let Err(err) = clk_update(&regs) {
++                self.log_update_failure(stage, &err);
 +                return Err(err);
 +            }
++        }
++        Ok(())
++    }
++
++    fn log_update_failure(&self, stage: &str, err: &Error) {
++        let regs = self.regs.read().unwrap();
++        self.log.log(format_args!(
++            "dwmmcd: clock update ({}) failed: {} cmd=0x{:08x} rint=0x{:08x} status=0x{:08x}",
++            stage,
++            err,
++            unsafe { regs.read(CMD) },
++            unsafe { regs.read(RINTSTS) },
++            unsafe { regs.read(STATUS) }
++        ));
++    }
++
++    /// Reprogram SCLK_SDMMC through CLKSEL_CON16 — the U-Boot
++    /// rk3399_mmc_set_clk way to change the card rate. The register is
++    /// plain (not hiword): read it, keep the upper bits, replace mux+div.
++    fn cru_set_clksel(&mut self, value: u32, label: &str) -> Result<()> {
++        let guard = self.cru.read().unwrap();
++        let cru = match guard.as_ref() {
++            Some(cru) => cru,
++            None => {
++                self.log
++                    .log(format_args!("dwmmcd: CRU not mapped, cannot set clksel"));
++                return Err(Error::new(EIO));
++            }
++        };
++        unsafe {
++            let old = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            let new = (old & !0x7ff) | value;
++            cru.write(CRU_CLKSEL_CON16_SCLK_SDMMC, new);
++            let readback = cru.read(CRU_CLKSEL_CON16_SCLK_SDMMC);
++            self.log.log(format_args!(
++                "dwmmcd: clksel16 {}: 0x{:08x} -> 0x{:08x}",
++                label, old, readback
++            ));
++            if readback != new {
++                return Err(Error::new(EIO));
++            }
++        }
++        Ok(())
++    }
++
++    /// The data-rate CLKSEL_CON16 value: the inherited one (the state
++    /// U-Boot used to read the ESP and the kernel from this card), or the
++    /// gpll/12 default when the inherited value looks implausible
++    /// (bypass divider or reserved mux).
++    fn data_clksel(&self) -> u32 {
++        let value = self.inherited_clksel16 & 0x7ff;
++        let mux = (value >> 8) & 0x7;
++        let div = value & 0x7f;
++        if mux > 5 || div == 0 {
++            CLKSEL_DATA
++        } else {
++            value
++        }
++    }
++
++    /// Primary clock setup, mirroring U-Boot dwmci_setup_bus on rk3399:
++    /// the CRU provides the rate first (400 kHz identification), then the
++    /// CLKENA off/on pair of CIU clock-update commands latches it.
++    fn setup_clocks_primary(&mut self) -> Result<()> {
++        self.cru_set_clksel(CLKSEL_400K, "ident-400k")?;
++        self.clkena_cycle("ident")
++    }
++
++    /// Fallback clock setup when CIU clock-update commands never
++    /// complete: re-reset the controller (drops any half-written
++    /// command), rebuild the polling-driver register state, then program
++    /// the clock registers as plain writes with no CIU involvement and
++    /// set the rate from the CRU.
++    fn clocks_direct(&mut self) -> Result<()> {
++        self.controller_setup()?;
++        {
++            let regs = self.regs.read().unwrap();
++            unsafe {
++                regs.write(CLKDIV, 0);
++                regs.write(CLKSRC, 0);
++                regs.write(CLKENA, CLKENA_ENABLE | CLKENA_LOW_PWR);
++                self.log.log(format_args!(
++                    "dwmmcd: direct clocks: clkdiv={} clksrc={} clkena=0x{:08x}",
++                    regs.read(CLKDIV),
++                    regs.read(CLKSRC),
++                    regs.read(CLKENA)
++                ));
++            }
++        }
++        self.cru_set_clksel(CLKSEL_400K, "ident-400k")
++    }
++
++    /// Switch to the data rate before the first data command. U-Boot path:
++    /// CRU rate, then the CLKENA cycle. Direct path: CRU rate only —
++    /// U-Boot also rewrites CLKSEL_CON with cclk running (its clk_set_rate
++    /// runs before the CLKENA stop), so a live clock survives this.
++    fn set_data_rate(&mut self) -> Result<()> {
++        let value = self.data_clksel();
++        if self.cru_clocking {
++            return self.cru_set_clksel(value, "data-rate");
++        }
++        self.cru_set_clksel(value, "data-rate")?;
++        if let Err(err) = self.clkena_cycle("data") {
++            self.log.log(format_args!(
++                "dwmmcd: data-rate clock update failed ({}), switching to direct clocking",
++                err
++            ));
++            self.cru_clocking = true;
++            let regs = self.regs.read().unwrap();
++            unsafe { regs.write(CLKENA, CLKENA_ENABLE | CLKENA_LOW_PWR) };
 +        }
 +        Ok(())
 +    }
@@ -1326,9 +1448,19 @@ index 00000000..baac3fd1
 +
 +    /// Full SD card enumeration: idle -> identify -> address -> select.
 +    fn card_init(&mut self) -> Result<()> {
-+        // Identification must run at 100-400 kHz. Slow the inherited clock
-+        // down by reprogramming CLKDIV only.
-+        self.set_clkdiv(INIT_CLKDIV)?;
++        // Identification must run at 100-400 kHz. U-Boot's rk3399 model:
++        // CLKDIV stays 0 and the rate comes from the CRU. Try the U-Boot
++        // sequence (CRU rate, two clock-update commands); when the CIU
++        // never accepts an update, fall back to plain register writes
++        // with no CIU involvement at all.
++        if let Err(err) = self.setup_clocks_primary() {
++            self.log.log(format_args!(
++                "dwmmcd: U-Boot clock sequence failed ({}), falling back to direct clocking",
++                err
++            ));
++            self.cru_clocking = true;
++            self.clocks_direct()?;
++        }
 +
 +        // Software-reset the internal DMA engine now, after the clocks are
 +        // settled (U-Boot writes BMOD = 1 after setup_bus, not before), so
@@ -1341,8 +1473,17 @@ index 00000000..baac3fd1
 +        // CMD0: go to idle. No response; a failure here means the
 +        // controller cannot talk to the bus at all.
 +        if let Err(err) = self.send_cmd(CMD0_GO_IDLE, 0, Response::None) {
-+            self.log
-+                .log(format_args!("dwmmcd: CMD0 failed: {}", err));
++            // The CMD register readback separates the two failure modes:
++            // START still set means the CIU never accepted the command;
++            // START cleared without command-done means it did and stalled.
++            let regs = self.regs.read().unwrap();
++            self.log.log(format_args!(
++                "dwmmcd: CMD0 failed: {} cmd=0x{:08x} rint=0x{:08x} status=0x{:08x}",
++                err,
++                unsafe { regs.read(CMD) },
++                unsafe { regs.read(RINTSTS) },
++                unsafe { regs.read(STATUS) }
++            ));
 +            return Err(Error::new(EIO));
 +        }
 +
@@ -1457,9 +1598,10 @@ index 00000000..baac3fd1
 +            }
 +        }
 +
-+        // Restore the inherited (full-speed) divider before selecting the
-+        // card, so the first data command already runs at data rate.
-+        self.set_clkdiv(self.inherited_clkdiv)?;
++        // Back to the data rate before selecting the card, so the first
++        // data command already runs full speed (CRU-side switch; the
++        // controller stays at CLKDIV 0/bypass).
++        self.set_data_rate()?;
 +
 +        // CMD7: select the card, moving it to transfer state.
 +        self.send_cmd(CMD7_SELECT_CARD, self.rca << 16, Response::Short)
@@ -1730,8 +1872,12 @@ index 00000000..baac3fd1
 +    }
 +}
 +
-+/// CIU clock-update command: start a CMD with only UPD_CLK set and wait for
-+/// command-done. Never reaches the card (U-Boot dwmci_control_clken).
++/// CIU clock-update command: start a CMD with only UPD_CLK set and wait
++/// for the CIU to accept it. Never reaches the card (U-Boot
++/// dwmci_setup_bus). Completion is the CMD START bit clearing — U-Boot
++/// polls exactly that and never waits for CDONE; on this IP a
++/// clock-only command does not raise CDONE in RINTSTS (iterations 2-5 of
++/// experiment 6 timed out on every update with a clean RINTSTS).
 +unsafe fn clk_update_try(regs: &DwmmcRegs, prv_dat_wait: bool) -> Result<()> {
 +    unsafe {
 +        regs.write(RINTSTS, 0xffff_ffff);
@@ -1750,9 +1896,12 @@ index 00000000..baac3fd1
 +
 +        let deadline = now_ms() + CLK_UPDATE_TIMEOUT_MS;
 +        loop {
-+            let rint = regs.read(RINTSTS);
-+            if rint & INT_CDONE != 0 {
-+                regs.write(RINTSTS, INT_CDONE);
++            // U-Boot completion check: the CIU accepts the command by
++            // clearing START (dwmci_setup_bus polls this bit).
++            if regs.read(CMD) & CMD_START == 0 {
++                // Clear whatever the CIU did raise so no stale state
++                // leaks into the next command wait.
++                regs.write(RINTSTS, 0xffff_ffff);
 +                return Ok(());
 +            }
 +            if now_ms() > deadline {
@@ -1762,7 +1911,7 @@ index 00000000..baac3fd1
 +    }
 +}
 +
-+unsafe fn clk_update(regs: &DwmmcRegs, stage: &str) -> Result<()> {
++unsafe fn clk_update(regs: &DwmmcRegs) -> Result<()> {
 +    unsafe {
 +        if clk_update_try(regs, true).is_ok() {
 +            return Ok(());
@@ -1827,10 +1976,10 @@ index 00000000..baac3fd1
 +}
 diff --git a/drivers/storage/dwmmcd/src/log.rs b/drivers/storage/dwmmcd/src/log.rs
 new file mode 100644
-index 00000000..3563380d
+index 00000000..850c96d5
 --- /dev/null
 +++ b/drivers/storage/dwmmcd/src/log.rs
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,71 @@
 +//! Bring-up logging for dwmmcd.
 +//!
 +//! stdout/stderr of initfs daemons go to the `log` scheme, which lives in
@@ -1849,10 +1998,25 @@ index 00000000..3563380d
 +
 +pub struct Logger {
 +    uart: Mutex<Option<std::fs::File>>,
++    start_ms: u64,
++}
++
++fn now_ms() -> u64 {
++    let mut ts = syscall::TimeSpec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    // Best effort: a broken time scheme degrades the timestamps to zero
++    // instead of panicking inside Logger::new.
++    if syscall::clock_gettime(syscall::flag::CLOCK_MONOTONIC, &mut ts).is_err() {
++        return 0;
++    }
++    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 +}
 +
 +impl Logger {
 +    pub fn new() -> Self {
++        let start_ms = now_ms();
 +        let uart = match OpenOptions::new()
 +            .write(true)
 +            .custom_flags(flag::O_WRONLY | flag::O_CLOEXEC)
@@ -1868,6 +2032,7 @@ index 00000000..3563380d
 +        };
 +        Logger {
 +            uart: Mutex::new(uart),
++            start_ms,
 +        }
 +    }
 +
@@ -1876,7 +2041,10 @@ index 00000000..3563380d
 +    /// debug scheme, so writing both duplicates every line on the serial
 +    /// console (observed in experiment 6).
 +    pub fn log(&self, args: core::fmt::Arguments) {
-+        let line = format!("{}\n", args);
++        // Seconds since driver start, so the serial capture shows how long
++        // each bring-up step actually takes.
++        let elapsed = (now_ms().saturating_sub(self.start_ms)) as f64 / 1000.0;
++        let line = format!("[{:8.3}] {}\n", elapsed, args);
 +        if let Some(uart) = self.uart.lock().unwrap().as_mut() {
 +            let _ = uart.write_all(line.as_bytes());
 +            let _ = uart.flush();
