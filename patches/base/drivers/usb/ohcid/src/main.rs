@@ -393,19 +393,47 @@ impl<'a> Enumeration<'a> {
     /// Enumerate the device that currently answers at address 0.
     /// `depth` is 0 for a root port device, 1 for a hub downstream port.
     fn enumerate_at_zero(&mut self, low_speed: bool, depth: u8) -> Result<(), Error> {
-        // First 8 bytes: enough to learn wMaxPacketSize0.
+        // First 8 bytes: enough to learn wMaxPacketSize0. Some devices — the
+        // internal Genesys hub on `fe3e0000` measured in experiment 8,
+        // iteration 8 — stall the very first request after a port reset
+        // while their firmware finishes booting; U-Boot tolerates this by
+        // scanning much later. Retry with a settle delay before giving up.
         let mut first = [0u8; 8];
-        if let Err(err) = self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first) {
+        let mut err = match self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        for attempt in 1..=3 {
+            match err {
+                None => break,
+                Some(e) => {
+                    self.log.log(format_args!(
+                        "ohcid:   first get_descriptor attempt {} failed {:?}, retrying after 150 ms",
+                        attempt, e
+                    ));
+                    self.hc.delay_ms(150);
+                    match self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first) {
+                        Ok(_) => {
+                            err = None;
+                            break;
+                        }
+                        Err(re) => err = Some(re),
+                    }
+                }
+            }
+        }
+        if let Some(err) = err {
             // Diagnostics for the first control transfer (experiment 8,
-            // iterations 2 and 7): the setup buffer of the second hardware
+            // iterations 2, 7 and 8): the setup buffer of the second hardware
             // controller reads back as zeros although the TDs in the head of
             // the same page are delivered to the controller correctly.
             let d = self.hc.diag_setup_buffer();
             self.log.log(format_args!(
-                "ohcid:   dbg: first get_descriptor failed {:?}; buf va 0x{:08x} phys 0x{:08x}; write-rb {:02x?}; phys-view {:02x?}; canary {:02x?}; td0 {:08x?}",
+                "ohcid:   dbg: first get_descriptor failed {:?}; buf va 0x{:08x} phys 0x{:08x}; orig {:02x?}; write-rb {:02x?}; phys-view {:02x?}; canary {:02x?}; td0 {:08x?}",
                 err,
                 d.va,
                 self.hc.bufs_physical(),
+                d.original,
                 d.write_readback,
                 d.phys_view,
                 d.canary,

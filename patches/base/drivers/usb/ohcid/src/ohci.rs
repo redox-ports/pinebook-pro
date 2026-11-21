@@ -194,6 +194,8 @@ pub struct SetupBufferDiag {
     pub va: usize,
     /// The first TD as the CPU sees it (retired values if a transfer ran).
     pub td0: [u32; 4],
+    /// The setup area as the failed transfer left it.
+    pub original: Vec<u8>,
     /// Pattern written to the setup area and read back through the Dma map.
     pub write_readback: Vec<u8>,
     /// The same area read through an independent Uncacheable physmap.
@@ -555,6 +557,10 @@ impl Ohci {
             self.tds[0].be,
         ];
 
+        // Preserve what the last transfer left in the setup area before the
+        // pattern write below destroys the evidence.
+        let original = self.buf_bytes_volatile(0, 8);
+
         // Write a known pattern into the setup area and read it back
         // through the same mapping.
         let pattern = [0x5au8, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x55, 0xaa];
@@ -572,6 +578,7 @@ impl Ohci {
         SetupBufferDiag {
             va,
             td0,
+            original,
             write_readback: wb,
             phys_view,
             canary,

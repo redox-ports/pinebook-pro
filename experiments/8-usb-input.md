@@ -528,3 +528,44 @@ Two follow-ups:
    attribute of the mmap'd DMA page on this kernel?), an interconnect quirk of
    `usb_host1` reading that DRAM range, or the real hub stalling for its own
    reasons with the zeros being an artifact of the read-back path.
+
+## Iteration 8 — first keystroke fixed; hub stall is not the mapping
+
+(2026-11-21)
+
+The image with the first-report fix (sha256 `b78cd2a2…`, log
+`logs/serial-20261121-134028.log`) — **the keyboard now delivers the first
+keystroke**: the serial log echoes the complete `user` at the login prompt
+(previous boots show it swallowing the first character). Login, shell prompt,
+`exit` and re-login all typed on the internal keyboard.
+
+The `fe3e0000` (Genesys hub) failure is unchanged and deterministic (fourth
+boot in a row), and the new diagnostics resolved several hypotheses at once:
+
+```
+buf va 0x0003f400 phys 0x0334f400
+write-rb [5a a5 3c c3 0f f0 55 aa]   <- pattern write + readback: works
+canary [c3 3c a5 5a]                 <- untouched tail offset: works
+td0 [03000000, 0, 0, 0334f407]       <- retired TD visible to the CPU
+phys-view None                        <- physmap of RAM refused (dev and uc)
+```
+
+- The Dma mapping is **not write-broken**: both a pattern write into the
+  setup area and a canary at another tail offset read back correctly through
+  the same virtual address.
+- The disassembly of `buf_slice_mut`/`control_transfer` confirms the setup
+  store goes to `tds.virt + 0x400 + off` — the same address the diagnostics
+  use; there is no second address to mix up.
+- The CPU sees the HC's TD writebacks through the mapping, so the page is
+  shared correctly between CPU and controller.
+- `physical@dev` and `physical@uc` both refuse to map the RAM page, so the
+  independent phys view stays unavailable.
+
+What remains: the hub stalls the data stage of the very first
+`GET_DESCRIPTOR` while its firmware may still be settling after the port
+reset (~10 ms after reset ends; U-Boot scans it orders of magnitude later).
+The keyboard on `fe3a0000` — a simple low-speed device — answers immediately.
+Next step, built into the next image: retry the first get_descriptor up to
+three times with 150 ms pauses, and keep the original buffer content in the
+diagnostics (the iteration-7 pattern write destroyed it before it could be
+read).
