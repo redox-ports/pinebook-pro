@@ -847,4 +847,16 @@ the second): the desktop image boots, the keyboard reports flow after
 read and dropped by the 8-byte keyboard guard, and no ED stalls or port reset
 fires — no regression from the new code. The _Mouse_ branch itself cannot be
 reached in the rig: QEMU has no two-interface keyboard chip, so the probe and
-the boot-mouse parsing need the hardware (see experiment 13 for the run).
+the boot-mouse parsing need the hardware.
+
+**Hardware result (2026-11-21, the desktop image):** the desktop and the
+keyboard work; the touchpad does not. Cursor pinned to the left edge, a
+left-right swipe moves the cursor up-down, and a click moves it slightly
+right — the classic signature of the layout `[report id, buttons, dx, dy]`
+parsed as `[buttons, dx, dy]`: the chip **ACKs `SET_PROTOCOL(boot)` but keeps
+its own report protocol** (allowed: a device may accept the request and only
+apply it if it implements boot reports). Not fixable by a request, so the
+driver must read the descriptor — see experiment 13, “The touchpad report
+layout”. One more defect the same change fixes: the revive path replaced only
+the keyboard entry, leaving the touchpad entry polling an ED the new
+enumeration had rewritten.

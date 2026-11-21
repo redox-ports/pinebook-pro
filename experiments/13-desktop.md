@@ -60,11 +60,11 @@ source trees.
 The one online run (`make all`, 17:24, no `COOKBOOK_OFFLINE`) moved the recipe
 sources to the branch heads before cooking:
 
-| recipe       | before     | after      |
-| ------------ | ---------- | ---------- |
-| `kernel`     | `e7f1d423` | `f64a8163` |
-| `relibc`     | `b83feabc` | `74b5e7e3` |
-| `uutils-grep`| `6f048c6`  | `00e7bec`  |
+| recipe        | before     | after      |
+| ------------- | ---------- | ---------- |
+| `kernel`      | `e7f1d423` | `f64a8163` |
+| `relibc`      | `b83feabc` | `74b5e7e3` |
+| `uutils-grep` | `6f048c6`  | `00e7bec`  |
 
 Two consequences were measured:
 
@@ -117,18 +117,24 @@ as well, and no heartbeat stalled or port reset fired: **no regression of the
 input path** with the mouse code in. The tablet is a single-interface HID
 device (protocol 0), so it is armed through the existing "first HID endpoint"
 fallback and its 3-byte reports are ignored by the 8-byte keyboard guard; the
-new `Mouse` path (a *second* endpoint of the keyboard device) cannot be
+new `Mouse` path (a _second_ endpoint of the keyboard device) cannot be
 reproduced with QEMU's stock USB devices — it needs the hardware.
 
 The rig cannot mount the root filesystem (no virtio-mmio block driver), so
 `redoxfs` fails and `orbital` never starts there: the rig validates boot and
 input only.
 
-## Built image
+## Built images
 
-`build/redox/build/aarch64/desktop-minimal/harddrive.img`, 512 MiB,
-sha256 `07bdfdc197ec6fd3aa927e8c0d4ad9dac8696ac12384d8cd0fa11f84bb57aefe`
-(local build 2026-11-21 18:02; not committed).
+- `07bdfdc197ec6fd3aa927e8c0d4ad9dac8696ac12384d8cd0fa11f84bb57aefe` — the
+  first desktop image (hardware run: desktop and keyboard work, touchpad
+  misparsed, freeze);
+- `98918225ccec40f112717e50582270f5ab55ef7512ce46a7d8a954fb69e4f66b` — the
+  same tree with the report-descriptor layout parser and the revive fix
+  (2026-11-21 18:55); hardware run pending.
+
+Both are local builds (`build/aarch64/desktop-minimal/harddrive.img`), not
+committed.
 
 ## Actions (hardware)
 
@@ -149,9 +155,58 @@ sha256 `07bdfdc197ec6fd3aa927e8c0d4ad9dac8696ac12384d8cd0fa11f84bb57aefe`
 
 ## Results (owner)
 
-`FILL IN` — panel photo/log, the `ohcid` endpoint line, whether moving a
-finger moves the cursor, and whether the keyboard still works after touching
-the touchpad (the experiment 8, iteration 15 failure mode).
+**Iteration 1 (2026-11-21, image `07bdfdc1…`): the desktop works on hardware.**
+`orbital` starts on the panel, the keyboard types into it, and the boot ran
+through to the desktop on the first try. One defect: the touchpad.
+
+- the cursor is stuck at the left edge and cannot be moved right;
+- moving a finger **left-right** moves the cursor **up-down**;
+- pressing the left button moves the cursor slightly **right**;
+- after a few touches/clicks everything froze.
+
+## The touchpad report layout (after the first hardware run, 2026-11-21)
+
+The symptoms pin the report layout exactly. Our parser assumed the boot
+layout `[buttons, dx, dy]`, i.e. `dx = byte 1`, `dy = byte 2`. The observed
+behaviour means:
+
+- horizontal finger motion changed **byte 2** (our `dy`) → the cursor moved
+  vertically;
+- the button bit changed **byte 1** (our `dx`) → a click moved the cursor 1 px
+  right;
+- nothing reached our `dx` from real horizontal motion → the cursor could
+  only drift left.
+
+That is the layout `[report id, buttons, dx, dy]`: the chip **acknowledges
+`SET_PROTOCOL(boot)` but keeps its own report protocol**, which is legal
+(read-only HID devices may ignore protocol changes they do not implement).
+
+The fix no longer guesses. `ohcid` fetches the interface's **HID report
+descriptor** (`GET_DESCRIPTOR(0x22)`, class request to the interface) and
+parses it (`parse_report_descriptor`): report ID, button byte and bit count,
+X/Y byte offsets, and whether the axes are relative or absolute (a digitizer
+would be absolute — consecutive positions are then diffed into relative
+motion). Reports whose ID does not match are ignored. Without a usable
+descriptor the driver falls back to the `SET_PROTOCOL(boot)` probe and the
+boot layout; without that it keeps draining.
+
+Also fixed in the same change: the 15 s self-healing path replaced only the
+keyboard `HidDevice` after a port reset, leaving the touchpad entry pointing
+at an ED that the new enumeration had rewritten (two entries polling one ED
+is a wedge candidate — likely the freeze). A revive now replaces **every**
+root-port endpoint of that controller with the fresh enumeration results.
+
+Diagnostics kept in the image (cheap, bounded): the report descriptor is
+hex-dumped when fetched, and the first 40 reports of non-keyboard endpoints
+are logged as `ohcid: raw ep 0x82 len N: …` — enough to verify or correct the
+parsed layout from the serial log alone.
+
+Image: sha256 `98918225ccec40f112717e50582270f5ab55ef7512ce46a7d8a954fb69e4f66b`
+(local build 2026-11-21 18:55). Rig smoke: boot + keyboard reports unchanged;
+the two-interface touchpad path is not reproducible in QEMU.
+
+`FILL IN` — hardware run of the iteration-2 image: the parsed layout line,
+the raw report bytes, cursor behaviour, and whether the freeze is gone.
 
 ## Open questions
 

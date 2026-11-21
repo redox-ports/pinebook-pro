@@ -338,13 +338,15 @@ impl Driver {
             // root port and enumerate it again — the port reset returns the
             // device to address 0, so the full control dance is redone.
             let now2 = ohci::now_ms();
-            for hid in hids.iter_mut() {
-                if hid.reports == 0
-                    || hid.root_port.is_none()
-                    || now2.wrapping_sub(hid.last_report_ms) < 15_000
-                {
-                    continue;
-                }
+            let stale = hids
+                .iter()
+                .find(|h| {
+                    h.reports > 0
+                        && h.root_port.is_some()
+                        && now2.wrapping_sub(h.last_report_ms) >= 15_000
+                })
+                .map(|h| (h.hc_index, h.addr, h.low_speed, h.mps));
+            if let Some((hc_index, addr, low_speed, mps)) = stale {
                 // Before resetting: an idle (but healthy) device also has
                 // no reports — its interrupt endpoint just NAKs until a key
                 // is pressed. Probe the control endpoint instead: a live
@@ -353,74 +355,95 @@ impl Driver {
                 // keyboard on every 15 s of plain idle (measured, iteration
                 // 14).
                 let probe = build_setup(0x80, 0x06, 0x0100, 0x0000, 8);
-                let hc = &mut hcs[hid.hc_index];
-                let alive = hc
-                    .control_transfer(
-                        hid.addr,
-                        hid.low_speed,
-                        u16::from(hid.mps),
-                        probe,
-                        None,
-                        false,
-                    )
+                let alive = hcs[hc_index]
+                    .control_transfer(addr, low_speed, u16::from(mps), probe, None, false)
                     .is_ok();
                 if alive {
                     // Healthy idle: forget the stall, do not touch the port.
-                    hid.last_report_ms = now2;
-                    continue;
-                }
-                log.log(format_args!(
-                    "ohcid: input addr {} silent and unresponsive, resetting its port",
-                    hid.addr
-                ));
-                let hc = &mut hcs[hid.hc_index];
-                match hc.reset_root_port(0) {
-                    Ok((connected, low_speed, enabled)) => {
-                        log.log(format_args!(
-                            "ohcid: revive port reset: connected {} low-speed {} enabled {}",
-                            connected, low_speed, enabled
-                        ));
-                        if connected && enabled {
-                            hc.delay_ms(20);
-                            let mut en = Enumeration {
-                                hc,
-                                log,
-                                hc_index: hid.hc_index,
-                                next_addr: 1,
-                                next_ed: 4,
-                                next_td: 4,
-                                next_slot: 0,
-                                root_port: Some(0),
-                                found: Vec::new(),
-                            };
-                            match en.enumerate_at_zero(low_speed, 0) {
-                                Ok(()) => {
-                                    if let Some(fresh) =
-                                        en.found.into_iter().find(|d| d.kind == HidKind::Keyboard)
-                                    {
-                                        log.log(format_args!(
-                                            "ohcid: revived keyboard addr {}",
-                                            fresh.addr
-                                        ));
-                                        *hid = fresh;
-                                        continue;
+                    for h in hids
+                        .iter_mut()
+                        .filter(|h| h.hc_index == hc_index && h.addr == addr)
+                    {
+                        h.last_report_ms = now2;
+                    }
+                } else {
+                    log.log(format_args!(
+                        "ohcid: input addr {} silent and unresponsive, resetting its port",
+                        addr
+                    ));
+                    let mut revived = false;
+                    match hcs[hc_index].reset_root_port(0) {
+                        Ok((connected, low_speed2, enabled)) => {
+                            log.log(format_args!(
+                                "ohcid: revive port reset: connected {} low-speed {} enabled {}",
+                                connected, low_speed2, enabled
+                            ));
+                            if connected && enabled {
+                                hcs[hc_index].delay_ms(20);
+                                let mut en = Enumeration {
+                                    hc: &mut hcs[hc_index],
+                                    log,
+                                    hc_index,
+                                    next_addr: 1,
+                                    next_ed: 4,
+                                    next_td: 4,
+                                    next_slot: 0,
+                                    root_port: Some(0),
+                                    found: Vec::new(),
+                                };
+                                match en.enumerate_at_zero(low_speed2, 0) {
+                                    Ok(()) => {
+                                        let fresh = std::mem::take(&mut en.found);
+                                        if fresh.iter().any(|d| d.kind == HidKind::Keyboard) {
+                                            // Replace every root-port HID
+                                            // endpoint: the touchpad is a
+                                            // second HidDevice of the same
+                                            // device, and its old ED has been
+                                            // rewritten by the new
+                                            // enumeration (a stale entry kept
+                                            // polling a foreign ED — a wedge
+                                            // candidate, experiment 13).
+                                            hids.retain(|h| {
+                                                h.hc_index != hc_index || h.root_port.is_none()
+                                            });
+                                            let count = fresh.len();
+                                            for mut d in fresh {
+                                                d.last_report_ms = now2;
+                                                hids.push(d);
+                                            }
+                                            log.log(format_args!(
+                                                "ohcid: revived {} endpoint(s) previously on addr {}",
+                                                count, addr
+                                            ));
+                                            revived = true;
+                                        } else {
+                                            log.log(format_args!(
+                                                "ohcid: revive found no keyboard after reset"
+                                            ));
+                                        }
                                     }
-                                    log.log(format_args!(
-                                        "ohcid: revive found no keyboard after reset"
-                                    ));
+                                    Err(err) => log.log(format_args!(
+                                        "ohcid: revive enumeration failed: {:?}",
+                                        err
+                                    )),
                                 }
-                                Err(err) => log.log(format_args!(
-                                    "ohcid: revive enumeration failed: {:?}",
-                                    err
-                                )),
                             }
                         }
+                        Err(err) => {
+                            log.log(format_args!("ohcid: revive port reset failed: {:?}", err))
+                        }
                     }
-                    Err(err) => log.log(format_args!("ohcid: revive port reset failed: {:?}", err)),
+                    if !revived {
+                        // Nothing worked: back off so the next attempt is not
+                        // an endless tight loop of resets.
+                        for h in hids
+                            .iter_mut()
+                            .filter(|h| h.hc_index == hc_index && h.addr == addr)
+                        {
+                            h.last_report_ms = now2;
+                        }
+                    }
                 }
-                // Nothing worked: back off so the next attempt is not an
-                // endless tight loop of resets.
-                hid.last_report_ms = now2;
             }
             let now = ohci::now_ms();
             if now.wrapping_sub(last_beat) >= 5_000 {
@@ -671,21 +694,42 @@ impl<'a> Enumeration<'a> {
                 continue;
             }
             // Every other interrupt endpoint on the device (the touchpad
-            // interface of the keyboard chip) must be polled. Try the boot
-            // protocol first: when the chip supports it, the reports become
-            // the fixed 3-byte mouse layout and feed the input scheme;
-            // otherwise (STALL) keep draining the raw reports.
-            if self
+            // interface of the keyboard chip) must be polled. Prefer the
+            // report descriptor: the chip keeps its own report format
+            // (`[report id, buttons, dx, dy]`) even though it answers
+            // `SET_PROTOCOL(boot)` without a stall, so the boot layout must
+            // not be assumed. Without a usable descriptor fall back to the
+            // boot-protocol probe, and without that keep draining.
+            let layout = self.hid_report_layout(addr, low_speed, mps0, info.interface);
+            if let Some(layout) = layout.filter(ReportLayout::usable) {
+                self.start_hid_kind(addr, low_speed, *info, HidKind::Mouse, layout)?;
+                self.log.log(format_args!(
+                    "ohcid:   mouse on endpoint 0x{:02x} of the keyboard device (report descriptor layout)",
+                    info.ep_address
+                ));
+            } else if self
                 .hid_set_boot_protocol(addr, low_speed, mps0, info.interface)
                 .is_ok()
             {
-                self.start_hid_kind(addr, low_speed, *info, HidKind::Mouse)?;
+                self.start_hid_kind(
+                    addr,
+                    low_speed,
+                    *info,
+                    HidKind::Mouse,
+                    ReportLayout::boot_mouse(),
+                )?;
                 self.log.log(format_args!(
                     "ohcid:   boot mouse on endpoint 0x{:02x} of the keyboard device",
                     info.ep_address
                 ));
             } else {
-                self.start_hid_kind(addr, low_speed, *info, HidKind::Drain)?;
+                self.start_hid_kind(
+                    addr,
+                    low_speed,
+                    *info,
+                    HidKind::Drain,
+                    ReportLayout::default(),
+                )?;
                 self.log.log(format_args!(
                     "ohcid:   draining extra endpoint 0x{:02x} of the keyboard device",
                     info.ep_address
@@ -699,7 +743,13 @@ impl<'a> Enumeration<'a> {
             ));
             self.hid_set_protocol(addr, low_speed, mps0, info.interface)?;
             let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
-            self.start_hid_kind(addr, low_speed, info, HidKind::Drain)?;
+            self.start_hid_kind(
+                addr,
+                low_speed,
+                info,
+                HidKind::Drain,
+                ReportLayout::default(),
+            )?;
             return Ok(());
         }
         if info.protocol == 1 {
@@ -717,7 +767,13 @@ impl<'a> Enumeration<'a> {
         self.log.log(format_args!("ohcid:   dbg: before set_idle"));
         let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
         self.log.log(format_args!("ohcid:   dbg: before start_hid"));
-        self.start_hid_kind(addr, low_speed, info, HidKind::Keyboard)?;
+        self.start_hid_kind(
+            addr,
+            low_speed,
+            info,
+            HidKind::Keyboard,
+            ReportLayout::default(),
+        )?;
         self.log.log(format_args!("ohcid:   dbg: start_hid ok"));
         Ok(())
     }
@@ -925,6 +981,63 @@ impl<'a> Enumeration<'a> {
         Ok(())
     }
 
+    /// Fetch and log the HID report descriptor of an interface and parse the
+    /// field layout out of it. Returns None when the request fails or the
+    /// descriptor does not describe X/Y/buttons.
+    fn hid_report_layout(
+        &mut self,
+        addr: u8,
+        low_speed: bool,
+        mps0: u8,
+        interface: u8,
+    ) -> Option<ReportLayout> {
+        let mut buf = [0u8; 128];
+        let setup = build_setup(0xa1, 0x06, 0x2200, u32::from(interface), buf.len() as u16);
+        let len = match self.hc.control_transfer(
+            addr,
+            low_speed,
+            u16::from(mps0),
+            setup,
+            Some(&mut buf),
+            true,
+        ) {
+            Ok(n) => n,
+            Err(err) => {
+                self.log.log(format_args!(
+                    "ohcid:   report descriptor of interface {} unavailable: {:?}",
+                    interface, err
+                ));
+                return None;
+            }
+        };
+        let bytes = &buf[..len.min(buf.len())];
+        let mut line = String::new();
+        for (n, chunk) in bytes.chunks(16).enumerate() {
+            line.clear();
+            for b in chunk {
+                line.push_str(&format!("{:02x} ", b));
+            }
+            self.log.log(format_args!(
+                "ohcid:   report descriptor {} +{:#04x}: {}",
+                interface,
+                n * 16,
+                line
+            ));
+        }
+        let layout = parse_report_descriptor(bytes);
+        self.log.log(format_args!(
+            "ohcid:   layout: id {:?} buttons {:?}/{} x {:?} (abs {}) y {:?} (abs {})",
+            layout.report_id,
+            layout.buttons_byte,
+            layout.buttons_bits,
+            layout.x_byte,
+            layout.x_absolute,
+            layout.y_byte,
+            layout.y_absolute
+        ));
+        Some(layout)
+    }
+
     fn hid_set_idle(
         &mut self,
         addr: u8,
@@ -996,6 +1109,7 @@ impl<'a> Enumeration<'a> {
         low_speed: bool,
         info: HidInfo,
         kind: HidKind,
+        layout: ReportLayout,
     ) -> Result<(), Error> {
         let ed = self.next_ed;
         let td = self.next_td;
@@ -1048,6 +1162,9 @@ impl<'a> Enumeration<'a> {
             prev_modifiers: 0,
             prev_keys: [0; 6],
             prev_buttons: 0,
+            prev_abs: None,
+            layout,
+            raw_logged: 0,
             reports: 0,
             last_report_ms: ohci::now_ms(),
         });
@@ -1063,6 +1180,186 @@ fn build_setup(request_type: u8, request: u8, value: u32, index: u32, length: u1
     setup[4..6].copy_from_slice(&(index as u16).to_le_bytes());
     setup[6..8].copy_from_slice(&length.to_le_bytes());
     setup
+}
+
+/// Where the fields of one HID input report live, according to the report
+/// descriptor.
+///
+/// The touchpad interface of the Pinebook Pro keyboard chip keeps its own
+/// report protocol even though it answers `SET_PROTOCOL(boot)` without a
+/// stall: its reports are `[report id, buttons, dx, dy]`, not the 3-byte boot
+/// layout `[buttons, dx, dy]` (experiment 13, iteration 2 — measured on
+/// hardware: bytes 1/2 swapped the axes and the button bit landed in the X
+/// byte). The descriptor is the only ground truth.
+#[derive(Clone, Copy, Default)]
+struct ReportLayout {
+    /// Leading report-ID byte expected on every report (None = no IDs).
+    report_id: Option<u8>,
+    /// Byte offset (inside the full report, ID included) of the button bits.
+    buttons_byte: Option<usize>,
+    /// Number of button bits in that byte.
+    buttons_bits: u32,
+    /// Byte offsets of X and Y and whether the axes are absolute.
+    x_byte: Option<usize>,
+    y_byte: Option<usize>,
+    x_absolute: bool,
+    y_absolute: bool,
+}
+
+impl ReportLayout {
+    /// The HID boot-mouse layout: `[buttons, dx, dy]` (appendix B.2).
+    fn boot_mouse() -> Self {
+        Self {
+            report_id: None,
+            buttons_byte: Some(0),
+            buttons_bits: 3,
+            x_byte: Some(1),
+            y_byte: Some(2),
+            x_absolute: false,
+            y_absolute: false,
+        }
+    }
+
+    fn usable(&self) -> bool {
+        self.buttons_byte.is_some() && self.x_byte.is_some() && self.y_byte.is_some()
+    }
+}
+
+/// Parse a HID report descriptor (HID 1.11, appendix B / section 6.2.2) far
+/// enough to find the first mouse-like input report: its report ID (if any),
+/// the button bit field and the X/Y fields (relative or absolute).
+fn parse_report_descriptor(bytes: &[u8]) -> ReportLayout {
+    let mut layout = ReportLayout::default();
+    let mut usage_page: u16 = 0;
+    let mut usages: Vec<(u16, u16)> = Vec::new();
+    let mut usage_min: Option<u16> = None;
+    let mut usage_max: Option<u16> = None;
+    let mut report_size: u32 = 0;
+    let mut report_count: u32 = 0;
+    let mut report_id: Option<u8> = None;
+    let mut logical_min: i32 = 0;
+    // Bit offset within the current report's data (after the ID byte).
+    let mut bit_offset: u32 = 0;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let prefix = bytes[i];
+        if prefix == 0xfe {
+            // Long item: 0xfe, bDataSize, bLongItemTag, data.
+            if i + 2 >= bytes.len() {
+                break;
+            }
+            i += 3 + usize::from(bytes[i + 1]);
+            continue;
+        }
+        let size = match prefix & 0x03 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        let item_type = (prefix >> 2) & 0x03;
+        let tag = prefix >> 4;
+        if i + 1 + size > bytes.len() {
+            break;
+        }
+        let data = &bytes[i + 1..i + 1 + size];
+        i += 1 + size;
+        let unsigned = match size {
+            0 => 0u32,
+            1 => u32::from(data[0]),
+            2 => u32::from(u16::from_le_bytes([data[0], data[1]])),
+            _ => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        };
+        let signed = match size {
+            0 => 0i32,
+            1 => i32::from(data[0] as i8),
+            2 => i32::from(i16::from_le_bytes([data[0], data[1]])),
+            _ => unsigned as i32,
+        };
+        match (item_type, tag) {
+            // Global items.
+            (1, 0) => usage_page = unsigned as u16,
+            (1, 1) => logical_min = signed,
+            (1, 7) => report_size = unsigned,
+            (1, 8) => {
+                // A descriptor may define several reports; stop after the
+                // first complete mouse-like one.
+                if layout.usable() {
+                    break;
+                }
+                report_id = Some(unsigned as u8);
+                bit_offset = 0;
+                layout = ReportLayout::default();
+            }
+            (1, 9) => report_count = unsigned,
+            // Local items.
+            (2, 0) => usages.push((usage_page, unsigned as u16)),
+            (2, 1) => usage_min = Some(unsigned as u16),
+            (2, 2) => usage_max = Some(unsigned as u16),
+            // Main item: Input.
+            (0, 8) => {
+                let bits = report_size.saturating_mul(report_count);
+                let id_bytes = usize::from(report_id.is_some());
+                // With Report Count > 1 and several Usages, the usages share
+                // the item and are packed consecutively: X at bit_offset,
+                // Y at bit_offset + report_size, ...
+                let mut off = bit_offset;
+                for (page, usage) in usages.iter().copied() {
+                    let byte = id_bytes + (off / 8) as usize;
+                    match (page, usage) {
+                        (0x01, 0x30) => {
+                            layout.x_byte = Some(byte);
+                            layout.x_absolute = logical_min >= 0;
+                        }
+                        (0x01, 0x31) => {
+                            layout.y_byte = Some(byte);
+                            layout.y_absolute = logical_min >= 0;
+                        }
+                        (0x09, _) => match layout.buttons_byte {
+                            None => {
+                                layout.buttons_byte = Some(byte);
+                                layout.buttons_bits = report_count.min(8);
+                            }
+                            // Separate Input items, one button each: extend
+                            // the bit count when the field continues there.
+                            Some(b) if b == byte => {
+                                layout.buttons_bits = (layout.buttons_bits + report_count).min(8);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    off += report_size;
+                }
+                // A Usage Minimum/Maximum pair over buttons (page 0x09).
+                if usages.is_empty()
+                    && usage_page == 0x09
+                    && usage_min.is_some()
+                    && usage_max.is_some()
+                    && layout.buttons_byte.is_none()
+                {
+                    layout.buttons_byte = Some(id_bytes + (bit_offset / 8) as usize);
+                    layout.buttons_bits = report_count.min(8);
+                }
+                bit_offset += bits;
+                usages.clear();
+                usage_min = None;
+                usage_max = None;
+            }
+            // Main items that also consume report bits / reset locals.
+            (0, 9) | (0, 11) => {
+                bit_offset += report_size.saturating_mul(report_count);
+                usages.clear();
+            }
+            (0, 10) | (0, 12) => {
+                usages.clear();
+            }
+            _ => {}
+        }
+    }
+    layout.report_id = report_id;
+    layout
 }
 
 /// Parsed HID keyboard interface.
@@ -1161,6 +1458,12 @@ struct HidDevice {
     prev_keys: [u8; 6],
     /// Last boot-mouse button state (bit 0/1/2 = left/right/middle).
     prev_buttons: u8,
+    /// Last absolute touchpad position, for absolute→relative conversion.
+    prev_abs: Option<(i32, i32)>,
+    /// Where the fields of a mouse report live (report-descriptor driven).
+    layout: ReportLayout,
+    /// Raw reports hex-dumped to the log so far (diagnostics).
+    raw_logged: u32,
     /// Completed interrupt transfers (heartbeat diagnostics).
     reports: u64,
     /// Timestamp of the last completed report (stall detection).
@@ -1180,11 +1483,24 @@ impl HidDevice {
         let report = hc.buf_slice(self.buf_off, len).to_vec();
 
         if cc == ohci::TD_CC_NOERROR || cc == ohci::TD_CC_DATAUNDERRUN {
+            // Ground truth for the report format: hex-dump the first reports
+            // of the non-keyboard endpoints (experiment 13, iteration 2).
+            if matches!(self.kind, HidKind::Mouse | HidKind::Drain) && self.raw_logged < 40 {
+                self.raw_logged += 1;
+                let mut line = String::new();
+                for b in report.iter().take(12) {
+                    line.push_str(&format!("{:02x} ", b));
+                }
+                log.log(format_args!(
+                    "ohcid: raw ep 0x{:02x} len {}: {}",
+                    self.ep, len, line
+                ));
+            }
             match self.kind {
                 HidKind::Keyboard if len >= 8 => {
                     self.handle_report(&report, input, log);
                 }
-                HidKind::Mouse if len >= 3 => {
+                HidKind::Mouse => {
                     self.handle_mouse_report(&report, input, log);
                 }
                 // Draining is the point for HidKind::Drain: the reports are
@@ -1260,13 +1576,60 @@ impl HidDevice {
         self.prev_keys = keys;
     }
 
-    /// Boot mouse report: [buttons, dx, dy] (HID spec appendix B.2).
-    /// Relative motion goes out as `MouseRelativeEvent`, button changes as
-    /// `ButtonEvent` — the same shapes the upstream `usbhidd` uses.
+    /// Mouse report driven by the parsed report layout: buttons at the
+    /// descriptor's button byte, X/Y at theirs (signed 8-bit fields).
+    /// Absolute axes (a touchpad digitizer) are turned into relative motion
+    /// by diffing consecutive positions. Everything goes out as
+    /// `MouseRelativeEvent`/`ButtonEvent` — the shapes orbital consumes.
     fn handle_mouse_report(&mut self, report: &[u8], input: &mut ProducerHandle, log: &Logger) {
-        let buttons = report[0] & 0x07;
-        let dx = report[1] as i8 as i32;
-        let dy = report[2] as i8 as i32;
+        let layout = self.layout;
+        if !layout.usable() {
+            return;
+        }
+        if let Some(id) = layout.report_id {
+            if report.is_empty() || report[0] != id {
+                return;
+            }
+        }
+        let (Some(bb), Some(xb), Some(yb)) = (layout.buttons_byte, layout.x_byte, layout.y_byte)
+        else {
+            return;
+        };
+        let last = bb.max(xb).max(yb);
+        if report.len() <= last {
+            return;
+        }
+        let mask = if layout.buttons_bits >= 8 {
+            0xff
+        } else {
+            (1u8 << layout.buttons_bits) - 1
+        };
+        let buttons = report[bb] & mask;
+        let raw_dx = i32::from(report[xb] as i8);
+        let raw_dy = i32::from(report[yb] as i8);
+        let (dx, dy) = if layout.x_absolute || layout.y_absolute {
+            let cur = (i32::from(report[xb]), i32::from(report[yb]));
+            let (ddx, ddy) = match self.prev_abs {
+                Some(prev) => (cur.0 - prev.0, cur.1 - prev.1),
+                // First absolute sample: no motion yet.
+                None => (0, 0),
+            };
+            self.prev_abs = Some(cur);
+            (
+                if layout.x_absolute {
+                    ddx.clamp(-127, 127)
+                } else {
+                    raw_dx
+                },
+                if layout.y_absolute {
+                    ddy.clamp(-127, 127)
+                } else {
+                    raw_dy
+                },
+            )
+        } else {
+            (raw_dx, raw_dy)
+        };
 
         if dx != 0 || dy != 0 {
             let event = OrbMouseRelativeEvent { dx, dy };
