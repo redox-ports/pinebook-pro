@@ -651,23 +651,41 @@ impl<'a> Enumeration<'a> {
         let config_value = config[5];
         self.set_configuration(addr, low_speed, u16::from(mps0), config_value)?;
 
-        let Some(info) = find_hid_keyboard(&config) else {
+        let eps = find_hid_endpoints(&config);
+        if eps.is_empty() {
             self.log
-                .log(format_args!("ohcid:   no HID keyboard interface, ignored"));
+                .log(format_args!("ohcid:   no HID interface, ignored"));
             return Ok(());
-        };
-
-        self.log.log(format_args!(
-            "ohcid:   HID interface {} protocol {} endpoint 0x{:02x} mps {} interval {}",
-            info.interface, info.protocol, info.ep_address, info.ep_mps, info.ep_interval
-        ));
+        }
+        // The keyboard is the boot-protocol interface if present, else the
+        // first HID endpoint (fallback, same as before).
+        let kb_index = eps.iter().position(|e| e.protocol == 1).unwrap_or(0);
+        for (n, info) in eps.iter().enumerate() {
+            self.log.log(format_args!(
+                "ohcid:   HID interface {} protocol {} endpoint 0x{:02x} mps {} interval {}",
+                info.interface, info.protocol, info.ep_address, info.ep_mps, info.ep_interval
+            ));
+            if n == kb_index {
+                continue;
+            }
+            // Every other interrupt endpoint on the device (the touchpad
+            // interface of the keyboard chip) is armed as a drain target —
+            // see find_hid_endpoints. No boot protocol is requested for it:
+            // the raw reports are read and dropped.
+            self.start_hid_kind(addr, low_speed, *info, HidKind::Drain)?;
+            self.log.log(format_args!(
+                "ohcid:   draining extra endpoint 0x{:02x} of the keyboard device",
+                info.ep_address
+            ));
+        }
+        let info = eps[kb_index];
         if info.protocol == 2 {
             self.log.log(format_args!(
                 "ohcid:   boot mouse interface, polling to drain reports"
             ));
             self.hid_set_protocol(addr, low_speed, mps0, info.interface)?;
             let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
-            self.start_hid_kind(addr, low_speed, info, HidKind::Mouse)?;
+            self.start_hid_kind(addr, low_speed, info, HidKind::Drain)?;
             return Ok(());
         }
         if info.protocol == 1 {
@@ -973,7 +991,7 @@ impl<'a> Enumeration<'a> {
             "ohcid:   polling {} addr {} endpoint {} via periodic slot {}",
             match kind {
                 HidKind::Keyboard => "keyboard",
-                HidKind::Mouse => "mouse",
+                HidKind::Drain => "mouse",
             },
             addr,
             info.ep_number,
@@ -1024,13 +1042,18 @@ struct HidInfo {
     ep_interval: u8,
 }
 
-/// Walk a configuration descriptor and return the first HID interface that
-/// has an interrupt IN endpoint. Boot keyboards use subclass 1; some devices
-/// report subclass 0, so only the class is required here.
-fn find_hid_keyboard(config: &[u8]) -> Option<HidInfo> {
+/// Walk a configuration descriptor and return every interrupt IN endpoint
+/// of every HID interface, in descriptor order. On the Pinebook Pro the
+/// keyboard chip (`258a:001e`) exposes **two** of them: interface 0 is the
+/// boot keyboard (0x81) and interface 1 is the touchpad (0x82) — a report
+/// waiting on 0x82 that nobody reads wedges the whole chip, taking the
+/// keyboard down with it (Tow-Boot issue #57, confirmed on this device in
+/// experiment 8, iteration 15). Every endpoint but the keyboard must be
+/// polled and drained.
+fn find_hid_endpoints(config: &[u8]) -> Vec<HidInfo> {
+    let mut out = Vec::new();
     let mut i = 0usize;
     let mut current: Option<(u8, u8)> = None;
-    let mut fallback: Option<HidInfo> = None;
     while i + 2 <= config.len() {
         let len = usize::from(config[i]);
         if len < 2 || i + len > config.len() {
@@ -1054,40 +1077,31 @@ fn find_hid_keyboard(config: &[u8]) -> Option<HidInfo> {
                 let is_in = address & 0x80 != 0;
                 if is_interrupt && is_in {
                     let mps = u16::from_le_bytes([config[i + 4], config[i + 5]]) & 0x07ff;
-                    let info = HidInfo {
+                    out.push(HidInfo {
                         interface,
                         protocol,
                         ep_address: address,
                         ep_number: address & 0x0f,
                         ep_mps: mps,
                         ep_interval: config[i + 6],
-                    };
-                    // A boot keyboard (protocol 1) is the best match; other
-                    // HID interfaces (consumer control, mouse) are only kept
-                    // as a fallback.
-                    if protocol == 1 {
-                        return Some(info);
-                    }
-                    if fallback.is_none() {
-                        fallback = Some(info);
-                    }
+                    });
                 }
             }
         }
         i += len;
     }
-    fallback
+    out
 }
 
 /// What kind of boot-protocol device a polled interrupt endpoint belongs to.
 #[derive(Clone, Copy, PartialEq)]
 enum HidKind {
     Keyboard,
-    /// Boot mouse: reports are read and drained so the device never stalls
-    /// on uncollected data (its MCU wedging takes the laptop keyboard down
-    /// with it — measured in experiment 8, iteration 12), but no events are
-    /// produced yet.
-    Mouse,
+    /// Reports are read and dropped: for the touchpad interface of the
+    /// keyboard chip (endpoint 0x82, generic HID) and for boot mice — an
+    /// unread report waiting there wedges the whole keyboard chip (Tow-Boot
+    /// issue #57, experiment 8, iteration 15).
+    Drain,
 }
 
 struct HidDevice {
@@ -1133,8 +1147,8 @@ impl HidDevice {
                 }
                 // Draining the touchpad is the point: the reports are read
                 // and dropped so the device never accumulates undelivered
-                // data (see HidKind::Mouse).
-                HidKind::Mouse => {}
+                // data (see HidKind::Drain).
+                HidKind::Drain => {}
                 _ => {}
             }
         } else {

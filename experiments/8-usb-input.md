@@ -780,3 +780,41 @@ made the emulated keyboard deliver reports, then 25 s of plain idle produced
 The touchpad itself stays dead after the first touch (behind the hub, no
 revive path yet, and it never delivered a report even while being stroked);
 the keyboard recovery is the working input path for now.
+
+## Iteration 15 — root cause found: the touchpad lives inside the keyboard chip
+
+(2026-11-21)
+
+The owner reproduced the keyboard death **in U-Boot** — touching the
+touchpad freezes the U-Boot menu keyboard too. That moves the cause out of
+our driver entirely; researching it found **Tow-Boot issue #57** (github.com/
+Tow-Boot/Tow-Boot/issues/57, "Pinebook pro keyboard randomly(?) freezes"),
+whose 2026-10 analysis matches our measurements exactly:
+
+> the Pinebook Pro's keyboard and touchpad are one USB device (`258a:001e`).
+> Interface 0 is a boot keyboard (interrupt endpoint `0x81`), interface 1 a
+> generic HID interface for the touchpad (endpoint `0x82`). U-Boot's `usb_kbd`
+> only ever polls `0x81`. Once the touchpad has a report waiting on `0x82`
+> that nobody reads, the keyboard chip stops sending keyboard reports as
+> well, so the keyboard looks frozen until a USB reset.
+
+Everything we observed falls into place: the keyboard device descriptor's
+configuration is 0x3b bytes = two interfaces + two interrupt endpoints; the
+death is silent at the USB level (the chip just stops answering, ports stay
+connected); `revive` (a port reset) recovers it; the serial console is
+unaffected; and our earlier "drain the separate 046d:c52f mouse" fixed the
+wrong device — that Logitech receiver behind the Genesys hub is a different
+animal (never sent a report in our boots).
+
+Fix, same shape as Tow-Boot's `0011-usb-kbd-drain` patch: the config parser
+now returns **every** HID interrupt IN endpoint of the device
+(`find_hid_endpoints`), and each endpoint other than the keyboard's own is
+armed as a `HidKind::Drain` poll target — reports read and dropped, boot
+protocol not requested. The 15 s port-reset self-healing stays as a safety
+net.
+
+(The 046d:c52f behind the hub remains a curiosity: on Manjaro it enumerates
+the same way; the real touchpad data may travel through the keyboard chip's
+0x82. PINE64 also ships a `pinebook-pro-keyboard-updater` firmware utility
+for the keyboard/touchpad chip — a separate, riskier path, documented on
+the PINE64 Touchpad page; not attempted.)
