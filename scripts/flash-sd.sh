@@ -9,12 +9,16 @@
 #   * requires an explicit YES (terminal prompt or --yes) before writing
 #
 # Usage:
-#   scripts/flash-sd.sh [--image PATH] [--device DEV] [--yes] [--no-verify]
+#   scripts/flash-sd.sh [--config NAME] [--image PATH] [--device DEV] [--yes] [--no-verify]
+#
+#   --config NAME  pick build/redox/build/aarch64/NAME/harddrive.img
+#                  (default: minimal; e.g. desktop-minimal)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${PBP_IMAGE:-$REPO_ROOT/build/redox/build/aarch64/minimal/harddrive.img}"
+CONFIG_NAME="minimal"
+IMAGE=""
 DEVICE=""
 ASSUME_YES=0
 VERIFY=1
@@ -25,12 +29,17 @@ die() {
 }
 
 usage() {
-    echo "usage: scripts/flash-sd.sh [--image PATH] [--device DEV] [--yes] [--no-verify]"
+    echo "usage: scripts/flash-sd.sh [--config NAME] [--image PATH] [--device DEV] [--yes] [--no-verify]"
     exit 0
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --config)
+            CONFIG_NAME="${2:?--config needs a value}"
+            IMAGE=""
+            shift
+            ;;
         --image) IMAGE="${2:?--image needs a value}"; shift ;;
         --device) DEVICE="${2:?--device needs a value}"; shift ;;
         --yes) ASSUME_YES=1 ;;
@@ -40,6 +49,8 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+[ -n "$IMAGE" ] || IMAGE="${PBP_IMAGE:-$REPO_ROOT/build/redox/build/aarch64/$CONFIG_NAME/harddrive.img}"
 
 [ -f "$IMAGE" ] || die "image not found: $IMAGE (build it first: scripts/build-image.sh)"
 IMG_SIZE=$(stat -c %s "$IMAGE")

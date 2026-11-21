@@ -1,0 +1,15 @@
+# Pinebook Pro minimal desktop filesystem configuration.
+#
+# Mirrors the shared desktop-minimal package set (orbital + orbterm +
+# orbutils + orbdata on top of minimal) and tunes sizes for the board. The
+# framebuffer comes from the firmware (RGB565 1920x1080, experiment 7), the
+# keyboard and the touchpad interface are driven by ohcid (experiment 8).
+
+include = ["../../desktop-minimal.toml"]
+
+# General settings
+[general]
+# Filesystem size in MiB
+filesystem_size = 512
+# EFI partition size in MiB
+efi_partition_size = 128

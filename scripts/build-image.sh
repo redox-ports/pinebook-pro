@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Build the minimal Pinebook Pro Redox image locally.
+# Build a Pinebook Pro Redox image locally.
 #
 # Requires scripts/bootstrap-redox.sh to have been run once. The result is
-# build/redox/build/aarch64/minimal/harddrive.img: a GPT image (ESP at
+# build/redox/build/aarch64/<config>/harddrive.img: a GPT image (ESP at
 # sector 2048 + RedoxFS). For the first hardware tests it boots on the
 # Pinebook Pro using the U-Boot already installed on the eMMC (distro boot
 # scans the microSD ESP), so no repacking is needed yet.
 #
 # Usage:
-#   scripts/build-image.sh [--repo-binary]
+#   scripts/build-image.sh [--config NAME] [--repo-binary]
 #
+#   --config NAME  filesystem config overlay from config/aarch64/
+#                  pinebook-pro/NAME.toml (default: minimal). The Redox
+#                  build then runs with CONFIG_NAME=NAME, so the image lands
+#                  in build/redox/build/aarch64/NAME/harddrive.img.
 #   --repo-binary  override .config and use prebuilt aarch64 packages from
 #                  the Redox server (much faster if they exist; availability
 #                  unverified, see README section 7, risk 7)
@@ -18,8 +22,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REDOX_DIR="${PBP_REDOX_DIR:-$REPO_ROOT/build/redox}"
-OVERLAY_SRC="$REPO_ROOT/config/aarch64/pinebook-pro/minimal.toml"
-IMG="$REDOX_DIR/build/aarch64/minimal/harddrive.img"
+CONFIG_NAME="minimal"
 REPO_BINARY=""
 
 die() {
@@ -28,12 +31,13 @@ die() {
 }
 
 usage() {
-    echo "usage: scripts/build-image.sh [--repo-binary]"
+    echo "usage: scripts/build-image.sh [--config NAME] [--repo-binary]"
     exit 0
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --config) CONFIG_NAME="${2:?--config needs a value}"; shift ;;
         --repo-binary) REPO_BINARY=1 ;;
         -h|--help) usage ;;
         *) die "unknown argument: $1 (see --help)" ;;
@@ -41,12 +45,15 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+OVERLAY_SRC="$REPO_ROOT/config/aarch64/pinebook-pro/$CONFIG_NAME.toml"
+IMG="$REDOX_DIR/build/aarch64/$CONFIG_NAME/harddrive.img"
+
 [ -f "$REDOX_DIR/Makefile" ] || die "no Redox tree at $REDOX_DIR (run scripts/bootstrap-redox.sh first)"
 [ -f "$OVERLAY_SRC" ] || die "overlay config missing: $OVERLAY_SRC"
 
 # Re-inject the overlay on every run: this repository is the source of truth.
 mkdir -p "$REDOX_DIR/config/aarch64/pinebook-pro"
-cp -f "$OVERLAY_SRC" "$REDOX_DIR/config/aarch64/pinebook-pro/minimal.toml"
+cp -f "$OVERLAY_SRC" "$REDOX_DIR/config/aarch64/pinebook-pro/$CONFIG_NAME.toml"
 
 # The changes have to be injected after the cookbook has fetched a recipe's
 # sources and before anything is compiled from them, so a fresh tree needs that
@@ -69,9 +76,11 @@ echo "==> applying patches"
 
 echo "==> build settings"
 grep -E '^(ARCH|CONFIG_NAME|FILESYSTEM_CONFIG|PODMAN_BUILD|REPO_BINARY)' "$REDOX_DIR/.config" || true
-echo "==> building (the first run is long; later runs are incremental)"
+echo "==> building config '$CONFIG_NAME' (the first run is long; later runs are incremental)"
 
-make -C "$REDOX_DIR" all ${REPO_BINARY:+REPO_BINARY=$REPO_BINARY}
+make -C "$REDOX_DIR" all ${REPO_BINARY:+REPO_BINARY=$REPO_BINARY} \
+    CONFIG_NAME="$CONFIG_NAME" \
+    FILESYSTEM_CONFIG="config/aarch64/pinebook-pro/$CONFIG_NAME.toml"
 
 [ -f "$IMG" ] || die "build finished but the image is missing: $IMG"
 
