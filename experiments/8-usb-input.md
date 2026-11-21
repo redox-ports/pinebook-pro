@@ -612,3 +612,40 @@ enumerates, `polling 2 keyboard(s)`).
 Expected on the next hardware run: devices behind the Genesys hub (touchpad
 and whatever else U-Boot sees there) finally appear; the keyboard polling
 path is already proven on `fe3a0000`.
+
+## Iteration 10 — devices behind the hub enumerate; laptop console freeze
+
+(2026-11-21)
+
+The port-power image (sha256 `f07db21f…`, log `logs/serial-20261121-142243.log`)
+**enumerates the whole internal USB tree**:
+
+```
+hub with 4 port(s), power-on 100 ms
+hub port 1: device attached  -> 046d:c52f (Logitech, touchpad), protocol 2
+                                         "boot mouse interface, report parser not implemented yet"
+hub port 2: device attached  -> 0c45:6321 (Sonix webcam), no HID, ignored
+```
+
+The keyboard path is unchanged and worked through a full serial session
+(login, shell, `exit`, respawned login banner).
+
+**New problem: the laptop console (framebuffer VT) froze at some point and
+the keyboard stopped delivering.** The serial log shows no ohcid error after
+`polling 1 keyboard(s)`, and the freeze moment is unknown ("didn't notice
+when exactly"). Notably the devices behind the hub are passive for the bus
+(USB is host-scheduled; without an armed interrupt ED nobody polls the
+touchpad's reports), so touchpad motion cannot itself generate traffic —
+the correlation may be coincidence.
+
+Ruled out on the way: the periodic list with PLE=1 over a zeroed HCCA table
+is the U-Boot/Linux pattern and NULL entries terminate the walk — U-Boot
+does exactly this on this SoC during its own scans.
+
+Diagnostics added for the next run: a poll-loop heartbeat
+(`ohcid: alive, N report(s)` every 5 s). On the next freeze it separates:
+- heartbeats continue, reports continue -> driver and kernel alive, freeze
+  is downstream (inputd / vesad / console scheme);
+- heartbeats continue, reports stall at 0 -> the interrupt ED stopped
+  completing (HC wedge / device issue);
+- heartbeats stop -> the driver or the kernel itself died.

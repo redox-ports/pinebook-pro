@@ -316,9 +316,26 @@ impl Driver {
         let hids = &mut self.hids;
         let input = &mut self.input;
         let log = &self.log;
+        // Heartbeat (experiment 8, iteration 10): a laptop-console freeze
+        // happened with no ohcid error lines — this discriminates a wedged
+        // driver (heartbeats stop or the report counter stalls) from a
+        // downstream freeze (heartbeats continue after the console dies)
+        // and proves the kernel + debug scheme alive through the freeze.
+        let mut last_beat = ohci::now_ms();
+        let mut beat_reports: u64 = 0;
         loop {
             for hid in hids.iter_mut() {
                 hid.poll(&mut hcs[hid.hc_index], input, log);
+            }
+            let now = ohci::now_ms();
+            if now.wrapping_sub(last_beat) >= 5_000 {
+                let reports: u64 = hids.iter().map(|h| h.reports).sum();
+                log.log(format_args!(
+                    "ohcid: alive, {} report(s)",
+                    reports.saturating_sub(beat_reports)
+                ));
+                beat_reports = reports;
+                last_beat = now;
             }
             thread::yield_now();
         }
@@ -846,6 +863,7 @@ impl<'a> Enumeration<'a> {
             low_speed,
             prev_modifiers: 0,
             prev_keys: [0; 6],
+            reports: 0,
         });
         Ok(())
     }
@@ -941,6 +959,8 @@ struct HidDevice {
     low_speed: bool,
     prev_modifiers: u8,
     prev_keys: [u8; 6],
+    /// Completed interrupt transfers (heartbeat diagnostics).
+    reports: u64,
 }
 
 impl HidDevice {
@@ -948,6 +968,7 @@ impl HidDevice {
         if !hc.interrupt_done(self.td) {
             return;
         }
+        self.reports += 1;
 
         let cc = hc.interrupt_cc(self.td);
         let len = hc.td_transferred(self.td, self.buf_phys, usize::from(self.mps));
