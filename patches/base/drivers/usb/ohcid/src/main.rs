@@ -209,6 +209,7 @@ impl Driver {
                 next_ed: 4, // slots 0..3 are the control pipe
                 next_td: 4,
                 next_slot: 0,
+                root_port: None,
                 found: Vec::new(),
             };
 
@@ -233,6 +234,7 @@ impl Driver {
                 if status & 1 == 0 {
                     continue;
                 }
+                en.root_port = Some(port);
 
                 match en.hc.reset_root_port(port) {
                     Ok((connected, low_speed, enabled)) => {
@@ -327,6 +329,73 @@ impl Driver {
             for hid in hids.iter_mut() {
                 hid.poll(&mut hcs[hid.hc_index], input, log);
             }
+            // Self-healing (experiment 8, iteration 13): both input devices
+            // can stop answering with the port still connected (the owner
+            // correlates it with touching the touchpad). When a device that
+            // previously delivered reports falls silent for 15 s, reset its
+            // root port and enumerate it again — the port reset returns the
+            // device to address 0, so the full control dance is redone.
+            let now2 = ohci::now_ms();
+            for hid in hids.iter_mut() {
+                if hid.reports == 0
+                    || hid.root_port.is_none()
+                    || now2.wrapping_sub(hid.last_report_ms) < 15_000
+                {
+                    continue;
+                }
+                log.log(format_args!(
+                    "ohcid: input addr {} silent for 15 s, resetting its port",
+                    hid.addr
+                ));
+                let hc = &mut hcs[hid.hc_index];
+                match hc.reset_root_port(0) {
+                    Ok((connected, low_speed, enabled)) => {
+                        log.log(format_args!(
+                            "ohcid: revive port reset: connected {} low-speed {} enabled {}",
+                            connected, low_speed, enabled
+                        ));
+                        if connected && enabled {
+                            hc.delay_ms(20);
+                            let mut en = Enumeration {
+                                hc,
+                                log,
+                                hc_index: hid.hc_index,
+                                next_addr: 1,
+                                next_ed: 4,
+                                next_td: 4,
+                                next_slot: 0,
+                                root_port: Some(0),
+                                found: Vec::new(),
+                            };
+                            match en.enumerate_at_zero(low_speed, 0) {
+                                Ok(()) => {
+                                    if let Some(fresh) =
+                                        en.found.into_iter().find(|d| d.kind == HidKind::Keyboard)
+                                    {
+                                        log.log(format_args!(
+                                            "ohcid: revived keyboard addr {}",
+                                            fresh.addr
+                                        ));
+                                        *hid = fresh;
+                                        continue;
+                                    }
+                                    log.log(format_args!(
+                                        "ohcid: revive found no keyboard after reset"
+                                    ));
+                                }
+                                Err(err) => log.log(format_args!(
+                                    "ohcid: revive enumeration failed: {:?}",
+                                    err
+                                )),
+                            }
+                        }
+                    }
+                    Err(err) => log.log(format_args!("ohcid: revive port reset failed: {:?}", err)),
+                }
+                // Nothing worked: back off so the next attempt is not an
+                // endless tight loop of resets.
+                hid.last_report_ms = now2;
+            }
             let now = ohci::now_ms();
             if now.wrapping_sub(last_beat) >= 5_000 {
                 let reports: u64 = hids.iter().map(|h| h.reports).sum();
@@ -411,6 +480,9 @@ struct Enumeration<'a> {
     next_ed: usize,
     next_td: usize,
     next_slot: usize,
+    /// Root hub port being enumerated (None while walking hub ports —
+    /// reviving a device behind a hub needs a hub-port reset instead).
+    root_port: Option<usize>,
     found: Vec<HidDevice>,
 }
 
@@ -601,6 +673,8 @@ impl<'a> Enumeration<'a> {
         mps0: u8,
         depth: u8,
     ) -> Result<(), Error> {
+        // Everything past this point hangs off hub ports, not the root hub.
+        self.root_port = None;
         if depth >= 1 {
             self.log
                 .log(format_args!("ohcid:   nested hub ignored (one level only)"));
@@ -895,9 +969,11 @@ impl<'a> Enumeration<'a> {
             ep: info.ep_number,
             low_speed,
             kind,
+            root_port: self.root_port,
             prev_modifiers: 0,
             prev_keys: [0; 6],
             reports: 0,
+            last_report_ms: ohci::now_ms(),
         });
         Ok(())
     }
@@ -1003,10 +1079,15 @@ struct HidDevice {
     ep: u8,
     low_speed: bool,
     kind: HidKind,
+    /// Root hub port this device sits on; `None` for devices behind a hub
+    /// (reviving those needs a hub-port reset, a separate path).
+    root_port: Option<usize>,
     prev_modifiers: u8,
     prev_keys: [u8; 6],
     /// Completed interrupt transfers (heartbeat diagnostics).
     reports: u64,
+    /// Timestamp of the last completed report (stall detection).
+    last_report_ms: u64,
 }
 
 impl HidDevice {
@@ -1015,6 +1096,7 @@ impl HidDevice {
             return;
         }
         self.reports += 1;
+        self.last_report_ms = ohci::now_ms();
 
         let cc = hc.interrupt_cc(self.td);
         let len = hc.td_transferred(self.td, self.buf_phys, usize::from(self.mps));

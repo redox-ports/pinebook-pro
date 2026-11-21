@@ -717,3 +717,38 @@ QEMU rig with an added `usb-mouse`: the mouse arms and polls
 
 Hardware check pending: swipe the touchpad extensively with the keyboard
 working — if the keyboard survives, the drain theory holds.
+
+## Iteration 13 — drain does not save it; self-healing port reset added
+
+(2026-11-21)
+
+The drain image (sha256 `d874a6be…`, log `logs/serial-20261121-145319.log`):
+the touchpad was armed and polled (`polling mouse addr 2 endpoint 1 via
+periodic slot 0`), the owner stroked it thoroughly — and the keyboard still
+died (reports 8/22/… then 0 forever from the same first touch), **and the
+touchpad itself never delivered a single report** (the report counter stayed
+0 in every window; a heartbeat design flaw showed the global sum on both
+lines, but no window after the death was non-zero). Both HC frame counters
+kept advancing, both ports stayed CCS=1+PES=1.
+
+Verified the drain mechanism itself in the rig: `mouse_move` /
+`mouse_button` via the QEMU monitor make the polled `usb-mouse` deliver
+reports (7/20/5 per 5 s window, toggle carry toggling in the ED head). So
+the polling path is sound — on hardware both input devices simply stop
+answering together at the first touch, with the bus healthy.
+
+Interpretation: the touchpad MCU (and the keyboard MCU with it) wedges on
+the first physical touch — both sit on shared input-device power/board
+resources. Why Manjaro survives this is still open (it polls the touchpad
+too, but also configures it as a *mouse* fully; our drain is byte-identical
+transport-wise, so the difference is not in the USB-level polling).
+
+Mitigation implemented (test + workaround): when a root-port device that
+previously delivered reports falls silent for 15 s, the driver resets its
+root port and re-enumerates it (the port reset returns the device to
+address 0, so the full get-descriptor/set-address/set-protocol/arming dance
+is redone, `HidDevice::root_port` tracks which devices this applies to —
+devices behind a hub are skipped, reviving them needs a hub-port reset
+instead). If the keyboard comes back after `revive`, the wedge is soft and
+the system self-heals; if not, the MCU is hard-hung and needs a power
+cycle.
