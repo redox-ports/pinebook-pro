@@ -372,6 +372,15 @@ impl Ohci {
         (self.read(REG_RH_A) & RH_A_NDP) as usize
     }
 
+    /// HCCA frame number, incremented by the HC every 1 ms frame. A stalled
+    /// counter means the HC stopped arbitrating the bus (diagnostics).
+    pub fn frame_number(&self) -> u32 {
+        // HccaFrameNumber sits at byte offset 128 of the HCCA — after the
+        // 32-entry interrupt table (`struct ohci_hcca`, OHCI spec 5.2.2);
+        // the HC writes it through DMA, so read it volatile.
+        unsafe { ptr::read_volatile((self.hcca.virt_addr() + 128) as *const u32) }
+    }
+
     /// Power the root hub ports if the controller needs it.
     pub fn power_ports(&mut self) -> Result<()> {
         let rh_a = self.read(REG_RH_A);

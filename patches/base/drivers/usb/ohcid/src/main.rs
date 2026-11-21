@@ -330,10 +330,27 @@ impl Driver {
             let now = ohci::now_ms();
             if now.wrapping_sub(last_beat) >= 5_000 {
                 let reports: u64 = hids.iter().map(|h| h.reports).sum();
-                log.log(format_args!(
-                    "ohcid: alive, {} report(s)",
-                    reports.saturating_sub(beat_reports)
-                ));
+                // Per-device state for the wedge diagnosis: ED head (halt /
+                // toggle-carry bits), TD condition code, root port status and
+                // the HC frame counter (advancing frame number = the HC is
+                // alive and sending SOFs).
+                for hid in hids.iter() {
+                    let hc = &hcs[hid.hc_index];
+                    log.log(format_args!(
+                        "ohcid: alive, {} report(s); kb ed head {:#x} td cc {:#x} port {:#x} frame {:#x}",
+                        reports.saturating_sub(beat_reports),
+                        hc.ed(hid.ed).head,
+                        hc.interrupt_cc(hid.td),
+                        hc.port_status(0),
+                        hc.frame_number(),
+                    ));
+                }
+                if hids.is_empty() {
+                    log.log(format_args!(
+                        "ohcid: alive, {} report(s)",
+                        reports.saturating_sub(beat_reports)
+                    ));
+                }
                 beat_reports = reports;
                 last_beat = now;
             }

@@ -649,3 +649,33 @@ Diagnostics added for the next run: a poll-loop heartbeat
 - heartbeats continue, reports stall at 0 -> the interrupt ED stopped
   completing (HC wedge / device issue);
 - heartbeats stop -> the driver or the kernel itself died.
+
+## Iteration 11 — heartbeat localizes the wedge: interrupt ED stops completing
+
+(2026-11-21)
+
+The heartbeat image (sha256 `d23696d6…`, log `logs/serial-20261121-143439.log`)
+caught the freeze in the act. The keyboard worked for about a minute
+(8/2/19/17/8 reports per 5 s window while typing), then fell to **0 reports
+permanently between 62 s and 67 s** while the heartbeats continued — the
+driver process, the kernel and the debug scheme stayed alive. The owner
+correlated the death explicitly with touching the touchpad this time.
+
+So the poll loop spins but the interrupt TD never retires again. Silent
+because `interrupt_done` only checks the TD condition code: an ED halted by
+the HC with the TD left unretired (or a device that stopped answering)
+leaves CC = NOT_ACCESSED forever and no error path logs anything.
+
+Notable: the touchpad sits on the other controller (`fe3e0000`), is
+enumerated but **not polled** (no armed ED) — USB is host-scheduled, so
+touching it cannot itself create bus traffic. The correlation therefore has
+to act through either the shared power rails, the hub re-reporting port
+status, or something in the OHCI/runtime state — unknown yet.
+
+Next diagnostics (image built, sha256 `…`): the heartbeat now carries per
+keyboard device: ED head word (halt bit 0x1, toggle carry 0x2), TD condition
+code, root port status (CCS/PES — did the keyboard detach?), and the HCCA
+frame counter at the spec offset 128 (advancing = the HC keeps arbitrating
+and sending SOFs). QEMU-verified: the frame counter advances at 1 kHz, the
+fields show the idle state as expected (ed head without halt, cc 0xf, port
+0x103).
