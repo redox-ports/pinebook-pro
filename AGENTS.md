@@ -108,7 +108,7 @@ fix(ci): prune runner disk before redox build
   passing a DMA _physical_ address to cache maintenance faults at EL0 on real
   hardware ("Lacks grant", driver killed) and is **invisible in QEMU** (TCG does
   no translation for CM-by-VA) — always clean through the Dma virtual mapping.
-  Hardware re-test of the fixed enumeration pending.
+  **Iteration 7 (2026-11-21): the keyboard works on hardware** — `258a:001e` sits directly on `fe3a0000` (low-speed), enumerates, boot protocol, reports into the VT. First-keystroke loss fixed (SET_IDLE 0 = report-on-change: the first report after arming is the first key press, not an idle snapshot — no first-report swallowing). The Genesys hub on `fe3e0000` (touchpad) still stalls on the first descriptor with a setup-buffer-zeros anomaly (TDs from the same page are delivered fine); not reproducible in the two-controller QEMU rig (`pci-ohci` BARs 0x10100000 + 0x10100100 — the driver now tolerates unaligned DT `reg` bases), `Ohci::diag_setup_buffer` discriminates write-broken mapping / lost write / cache attribute on the next run. Hardware re-check pending.
 - **Redox bring-up status (2026-11-20, experiments 4–6):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on

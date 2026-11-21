@@ -476,3 +476,55 @@ Hardware check pending (one flash, image rebuilt with the fix): expected
 `root device …`, `hub with N port(s)` on `fe3e0000` and `polling N
 keyboard(s)`; the low-speed device on `fe3a0000` may still fail enumeration
 (for it, any timeout now reflects the device, not the driver).
+
+## Iteration 7 — keyboard works on hardware; first keystroke; hub stall
+
+(2026-11-21)
+
+The fixed image (sha256 `17405451…`, log `logs/serial-20261121-125955.log`)
+**enumerates and drives the internal keyboard on hardware.** The keyboard
+(`258a:001e`, low-speed) turned out to sit **directly on `fe3a0000`
+(`usb_host0_ohci`)** — not behind the Genesys hub: full enumeration
+(`root device addr 1 id 258a:001e … low-speed`), boot protocol, and
+`polling 1 keyboard(s)`; the owner typed the login name on the laptop keyboard
+and it reached the VT.
+
+Two follow-ups:
+
+1. **The first keystroke was lost** ("user" arrived as "ser"). Cause: the
+   driver sends `SET_IDLE` with duration 0, so the keyboard reports **only on
+   state change** — the first interrupt report after arming is the first key
+   press, not an idle snapshot. `handle_report` discarded the first report
+   ("current idle state" assumption) and ate it. Fix: no first-report
+   swallowing; the diff runs against the initial all-keys-up state, which is
+   correct for both a state-change report and a genuine idle snapshot.
+
+2. **`fe3e0000` (Genesys hub, touchpad behind it) still stalls** on the first
+   `GET_DESCRIPTOR`: setup TD retires CC=0 (8 bytes transmitted and ACKed),
+   data TD STALLs, and — the strange part — the setup buffer in the tail of
+   the TD page reads back as **zeros** through the driver's own Dma mapping,
+   while the TDs at the head of the **same page** were delivered to the HC
+   correctly (it walked the chain with our cbp/be values and retired the TDs).
+   The 11:04 run's read-back still showed the packet, so something between
+   the two builds changed whether that write survives; the write path itself
+   is identical.
+
+   Not reproducible in emulation: the QEMU rig now has **two** `pci-ohci`
+   controllers (second BAR at `0x10100100`, unaligned — the driver now maps
+   page-aligned base + offset, which hardware never needs but tolerates), with
+   the hub on the second controller — the whole tree enumerates and
+   `polling 2 keyboard(s)`. So the failure is hardware/controller-specific,
+   and the buffer-zeros symptom does not involve the driver's protocol logic.
+
+   Diagnostics added for the next hardware run (`Ohci::diag_setup_buffer`,
+   triggered only when the first get_descriptor fails): the buffer virtual
+   address, a pattern **written and read back** through the Dma mapping
+   (discriminates a write-broken mapping from a lost one-off write), the same
+   area through an independent `physical@uc` physmap (RAM refuses `dev`;
+   catches cache-attribute and virt-to-phys divergence), a canary at an
+   untouched tail offset, and the first TD as the CPU sees it.
+
+   Hypotheses still open: lost/stale store to the buffer area only (cache
+   attribute of the mmap'd DMA page on this kernel?), an interconnect quirk of
+   `usb_host1` reading that DRAM range, or the real hub stalling for its own
+   reasons with the zeros being an artifact of the read-back path.

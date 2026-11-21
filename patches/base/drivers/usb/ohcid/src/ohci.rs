@@ -188,6 +188,20 @@ const TD_POOL: usize = 64;
 /// Bytes of shared buffer space for setup packets, descriptors and reports.
 const BUF_POOL: usize = 4096;
 
+/// Result of the setup-buffer diagnostics (see `Ohci::diag_setup_buffer`).
+pub struct SetupBufferDiag {
+    /// Virtual address of the setup buffer area.
+    pub va: usize,
+    /// The first TD as the CPU sees it (retired values if a transfer ran).
+    pub td0: [u32; 4],
+    /// Pattern written to the setup area and read back through the Dma map.
+    pub write_readback: Vec<u8>,
+    /// The same area read through an independent Uncacheable physmap.
+    pub phys_view: Option<Vec<u8>>,
+    /// Canary written to an untouched tail offset and read back.
+    pub canary: Vec<u8>,
+}
+
 #[inline]
 fn ed_info(addr: u8, endpoint: u8, low_speed: bool, dir: u32, mps: u16) -> u32 {
     u32::from(addr & 0x7f)
@@ -216,15 +230,21 @@ impl Ohci {
             "ohcid: 0x{:08x}: mapping the register window",
             base
         ));
-        let regs = unsafe {
+        // Some firmware places controllers at unaligned BARs (the QEMU
+        // pci-ohci rig lands the second controller at +0x100 inside the
+        // first one's page); physmap needs a page-aligned address.
+        let page = base & !0xfff;
+        let off = base & 0xfff;
+        let map = unsafe {
             common::physmap(
-                base,
+                page,
                 0x1000,
                 common::Prot::RW,
                 common::MemoryType::DeviceMemory,
             )
         }
         .map_err(|_| Error::Protocol("cannot map OHCI registers"))? as usize;
+        let regs = map + off;
         log.log(format_args!(
             "ohcid: 0x{:08x}: registers at 0x{:08x}",
             base, regs
@@ -502,18 +522,15 @@ impl Ohci {
             .collect()
     }
 
-    /// Read buffer bytes through an independent DeviceMemory mapping of the
-    /// same physical page (diagnostics: catches virt-to-phys divergence).
+    /// Read buffer bytes through an independent mapping of the same
+    /// physical page (diagnostics: catches virt-to-phys divergence and cache
+    /// attribute mismatches). RAM ranges are mapped Uncacheable; the device
+    /// type is refused for RAM by the kernel.
     pub fn buf_bytes_via_physmap(&self, off: usize, len: usize) -> Option<Vec<u8>> {
         const TD_BUF_OFF: usize = 1024;
         let phys = self.tds.physical() + TD_BUF_OFF + off;
         let map = unsafe {
-            common::physmap(
-                phys,
-                len,
-                common::Prot::RW,
-                common::MemoryType::DeviceMemory,
-            )
+            common::physmap(phys, len, common::Prot::RW, common::MemoryType::Uncacheable)
         }
         .ok()?;
         let mut out = Vec::with_capacity(len);
@@ -521,6 +538,44 @@ impl Ohci {
             out.push(unsafe { ptr::read_volatile((map as usize + i) as *const u8) });
         }
         Some(out)
+    }
+
+    /// Diagnostics for the setup-buffer-zeros anomaly on the second hardware
+    /// controller (experiment 8, iteration 7): the HC walks the TDs at the
+    /// head of the TD page correctly but transmits zeros from the buffer
+    /// tail of the very same page, and the driver read-back sees zeros too.
+    /// Discriminates a write-broken mapping from a lost single write.
+    pub fn diag_setup_buffer(&mut self) -> SetupBufferDiag {
+        const TD_BUF_OFF: usize = 1024;
+        let va = self.tds.virt_addr() + TD_BUF_OFF;
+        let td0 = [
+            self.tds[0].info,
+            self.tds[0].cbp,
+            self.tds[0].next,
+            self.tds[0].be,
+        ];
+
+        // Write a known pattern into the setup area and read it back
+        // through the same mapping.
+        let pattern = [0x5au8, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x55, 0xaa];
+        self.buf_slice_mut(0, 8).copy_from_slice(&pattern);
+        let wb = self.buf_bytes_volatile(0, 8);
+
+        // Same through an independent Uncacheable mapping of the phys.
+        let phys_view = self.buf_bytes_via_physmap(0, 8);
+
+        // Canary in the untouched middle of the tail.
+        self.buf_slice_mut(2048, 4)
+            .copy_from_slice(&[0xc3u8, 0x3c, 0xa5, 0x5a]);
+        let canary = self.buf_bytes_volatile(2048, 4);
+
+        SetupBufferDiag {
+            va,
+            td0,
+            write_readback: wb,
+            phys_view,
+            canary,
+        }
     }
 
     /// Fill one general TD and link it to `next`.

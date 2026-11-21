@@ -396,18 +396,20 @@ impl<'a> Enumeration<'a> {
         // First 8 bytes: enough to learn wMaxPacketSize0.
         let mut first = [0u8; 8];
         if let Err(err) = self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first) {
-            // Diagnostics for the first control transfer: compare the Dma
-            // mapping view with an independent DeviceMemory view of the same
-            // physical page, and log what the setup packet looks like from
-            // both sides. See experiment 8, iteration 2.
-            let dma_view = self.hc.buf_bytes_volatile(0, 8);
-            let phys_view = self.hc.buf_bytes_via_physmap(0, 8);
+            // Diagnostics for the first control transfer (experiment 8,
+            // iterations 2 and 7): the setup buffer of the second hardware
+            // controller reads back as zeros although the TDs in the head of
+            // the same page are delivered to the controller correctly.
+            let d = self.hc.diag_setup_buffer();
             self.log.log(format_args!(
-                "ohcid:   dbg: first get_descriptor failed {:?}; buf phys 0x{:08x}; dma-view {:02x?}; physmap-view {:?}",
+                "ohcid:   dbg: first get_descriptor failed {:?}; buf va 0x{:08x} phys 0x{:08x}; write-rb {:02x?}; phys-view {:02x?}; canary {:02x?}; td0 {:08x?}",
                 err,
+                d.va,
                 self.hc.bufs_physical(),
-                dma_view,
-                phys_view
+                d.write_readback,
+                d.phys_view,
+                d.canary,
+                d.td0,
             ));
             return Err(err);
         }
@@ -803,7 +805,6 @@ impl<'a> Enumeration<'a> {
             low_speed,
             prev_modifiers: 0,
             prev_keys: [0; 6],
-            seen: false,
         });
         Ok(())
     }
@@ -899,7 +900,6 @@ struct HidDevice {
     low_speed: bool,
     prev_modifiers: u8,
     prev_keys: [u8; 6],
-    seen: bool,
 }
 
 impl HidDevice {
@@ -947,13 +947,12 @@ impl HidDevice {
         let mut keys = [0u8; 6];
         keys.copy_from_slice(&report[2..8]);
 
-        if !self.seen {
-            // The first report is the current idle state, not a key press.
-            self.seen = true;
-            self.prev_modifiers = modifiers;
-            self.prev_keys = keys;
-            return;
-        }
+        // No first-report swallowing: SET_IDLE 0 makes the keyboard report
+        // only on state change, so the first report IS the first key press
+        // (experiment 8, iteration 7: the login's first character was eaten
+        // by an "first report = idle state" assumption). The diff below runs
+        // against the initial all-keys-up state, which is correct for both a
+        // state-change report and a genuine idle snapshot.
 
         // Modifier bits map to usages 0xE0..0xE7.
         for bit in 0..8u8 {
