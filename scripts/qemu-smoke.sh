@@ -87,7 +87,7 @@ set +e
 timeout "$SECONDS_LIMIT" qemu-system-aarch64 \
     -M virt,gic-version=3 -cpu cortex-a72 -m 4G -smp 1 \
     -bios "$UBOOT_BIN" \
-    -drive if=none,id=d0,file="$IMAGE",format=raw \
+    -drive if=none,id=d0,file="$IMAGE",format=raw,readonly=on \
     -device virtio-blk-device,drive=d0 \
     -device ramfb -display none \
     -serial "file:$LOG" -monitor none -no-reboot

@@ -20,6 +20,54 @@ use common::dma::Dma;
 
 use crate::log::Logger;
 
+/// Clean the data cache over a virtual range so a non-snooping USB
+/// controller reads the freshly written descriptor/buffer content.
+///
+/// The DMA memory is requested as Uncacheable, but if the kernel mapping
+/// does not honour that attribute (or the allocation lands on cacheable
+/// pages) the controller reads stale zeros — exactly the enumeration
+/// symptom seen on hardware (experiment 8, iteration 2). DC CVAC/DSB are
+/// EL0-accessible; on other architectures this is a no-op.
+#[cfg(target_arch = "aarch64")]
+fn cache_clean_range(virt: usize, len: usize) {
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = (4usize) << ((ctr >> 16) & 0xf);
+        let mut a = virt & !(dline - 1);
+        let end = (virt + len + dline - 1) & !(dline - 1);
+        while a < end {
+            core::arch::asm!("dc cvac, {}", in(reg) a, options(nostack));
+            a += dline;
+        }
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn cache_clean_range(_virt: usize, _len: usize) {}
+
+/// Invalidate the data cache over a virtual range so the CPU reads the data
+/// a non-snooping controller wrote back instead of its own stale lines.
+#[cfg(target_arch = "aarch64")]
+fn cache_invalidate_range(virt: usize, len: usize) {
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = (4usize) << ((ctr >> 16) & 0xf);
+        let mut a = virt & !(dline - 1);
+        let end = (virt + len + dline - 1) & !(dline - 1);
+        while a < end {
+            core::arch::asm!("dc ivac, {}", in(reg) a, options(nostack));
+            a += dline;
+        }
+        core::arch::asm!("dsb sy", "isb", options(nostack));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn cache_invalidate_range(_virt: usize, _len: usize) {}
+
 // Register offsets (OHCI spec section 7, `struct ohci_regs`).
 pub const REG_REVISION: usize = 0x00;
 pub const REG_CONTROL: usize = 0x04;
@@ -273,6 +321,8 @@ impl Ohci {
         self.write(REG_ED_BULKHEAD, 0);
         self.write(REG_ED_BULKCURRENT, 0);
         self.write(REG_HCCA, hcca_phys as u32);
+        // The HC writes frame/done-head back into the HCCA through DMA.
+        cache_clean_range(self.hcca.virt() as usize, 256);
 
         // Frame timing: 11999 means one frame every 1 ms. FSMPS (largest
         // packet) and PeriodicStart follow Linux `periodic_reinit()`.
@@ -399,24 +449,75 @@ impl Ohci {
         self.tds.physical() + index * size_of::<Td>()
     }
 
-    /// Reserve `len` bytes in the shared DMA buffer arena and return
+    /// Reserve `len` bytes in the shared buffer arena and return
     /// `(offset, physical)`. The arena is allocated once and never reused.
+    ///
+    /// DIAGNOSTIC (experiment 8, iteration 2): the buffers live in the tail
+    /// of the TD page instead of their own allocation. The HC reads our TDs
+    /// from the TD page correctly, but saw stale zeros in the separate
+    /// phys_contiguous buffer page; if transfers work from this page, the
+    /// separate allocation is the problem.
     pub fn alloc_buf(&mut self, len: usize) -> Result<(usize, usize)> {
+        const TD_BUF_OFF: usize = 1024; // 64 TDs x 16 bytes
         let off = self.next_buf;
         let end = off + len.max(1);
-        if end > BUF_POOL {
+        if TD_BUF_OFF + end > 4096 {
             return Err(Error::OutOfMemory);
         }
-        self.next_buf = (end + 15) & !15;
-        Ok((off, self.bufs.physical() + off))
+        self.next_buf = TD_BUF_OFF + ((end + 15) & !15);
+        Ok((off, self.tds.physical() + TD_BUF_OFF + off))
+    }
+
+    fn td_page_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.tds.virt() as *mut u8, 4096) }
     }
 
     pub fn buf_slice_mut(&mut self, off: usize, len: usize) -> &mut [u8] {
-        &mut self.bufs[off..off + len]
+        const TD_BUF_OFF: usize = 1024;
+        let base = self.td_page_bytes_mut();
+        &mut base[TD_BUF_OFF + off..TD_BUF_OFF + off + len]
     }
 
     pub fn buf_slice(&self, off: usize, len: usize) -> &[u8] {
-        &self.bufs[off..off + len]
+        const TD_BUF_OFF: usize = 1024;
+        let base = unsafe { core::slice::from_raw_parts(self.tds.virt() as *const u8, 4096) };
+        &base[TD_BUF_OFF + off..TD_BUF_OFF + off + len]
+    }
+
+    /// Physical base address of the shared buffer arena (diagnostics).
+    pub fn bufs_physical(&self) -> usize {
+        const TD_BUF_OFF: usize = 1024;
+        self.tds.physical() + TD_BUF_OFF
+    }
+
+    /// Read buffer bytes through the Dma mapping, volatile (diagnostics).
+    pub fn buf_bytes_volatile(&self, off: usize, len: usize) -> Vec<u8> {
+        const TD_BUF_OFF: usize = 1024;
+        let base = unsafe { core::slice::from_raw_parts(self.tds.virt() as *const u8, 4096) };
+        (0..len)
+            .map(|i| unsafe { ptr::read_volatile(base.as_ptr().add(TD_BUF_OFF + off + i)) })
+            .collect()
+    }
+
+    /// Read buffer bytes through an independent DeviceMemory mapping of the
+    /// same physical page (diagnostics: catches virt-to-phys divergence).
+    pub fn buf_bytes_via_physmap(&self, off: usize, len: usize) -> Option<Vec<u8>> {
+        const TD_BUF_OFF: usize = 1024;
+        let phys = self.tds.physical() + TD_BUF_OFF + off;
+        let map = unsafe {
+            common::physmap(
+                phys,
+                len,
+                common::Prot::RW,
+                common::MemoryType::DeviceMemory,
+            )
+        }
+        .ok()?;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            out.push(unsafe { ptr::read_volatile((map as usize + i) as *const u8) });
+        }
+        Some(out)
     }
 
     /// Fill one general TD and link it to `next`.
@@ -466,6 +567,14 @@ impl Ohci {
     ) -> Result<usize> {
         let (setup_off, setup_phys) = self.alloc_buf(8)?;
         self.buf_slice_mut(setup_off, 8).copy_from_slice(&setup);
+        // DIAGNOSTIC (experiment 8, iteration 2): the HC reads zeros from
+        // this buffer although the CPU view shows the packet; log the exact
+        // physical address so the RAM can be inspected from the QEMU monitor
+        // during the diagnostic delay below.
+        println!(
+            "ohcid:   dbg: setup phys 0x{:08x} bytes {:02x?}",
+            setup_phys, setup
+        );
 
         let data_len = data.as_ref().map_or(0, |d| d.len());
         let (data_off, data_phys) = if data_len > 0 {
@@ -535,7 +644,18 @@ impl Ohci {
             ed.next = 0;
         }
 
+        // Push every byte the controller will read out of the caches: the
+        // ED page, and the TD page (the TDs live in its first KiB, the
+        // shared buffers in its tail).
+        cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
+        cache_clean_range(self.tds.virt() as usize, 4096);
+
         self.start_control(ed_index);
+        // DIAGNOSTIC (experiment 8, iteration 2): the HC read stale zeros
+        // from the setup buffer although the CPU view showed the packet;
+        // long pause between the CPU write and the list start so the VM can
+        // be frozen and the RAM inspected before the DMA read happens.
+        self.delay_ms(5000);
         let result = self.wait_td(ed_index, td_status, 500);
         self.stop_control();
 
@@ -547,6 +667,9 @@ impl Ohci {
 
         if data_in {
             if let (Some(off), Some(dst)) = (data_off, data) {
+                // The controller may have written the data through DMA; drop
+                // our possibly stale cache lines before reading it back.
+                cache_invalidate_range(self.tds.virt() as usize + 1024 + off, data_len.max(1));
                 let len = dst.len().min(data_len);
                 let copy = self.buf_slice(off, len).to_vec();
                 dst[..len].copy_from_slice(&copy);
@@ -623,6 +746,11 @@ impl Ohci {
         // keyboard and far simpler than the interval tree Linux builds.
         let entry = self.hcca.physical() as *mut u32;
         unsafe { ptr::write_volatile(entry.add(slot), self.ed_phys(ed_index) as u32) };
+        // The HC reads the periodic table and the ED/TDs through DMA; clean
+        // the cache lines it will touch.
+        cache_clean_range(self.hcca.virt() as usize, 256);
+        cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
+        cache_clean_range(self.tds.virt() as usize, 4096);
 
         let control = self.read(REG_CONTROL);
         if control & CTRL_PLE == 0 {

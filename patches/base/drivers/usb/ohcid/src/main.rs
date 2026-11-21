@@ -146,25 +146,30 @@ impl Driver {
             }
             self.log
                 .log(format_args!("ohcid: devicetree OHCI nodes:{}", list));
-            // U-Boot gates the USB clocks when it hands over to the EFI
-            // payload, and an access to an unclocked controller stalls the
-            // whole machine. Only probe when the gates are really open.
-            if !cru::enable_usb_host_clocks(&self.log) {
-                return;
+            // The CRU/PHY bring-up below applies to the RK3399's own
+            // controllers only: U-Boot gates the USB clocks when it hands
+            // over to the EFI payload, and an access to an unclocked
+            // controller stalls the whole machine, so the gates must be open
+            // before probing. Other platforms (emulation, other boards) must
+            // not touch RK3399 clock registers at all.
+            if bases.iter().any(|base| OHCI_BASES.contains(base)) {
+                if !cru::enable_usb_host_clocks(&self.log) {
+                    return;
+                }
+                // The PHY is powered down as well; without its 480 MHz UTMI
+                // clock the controller sees no devices at all.
+                u2phy::power_on_host_ports(&self.log);
             }
-            // The PHY is powered down as well; without its 480 MHz UTMI clock
-            // the controller sees no devices at all.
-            u2phy::power_on_host_ports(&self.log);
         }
 
-        for base in OHCI_BASES {
-            if !bases.is_empty() && !bases.contains(&base) {
-                self.log.log(format_args!(
-                    "ohcid: 0x{:08x} is not enabled in the devicetree, skipped",
-                    base
-                ));
-                continue;
-            }
+        // Probe what the devicetree names; without devicetree information
+        // fall back to the known RK3399 addresses.
+        let probe: Vec<usize> = if bases.is_empty() {
+            OHCI_BASES.to_vec()
+        } else {
+            bases.clone()
+        };
+        for base in probe {
             if let Err(err) = self.bring_up_controller(base) {
                 self.log
                     .log(format_args!("ohcid: 0x{:08x} failed: {:?}", base, err));
@@ -390,7 +395,22 @@ impl<'a> Enumeration<'a> {
     fn enumerate_at_zero(&mut self, low_speed: bool, depth: u8) -> Result<(), Error> {
         // First 8 bytes: enough to learn wMaxPacketSize0.
         let mut first = [0u8; 8];
-        self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first)?;
+        if let Err(err) = self.get_descriptor(0, low_speed, 8, DESC_DEVICE, 0, &mut first) {
+            // Diagnostics for the first control transfer: compare the Dma
+            // mapping view with an independent DeviceMemory view of the same
+            // physical page, and log what the setup packet looks like from
+            // both sides. See experiment 8, iteration 2.
+            let dma_view = self.hc.buf_bytes_volatile(0, 8);
+            let phys_view = self.hc.buf_bytes_via_physmap(0, 8);
+            self.log.log(format_args!(
+                "ohcid:   dbg: first get_descriptor failed {:?}; buf phys 0x{:08x}; dma-view {:02x?}; physmap-view {:?}",
+                err,
+                self.hc.bufs_physical(),
+                dma_view,
+                phys_view
+            ));
+            return Err(err);
+        }
         let mps0 = match first[7] {
             8 | 16 | 32 | 64 => first[7],
             other => {

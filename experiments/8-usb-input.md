@@ -263,3 +263,117 @@ needed for that: the CRU/PHY step must run only on RK3399-compatible machines (i
 RK3399-specific but currently runs whenever any OHCI node exists), and the probe list
 must come from the devicetree (today only the two hardcoded RK3399 addresses are
 probed). Neither touches the enumeration logic under test.
+
+## Iteration 3 — the QEMU rig works, the bug reproduces, the evidence is contradictory
+
+(2026-11-20 late evening, continued past midnight)
+
+The emulation rig is fully working (all steps are reproducible from the repo):
+
+1. Two driver changes make ohcid place-independent: the CRU/PHY bring-up runs only when
+   the devicetree names the RK3399 controllers, and the probe list comes from the
+   devicetree (fallback to the hardcoded addresses when there is no node).
+2. QEMU provides `pci-ohci`, `usb-hub`, `usb-kbd`; the packaged U-Boot enumerates them
+   (`In: serial,usbkbd`). The DT-driven driver is connected by patching a copy of
+   QEMU's own DTB (`-machine dumpdtb` → add a `generic-ohci` node at the BAR address →
+   `-machine dtb=…`); the BAR (0x10100000) is read from the QEMU monitor
+   (`info pci`). Support scripts: `build/qmon.py` (monitor socket), `build/rig_freeze.py`
+   (freeze + RAM dump), DTB sources `build/qemu-virt-rig.dts`.
+3. Topology mirrors the laptop: hub on root port 1, keyboard on hub port 2
+   (`-device usb-kbd,bus=ohci0.0,port=1.2`).
+
+**The bug reproduces exactly**: `port 1 enumeration failed: Halted` ~20 ms after the
+reset — the same signature as the hardware hub port. The defect is in protocol logic
+or in the memory path, not in RK3399 silicon. Iteration cost is ~2 minutes.
+
+### The evidence trail (QEMU `-trace usb_ohci_td*`, monitor `xp`, driver diagnostics)
+
+- The trace shows the controller transmitting **a SETUP packet of eight zero bytes**
+  (`usb_ohci_td_pkt_full OUT data: 00 00 …`), so the emulated hub answers STALL and
+  halts the ED — the `Halted` explained.
+- The driver's own view of the same buffer shows the correct packet
+  (`80 06 00 01 00 00 08 00` = GET_DESCRIPTOR(device, 8)).
+- Freezing the VM inside the diagnostic delay (buffer written, TD not yet processed)
+  and dumping guest RAM through the monitor (`xp`) at the TD's cbp shows **the packet
+  already present in RAM before the DMA read**; the dump is stable across 12 samples.
+- After resuming, the DMA read of the **same guest-physical address** (cbp printed by
+  the trace equals the address printed by the driver) still returns zeros.
+- A 100 ms and a 5 s pause between the CPU write and the list start change nothing.
+- Moving the buffers into the tail of the TD page (whose contents the controller reads
+  correctly) changes nothing.
+- `info mtree` shows a single flat RAM region (0x40000000-0x13fffffff) in both the
+  system and the PCI DMA address space — no overlapping region at the buffer address.
+
+So: guest RAM contains the packet, the guest CPU sees the packet, and the emulated
+controller's DMA read of the same address sees zeros — in TCG, which does not model
+caches at all. This is logically impossible for a correct emulation and is not
+explained by anything in our driver; the remaining suspects are on the QEMU side
+(Debian qemu-system-aarch64 version/patches, `pci-ohci` + PCIe-root quirks) — or a
+kernel-side virt→phys divergence that both the monitor and the trace would have to
+share, which the address consistency (driver-printed cbp == trace-printed cbp) makes
+unlikely.
+
+### Cross-checks (all confirm the anomaly is systematic)
+
+- **QEMU 8.2.2 (noble build, unpacked into `build/qemu82-root`, run with
+  `LD_LIBRARY_PATH`)** reproduces the identical behaviour (zeros on the wire, STALL,
+  Halted) — so this is not a bug of one specific 10.2.1 build.
+- **Writeback instead of Uncacheable** for the DMA mapping (throwaway edit in the
+  build tree, reverted) — identical result. The MAIR attribute is not the trigger of
+  the QEMU-side anomaly.
+- **Full single-run protocol** (`build/rig_protocol.py`): `xp` during the diagnostic
+  delay shows the packet at the TD's cbp (six samples, stable); after the failure the
+  same address still shows the packet; the trace between those two dumps recorded the
+  DMA read of the same address as eight zero bytes followed by STALL.
+- `info mtree` shows a single flat RAM region (0x40000000-0x13fffffff) in both the
+  system and the PCI DMA address space — no overlapping region at the buffer address.
+
+The QEMU-side anomaly is left open (report upstream with this protocol if it keeps
+blocking emulation work). The hardware side needs its own answer — see the next
+iteration.
+
+## Iteration 4 — cache maintenance in the driver, and the decisive hardware test
+
+(2026-11-21)
+
+Regardless of the QEMU anomaly, the real device can still fail from cache
+incoherence: the RK3399 OHCI does not snoop CPU caches, and the mapping is only
+non-cacheable if every layer honours the request (the rmm aarch64 code looks correct:
+`ENTRY_FLAG_UNCACHEABLE = MEM_ATTR_NC << 2`, wired through `PageFlags::uncacheable`
+into the PTE attribute field — but it has never been verified on this hardware).
+
+The driver now maintains the caches itself, which is both a candidate fix and a
+diagnostic: `dc cvac` + `dsb sy` over the ED page, the TD page (descriptors and
+buffers) and the HCCA before the controller touches them, and `dc ivac` over a data
+buffer before the CPU reads back IN data (`cache_clean_range`/`cache_invalidate_range`
+in `ohci.rs`; EL0-accessible instructions, no-ops on non-aarch64 builds).
+
+**Test built, image sha256 `8839c619…`, hardware check pending** (one flash):
+
+- if enumeration starts working (`root device … polling N keyboard(s)`) — the
+  uncacheable mapping does not work on this kernel/hardware combination, and the
+  driver-side cache maintenance is the practical fix (plus a kernel report);
+- if it still fails with `Halted`/timeout — cache coherence is ruled out on hardware
+  too, and the next step is comparing the wire-level behaviour with U-Boot's OHCI
+  driver sequence register by register.
+
+Diagnostic leftovers kept for this stage: the `dbg:` lines in the serial log, the
+5-second delay between the buffer write and the list start, and the buffer arena
+living in the TD page tail (all marked DIAGNOSTIC in the source).
+
+### State and next steps
+
+- Uncommitted driver state: diagnostics (`dbg:` lines), the diagnostic delay before
+  the list start, the buffer relocation into the TD page, and the two
+  place-independence changes. Keep for the next iteration.
+- Next: (a) try a different QEMU version/build (upstream binary or `-M virt,highmem=off`)
+  to falsify the emulator hypothesis; (b) check what memory type the aarch64 kernel
+  actually applies to `zeroed@uc?phys_contiguous` mappings (the Dma code requests
+  Uncacheable — verify it lands in the page flags on this path); (c) if the emulator
+  hypothesis is confirmed, debug the hardware side directly: the RK3399 OHCI does not
+  snoop caches, so the primary suspect for the real hardware failure is the same
+  zeros-on-the-wire symptom caused by cache incoherence — test by flushing/invalidating
+  the buffer range in the driver (DC CVAC/IVAC is EL0-accessible) or by making the
+  buffer mapping device-typed.
+- The keyboard stays deferred until enumeration works; everything else in the
+  deliverable image is hardware-verified (iteration 2 of experiment 12).
