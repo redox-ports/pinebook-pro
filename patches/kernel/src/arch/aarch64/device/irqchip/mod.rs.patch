@@ -1,0 +1,102 @@
+diff --git a/src/arch/aarch64/device/irqchip/mod.rs b/src/arch/aarch64/device/irqchip/mod.rs
+index 01489060..16689b8b 100644
+--- a/src/arch/aarch64/device/irqchip/mod.rs
++++ b/src/arch/aarch64/device/irqchip/mod.rs
+@@ -43,21 +43,44 @@ pub(crate) fn ic_for_chip(fdt: &Fdt, node: &FdtNode) -> Option<usize> {
+     }
+ }
+ 
++/// Run a closure with the root interrupt controller.
++fn with_root_ic<R>(f: impl FnOnce(&mut dyn InterruptController) -> R) -> Option<R> {
++    let idx = super::ROOT_IC_IDX.load(core::sync::atomic::Ordering::Acquire);
++    unsafe {
++        let chips = &mut IRQ_CHIP.irq_chip_list.chips;
++        let chip = chips.get_mut(idx)?;
++        Some(f(&mut *chip.ic))
++    }
++}
++
+ pub(crate) fn init_ap() -> syscall::Result<()> {
+-    // Secondary CPU activation currently supports the memory-mapped GICv2
+-    // interface. GICv3 remains on the safe single-CPU fallback path.
+     if gic::active() {
++        // GICv2: memory-mapped per-CPU interface, addressed by target mask.
+         gic::init_current_cpu()?;
+-        gic::current_cpu_target_mask()
++        return gic::current_cpu_target_mask()
+             .map(|_| ())
+-            .ok_or_else(|| syscall::Error::new(syscall::error::EINVAL))
+-    } else {
+-        Err(syscall::Error::new(syscall::error::ENODEV))
++            .ok_or_else(|| syscall::Error::new(syscall::error::EINVAL));
+     }
++    // GICv3: system-register interface plus this CPU's redistributor frame
++    // (the PPI/SGI bank lives there, not in the distributor).
++    with_root_ic(|ic| ic.init_ap_local())
++        .unwrap_or_else(|| Err(syscall::Error::new(syscall::error::ENODEV)))
++        .map_err(|_| syscall::Error::new(syscall::error::EINVAL))
+ }
+ 
+ pub(crate) fn cpu_capacity() -> Option<usize> {
+-    gic::cpu_capacity()
++    if gic::active() {
++        return gic::cpu_capacity();
++    }
++    with_root_ic(|ic| ic.smp_cpu_capacity()).flatten()
++}
++
++/// Can this platform address a specific secondary CPU?
++pub(crate) fn smp_ready() -> bool {
++    if gic::active() {
++        return gic::current_cpu_target_mask().is_some();
++    }
++    with_root_ic(|ic| ic.smp_cpu_capacity().is_some()).unwrap_or(false)
+ }
+ 
+ pub(crate) fn current_cpu_target_mask() -> Option<u8> {
+@@ -66,10 +89,42 @@ pub(crate) fn current_cpu_target_mask() -> Option<u8> {
+ 
+ pub(crate) fn enable_local_irq(hwirq: u32) -> syscall::Result<()> {
+     if gic::active() {
+-        gic::enable_local_irq(hwirq)
+-    } else {
+-        Err(syscall::Error::new(syscall::error::ENODEV))
++        return gic::enable_local_irq(hwirq);
++    }
++    // GICv3 (and any controller with a per-CPU part): go through the trait,
++    // whose irq_enable routes hwirq < 32 to the running CPU's redistributor.
++    with_root_ic(|ic| {
++        ic.irq_to_virq(hwirq).map(|virq| {
++            ic.irq_enable(virq as u32);
++        })
++    })
++    .flatten()
++    .ok_or_else(|| syscall::Error::new(syscall::error::EINVAL))
++}
++
++/// Send an SGI to one specific CPU: GICv2 addresses it by target mask, GICv3
++/// by the MPIDR affinity in `ICC_SGI1R_EL1`.
++pub(crate) fn send_sgi_to_cpu(
++    sgi: u8,
++    mpidr: u64,
++    target_mask: Option<u8>,
++) -> syscall::Result<()> {
++    if gic::active() {
++        return gic::send_sgi(sgi, target_mask);
++    }
++    with_root_ic(|ic| ic.send_sgi_to_mpidr(sgi, mpidr))
++        .unwrap_or_else(|| Err(syscall::Error::new(syscall::error::ENODEV)))
++        .map_err(|_| syscall::Error::new(syscall::error::EINVAL))
++}
++
++/// Send an SGI to every other CPU: GICv2 target-list filter, GICv3 IRM = 1.
++pub(crate) fn send_sgi_all_but_self(sgi: u8) -> syscall::Result<()> {
++    if gic::active() {
++        return gic::send_sgi(sgi, None);
+     }
++    with_root_ic(|ic| ic.send_sgi_all_but_self(sgi))
++        .unwrap_or_else(|| Err(syscall::Error::new(syscall::error::ENODEV)))
++        .map_err(|_| syscall::Error::new(syscall::error::EINVAL))
+ }
+ 
+ pub(crate) fn acknowledge_root() -> (u32, u32, Option<usize>) {

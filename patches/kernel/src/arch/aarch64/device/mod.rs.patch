@@ -1,0 +1,28 @@
+diff --git a/src/arch/aarch64/device/mod.rs b/src/arch/aarch64/device/mod.rs
+index cdaf24f6..f8c6831d 100644
+--- a/src/arch/aarch64/device/mod.rs
++++ b/src/arch/aarch64/device/mod.rs
+@@ -1,4 +1,4 @@
+-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
++use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+ 
+ pub mod cpu;
+ pub mod generic_timer;
+@@ -59,12 +59,17 @@ pub unsafe fn init_devicetree(fdt: &Fdt) {
+ 
+ pub struct ArchPercpuMisc {
+     pub gic_target_mask: AtomicU8,
++    /// MPIDR of this CPU: GICv3 SGIs are addressed by affinity, not by the
++    /// GICv2 target mask, so cross-CPU wakeups and the secondary-CPU
++    /// handshake need the hardware ID (experiment 14).
++    pub mpidr: AtomicU64,
+ }
+ 
+ impl ArchPercpuMisc {
+     pub const fn default() -> Self {
+         Self {
+             gic_target_mask: AtomicU8::new(0),
++            mpidr: AtomicU64::new(0),
+         }
+     }
+ }

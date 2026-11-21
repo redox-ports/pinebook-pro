@@ -1,5 +1,5 @@
 diff --git a/src/arch/aarch64/device/irqchip/gicv3.rs b/src/arch/aarch64/device/irqchip/gicv3.rs
-index fb435b8e..dfb886a4 100644
+index fb435b8e..60222507 100644
 --- a/src/arch/aarch64/device/irqchip/gicv3.rs
 +++ b/src/arch/aarch64/device/irqchip/gicv3.rs
 @@ -23,6 +23,32 @@ pub struct GicV3 {
@@ -65,7 +65,7 @@ index fb435b8e..dfb886a4 100644
              }
          }
  
-@@ -74,6 +103,67 @@ impl GicV3 {
+@@ -74,6 +103,90 @@ impl GicV3 {
              Ok(())
          }
      }
@@ -77,12 +77,22 @@ index fb435b8e..dfb886a4 100644
 +    /// CPUs the distributor reports.
 +    fn current_cpu_gicr(&self) -> Option<usize> {
 +        let (region_base, region_len) = *self.gicrs.first()?;
-+        let ncpus = core::cmp::max(self.gic_dist_if.ncpus as usize, 1);
-+        let stride = match region_len / ncpus {
-+            0 => GICR_FRAME_STRIDE,
-+            stride => stride & !0xfff,
-+        };
-+        Some(region_base + usize::try_from(crate::cpu_id().get()).ok()? * stride)
++        // The GICv3 redistributor frames are contiguous and each CPU owns a
++        // fixed 128 KiB pair (RD frame + SGI frame). The stride must NOT be
++        // derived from the distributor's CPUNumber: on GICv3 that field is
++        // not authoritative (QEMU reports 1 with 4 CPUs, and dividing the
++        // region by it aims every CPU above 0 outside the region — the AP
++        // then wakes a wrong frame and its SGI/PPI bank is dead).
++        let index = usize::try_from(crate::cpu_id().get()).ok()?;
++        let off = index.checked_mul(GICR_FRAME_STRIDE)?;
++        if off + GICR_FRAME_STRIDE > region_len.max(GICR_FRAME_STRIDE) {
++            warn!(
++                "gicv3: no redistributor frame for CPU {} in {:#x}+{:#x}",
++                index, region_base, region_len
++            );
++            return None;
++        }
++        Some(region_base + off)
 +    }
 +
 +    /// Wake the local redistributor and reset the banked SGI/PPI state.
@@ -121,6 +131,19 @@ index fb435b8e..dfb886a4 100644
 +            gicr_write32(sgi, GICR_IPRIORITYR + 4 * irq, 0xa0a0_a0a0);
 +        }
 +        gicr_write32(sgi, GICR_ICFGR1, 0);
++        // SGIs (0..16) are private like the PPIs: they are enabled in the
++        // redistributor's SGI frame, not in the distributor. The secondary
++        // CPU handshake and the cross-CPU IPIs need them (experiment 14).
++        gicr_write32(sgi, GICR_ISENABLER0, 0xffff);
++
++        // Remember this CPU's MPIDR: GICv3 SGIs are addressed by affinity.
++        crate::percpu::PercpuBlock::current()
++            .misc_arch_info
++            .mpidr
++            .store(
++                unsafe { crate::arch::aarch64::device::cpu::registers::control_regs::mpidr() },
++                core::sync::atomic::Ordering::Release,
++            );
 +
 +        info!(
 +            "gicv3: redistributor {:#x} ready, GICR_WAKER {:#x} -> {:#x}",
@@ -133,7 +156,7 @@ index fb435b8e..dfb886a4 100644
  }
  
  impl InterruptHandler for GicV3 {
-@@ -95,6 +185,7 @@ impl InterruptController for GicV3 {
+@@ -95,6 +208,7 @@ impl InterruptController for GicV3 {
  
          unsafe {
              self.gic_cpu_if.init();
@@ -141,7 +164,7 @@ index fb435b8e..dfb886a4 100644
          }
          let idx = *irq_idx;
          let cnt = if self.gic_dist_if.nirqs > 1024 {
-@@ -125,10 +216,24 @@ impl InterruptController for GicV3 {
+@@ -125,10 +239,24 @@ impl InterruptController for GicV3 {
          unsafe { self.gic_cpu_if.irq_eoi(irq_num) }
      }
      fn irq_enable(&mut self, irq_num: u32) {
@@ -168,3 +191,86 @@ index fb435b8e..dfb886a4 100644
      }
      fn irq_configure(&mut self, irq_data: IrqCell) -> Result<()> {
          let (irq, flags) = match irq_data {
+@@ -153,6 +281,62 @@ impl InterruptController for GicV3 {
+             Some(self.irq_range.0 + hwirq as usize)
+         }
+     }
++
++    fn init_ap_local(&mut self) -> Result<()> {
++        unsafe {
++            self.gic_cpu_if.init();
++            self.init_current_cpu_redist()
++        }
++    }
++
++    fn send_sgi_to_mpidr(&mut self, sgi: u8, mpidr: u64) -> Result<()> {
++        if sgi >= 16 {
++            return Err(Error::new(EINVAL));
++        }
++        let aff0 = mpidr & 0xff;
++        // The target list is a 16-bit bitmap of Aff0 values.
++        if aff0 >= 16 {
++            return Err(Error::new(EINVAL));
++        }
++        let aff1 = (mpidr >> 8) & 0xff;
++        let aff2 = (mpidr >> 16) & 0xff;
++        let aff3 = (mpidr >> 32) & 0xff;
++        // ICC_SGI1R_EL1: [15:0] TargetList, [23:16] Aff1, [27:24] INTID,
++        // [39:32] Aff2, [47:40] IRM, [55:48] Aff3.
++        let value = (1u64 << aff0)
++            | (aff1 << 16)
++            | (u64::from(sgi) << 24)
++            | (aff2 << 32)
++            | (aff3 << 48);
++        unsafe {
++            asm!("dsb ishst", options(nostack, preserves_flags));
++            asm!("msr icc_sgi1r_el1, {}", in(reg) value);
++            asm!("isb", options(nostack, preserves_flags));
++        }
++        Ok(())
++    }
++
++    fn send_sgi_all_but_self(&mut self, sgi: u8) -> Result<()> {
++        if sgi >= 16 {
++            return Err(Error::new(EINVAL));
++        }
++        // IRM = 1: every PE except the requesting one.
++        let value = (1u64 << 40) | (u64::from(sgi) << 24);
++        unsafe {
++            asm!("dsb ishst", options(nostack, preserves_flags));
++            asm!("msr icc_sgi1r_el1, {}", in(reg) value);
++            asm!("isb", options(nostack, preserves_flags));
++        }
++        Ok(())
++    }
++
++    fn smp_cpu_capacity(&self) -> Option<usize> {
++        // One 128 KiB redistributor pair per CPU. The DT region is the
++        // authoritative source for GICv3 (GICD CPUNumber is not).
++        let (_, region_len) = *self.gicrs.first()?;
++        let capacity = region_len / GICR_FRAME_STRIDE;
++        (capacity > 0).then_some(capacity)
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -188,11 +372,14 @@ impl GicV3CpuIf {
+         unsafe {
+             let mut irq: usize;
+             asm!("mrs {}, icc_iar1_el1", out(reg) irq);
+-            irq &= 0x1ff;
+-            if irq == 1023 {
+-                panic!("irq_ack: got ID 1023!!!");
+-            }
+-            irq as u32
++            // INTID is 10 bits wide (0..1023); bits [23:10] carry the source
++            // CPUID for SGIs and must not leak into the id. The old mask was
++            // 9 bits (`0x1ff`), which folded INTID 511 into 511 (a bogus
++            // "unexpected local IRQ 511" on the Pinebook Pro) and panicked on
++            // the spurious id 1023 — but 1023 is a normal read when an
++            // interrupt is taken through another path and must be ignored,
++            // not fatal (experiment 14).
++            (irq & 0x3ff) as u32
+         }
+     }
+ 

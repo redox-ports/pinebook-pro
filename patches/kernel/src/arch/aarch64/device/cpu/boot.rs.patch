@@ -1,0 +1,39 @@
+diff --git a/src/arch/aarch64/device/cpu/boot.rs b/src/arch/aarch64/device/cpu/boot.rs
+index becbb31c..b0c1ce55 100644
+--- a/src/arch/aarch64/device/cpu/boot.rs
++++ b/src/arch/aarch64/device/cpu/boot.rs
+@@ -474,19 +474,19 @@ pub(super) fn start_secondaries() {
+         return;
+     };
+     let Some(gic_capacity) = crate::arch::device::irqchip::cpu_capacity() else {
+-        error!("CPU activation unavailable: PSCI secondary boot currently requires GICv2");
++        error!("CPU activation unavailable: the interrupt controller reports no CPU capacity");
+         return;
+     };
+     if resources.slots.len() + 1 > gic_capacity {
+         error!(
+-            "CPU activation unavailable: topology requires {} CPUs but GICv2 exposes {} interfaces",
++            "CPU activation unavailable: topology requires {} CPUs but the interrupt controller exposes {} interfaces",
+             resources.slots.len() + 1,
+             gic_capacity
+         );
+         return;
+     }
+-    if crate::arch::device::irqchip::current_cpu_target_mask().is_none() {
+-        error!("CPU activation unavailable: BSP has no directed-SGI target mask");
++    if !crate::arch::device::irqchip::smp_ready() {
++        error!("CPU activation unavailable: the interrupt controller cannot address a secondary CPU");
+         return;
+     }
+     if !crate::arch::device::generic_timer::ready() {
+@@ -530,8 +530,9 @@ pub(super) fn start_secondaries() {
+                 STATE_READY => break,
+                 STATE_LOCAL_READY if !self_test_sgi_sent => {
+                     let target_mask = slot.gic_target_mask();
+-                    if let Err(error) = crate::arch::device::irqchip::send_sgi(
++                    if let Err(error) = crate::arch::device::irqchip::send_sgi_to_cpu(
+                         crate::arch::ipi::IpiKind::Wakeup as u8,
++                        slot.mpidr,
+                         Some(target_mask),
+                     ) {
+                         args.state.store(STATE_ABORTED, Ordering::Release);

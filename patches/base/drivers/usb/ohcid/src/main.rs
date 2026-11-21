@@ -155,6 +155,9 @@ impl Driver {
             // before probing. Other platforms (emulation, other boards) must
             // not touch RK3399 clock registers at all.
             if bases.iter().any(|base| OHCI_BASES.contains(base)) {
+                // One-shot CPU clock dump: the desktop speed depends on the
+                // rate U-Boot left the clusters at (experiment 14).
+                cru::log_cpu_clocks(&self.log);
                 if !cru::enable_usb_host_clocks(&self.log) {
                     return;
                 }

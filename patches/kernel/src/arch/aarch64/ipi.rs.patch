@@ -1,0 +1,27 @@
+diff --git a/src/arch/aarch64/ipi.rs b/src/arch/aarch64/ipi.rs
+index 1c3e7896..4dc4fe4d 100644
+--- a/src/arch/aarch64/ipi.rs
++++ b/src/arch/aarch64/ipi.rs
+@@ -25,7 +25,9 @@ pub fn ipi(kind: IpiKind, target: IpiTarget) {
+ 
+     match target {
+         IpiTarget::Other => {
+-            if let Err(error) = crate::arch::device::irqchip::send_sgi(kind as u8, None) {
++            if let Err(error) =
++                crate::arch::device::irqchip::send_sgi_all_but_self(kind as u8)
++            {
+                 warn!("failed to send {:?} IPI: {:?}", kind, error);
+             }
+         }
+@@ -42,7 +44,10 @@ pub fn ipi_single(kind: IpiKind, target: &PercpuBlock) {
+         .misc_arch_info
+         .gic_target_mask
+         .load(Ordering::Acquire);
+-    if let Err(error) = crate::arch::device::irqchip::send_sgi(kind as u8, Some(target_mask)) {
++    let mpidr = target.misc_arch_info.mpidr.load(Ordering::Acquire);
++    if let Err(error) =
++        crate::arch::device::irqchip::send_sgi_to_cpu(kind as u8, mpidr, Some(target_mask))
++    {
+         warn!(
+             "failed to send {:?} IPI to logical {}: {:?}",
+             kind, target.cpu_id, error

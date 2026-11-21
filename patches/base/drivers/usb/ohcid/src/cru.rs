@@ -43,6 +43,39 @@ unsafe fn write32(base: usize, offset: usize, value: u32) {
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
 }
 
+/// Log the CPU clock registers once (diagnostics for the desktop speed:
+/// Redox has no cpufreq driver, so the clusters run at whatever rate U-Boot
+/// left; experiment 14 needs the actual values). Raw dumps: PLL CON0..CON3
+/// groups (each PLL occupies 0x10 bytes starting at APLL 0x00) and the two
+/// armclk selects CLKSEL_CON0/CON1 at 0x100/0x104.
+pub fn log_cpu_clocks(log: &Logger) {
+    let base = match unsafe {
+        common::physmap(
+            CRU_BASE,
+            CRU_LEN,
+            common::Prot::RW,
+            common::MemoryType::DeviceMemory,
+        )
+    } {
+        Ok(ptr) => ptr as usize,
+        Err(_) => return,
+    };
+    let mut line = String::new();
+    for off in (0x00..0xa0).step_by(0x10) {
+        line.clear();
+        for i in 0..4 {
+            let v = unsafe { read32(base, off + i * 4) };
+            line.push_str(&format!("{:08x} ", v));
+        }
+        log.log(format_args!("ohcid: cru pll {:#04x}: {}", off, line));
+    }
+    log.log(format_args!(
+        "ohcid: cru clksel_con0 {:#010x} clksel_con1 {:#010x}",
+        unsafe { read32(base, 0x100) },
+        unsafe { read32(base, 0x104) }
+    ));
+}
+
 /// Un-gate the USB2 host clocks and report the gate state before and after.
 ///
 /// Returns `true` when the gates read back as enabled, which is the

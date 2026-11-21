@@ -1,8 +1,44 @@
 diff --git a/src/dtb/irqchip.rs b/src/dtb/irqchip.rs
-index b320d1f6..004462c6 100644
+index b320d1f6..925d1867 100644
 --- a/src/dtb/irqchip.rs
 +++ b/src/dtb/irqchip.rs
-@@ -130,7 +130,17 @@ impl IrqChipList {
+@@ -57,6 +57,35 @@ pub trait InterruptController: InterruptHandler {
+     }
+     fn irq_xlate(&self, irq_data: IrqCell) -> Result<usize>;
+     fn irq_to_virq(&self, hwirq: u32) -> Option<usize>;
++
++    /// Bring up this CPU's local interrupt controller on a secondary CPU.
++    ///
++    /// The BSP initializes the controller through `irq_init`; an AP only has
++    /// its own per-CPU interface (and, on GICv3, its own redistributor frame)
++    /// to configure. Controllers without a per-CPU part keep the default
++    /// error and the secondary-CPU boot aborts (experiment 14).
++    fn init_ap_local(&mut self) -> Result<()> {
++        Err(Error::new(EINVAL))
++    }
++
++    /// Send an SGI to the CPU with the given MPIDR.
++    ///
++    /// GICv3 has no target-mask register: the destination is encoded by
++    /// affinity in `ICC_SGI1R_EL1`. Controllers that address CPUs by a GICv2
++    /// target mask keep the default error and use `send_sgi` instead.
++    fn send_sgi_to_mpidr(&mut self, _sgi: u8, _mpidr: u64) -> Result<()> {
++        Err(Error::new(EINVAL))
++    }
++
++    /// Send an SGI to every CPU except this one.
++    fn send_sgi_all_but_self(&mut self, _sgi: u8) -> Result<()> {
++        Err(Error::new(EINVAL))
++    }
++
++    /// How many CPUs this controller can start and address, when it can.
++    fn smp_cpu_capacity(&self) -> Option<usize> {
++        None
++    }
+ }
+ 
+ pub struct IrqConnection {
+@@ -130,7 +159,17 @@ impl IrqChipList {
                      }
                  }
  

@@ -1,7 +1,7 @@
 # `redox-os/kernel` changes
 
 - Upstream: https://github.com/redox-os/kernel (mirror of https://gitlab.redox-os.org/redox-os/kernel.git)
-- Base commit: `719e8f5c`
+- Base commit: `e7f1d423`
 - Apply with: `scripts/apply-patches.sh kernel`
 
 A `<path>.patch` file is a diff against the upstream `<path>`; every other
@@ -9,12 +9,16 @@ file is new and is copied verbatim (see `../README.md`).
 
 ## Modified files
 
+- `src/arch/aarch64/device/cpu/boot.rs`
 - `src/arch/aarch64/device/generic_timer.rs`
 - `src/arch/aarch64/device/irqchip/gic.rs`
 - `src/arch/aarch64/device/irqchip/gicv3.rs`
 - `src/arch/aarch64/device/irqchip/irq_bcm2835.rs`
+- `src/arch/aarch64/device/irqchip/mod.rs`
+- `src/arch/aarch64/device/mod.rs`
 - `src/arch/aarch64/device/serial.rs`
 - `src/arch/aarch64/interrupt/exception.rs`
+- `src/arch/aarch64/ipi.rs`
 - `src/arch/riscv64/device/serial.rs`
 - `src/context/signal.rs`
 - `src/devices/graphical_debug/debug.rs`
@@ -58,10 +62,26 @@ The firmware framebuffer is not always 32 bits per pixel: U-Boot v2021.07 progra
 
 Files: `src/arch/aarch64/interrupt/exception.rs`, `src/context/signal.rs`
 
-`signal_handler()` runs from `sched_yield()` and from `context::switch::tick()`, i.e. while a syscall is still executing. It records `regs.sig_archdep_reg()` (x0) and the resume address (the instruction after `svc`) for the userspace signal trampoline, but the arch syscall epilogue writes the result into `scratch.x0` only after `syscall()` returns. A signal delivered in that window therefore saved the syscall *argument* as its return value, and `sigreturn` made the caller resume with it: relibc's `Sys::verify()` yield was entered with x0 = -1 and resumed with x0 = -1, so uutils binaries took the `b.hs -> brk #1` abort path at startup and died silently (experiment 10; the trap site was pinned by deriving the module bases from the dump: executable 0x1000, `libc.so` 0xa80000). The patch makes `signal_handler()` refuse to run while `percpu.inside_syscall` is set (`being_sigkilled` is still honoured first) and calls it from the aarch64 syscall epilogue right after `stack.scratch.x0 = ret`. Timer-tick delivery in userspace is unchanged.
+`signal_handler()` runs from `sched_yield()` and from `context::switch::tick()`, i.e. while a syscall is still executing. It records `regs.sig_archdep_reg()` (x0) and the resume address (the instruction after `svc`) for the userspace signal trampoline, but the arch syscall epilogue writes the result into `scratch.x0` only after `syscall()` returns. A signal delivered in that window therefore saved the syscall _argument_ as its return value, and `sigreturn` made the caller resume with it: relibc's `Sys::verify()` yield was entered with x0 = -1 and resumed with x0 = -1, so uutils binaries took the `b.hs -> brk #1` abort path at startup and died silently (experiment 10; the trap site was pinned by deriving the module bases from the dump: executable 0x1000, `libc.so` 0xa80000). The patch makes `signal_handler()` refuse to run while `percpu.inside_syscall` is set (`being_sigkilled` is still honoured first) and calls it from the aarch64 syscall epilogue right after `stack.scratch.x0 = ret`. Timer-tick delivery in userspace is unchanged.
 
 ## GICv3 redistributor: PPIs/SGIs (architected timer)
 
 Files: `src/arch/aarch64/device/irqchip/gicv3.rs`
 
-The architected timer PPI (27) never fired, so nothing preempted, `nanosleep` never returned, scheme timeouts never expired and the VT only repainted when input caused a syscall (experiment 11). Two defects in the GICv3 driver. (1) `GicV3::parse()` created a fresh `reg()` iterator per entry, so `chunk.iter().next()` returned the *GICD* chunk `#redistributor-regions` times — the boot log showed `gicrs: [(FEE00000, 10000)]`, i.e. the distributor instead of the RK3399 redistributor region at `fef00000` (six 0x20000 frames) — and stored the frames without `PHYS_OFFSET`. (2) The redistributor was never programmed: in GICv3 SGIs/PPIs are banked per CPU, so their enable/group/priority/trigger configuration lives in `GICR_ISENABLER0`/`GICR_IGROUPR0`/`GICR_IPRIORITYR`/`GICR_ICFGR1` of the redistributor's SGI frame and the frame has to be woken via `GICR_WAKER`; `GICD_ISENABLER` only covers SPIs, so `irq_enable(27)` wrote a RES0 bit and silently enabled nothing, while every SPI (UART2) kept working. The patch keeps one iterator for the redistributor region, wakes the current CPU's frame, marks PPIs Group 1 NS with priority 0xa0 and level trigger, and routes `irq_enable`/`irq_disable` for ids below 32 to `GICR_ISENABLER0`/`GICR_ICENABLER0`. Verified in QEMU: `sleep(10ms)`/`sleep(250ms)` return after 10.9 ms/250.2 ms, where before a 10 ms `nanosleep` never returned.
+The architected timer PPI (27) never fired, so nothing preempted, `nanosleep` never returned, scheme timeouts never expired and the VT only repainted when input caused a syscall (experiment 11). Two defects in the GICv3 driver. (1) `GicV3::parse()` created a fresh `reg()` iterator per entry, so `chunk.iter().next()` returned the _GICD_ chunk `#redistributor-regions` times — the boot log showed `gicrs: [(FEE00000, 10000)]`, i.e. the distributor instead of the RK3399 redistributor region at `fef00000` (six 0x20000 frames) — and stored the frames without `PHYS_OFFSET`. (2) The redistributor was never programmed: in GICv3 SGIs/PPIs are banked per CPU, so their enable/group/priority/trigger configuration lives in `GICR_ISENABLER0`/`GICR_IGROUPR0`/`GICR_IPRIORITYR`/`GICR_ICFGR1` of the redistributor's SGI frame and the frame has to be woken via `GICR_WAKER`; `GICD_ISENABLER` only covers SPIs, so `irq_enable(27)` wrote a RES0 bit and silently enabled nothing, while every SPI (UART2) kept working. The patch keeps one iterator for the redistributor region, wakes the current CPU's frame, marks PPIs Group 1 NS with priority 0xa0 and level trigger, and routes `irq_enable`/`irq_disable` for ids below 32 to `GICR_ISENABLER0`/`GICR_ICENABLER0`. Verified in QEMU: `sleep(10ms)`/`sleep(250ms)` return after 10.9 ms/250.2 ms, where before a 10 ms `nanosleep` never returned.
+
+## SMP: secondary CPUs on GICv3 (experiment 14)
+
+Files: `src/dtb/irqchip.rs`, `src/arch/aarch64/device/mod.rs`, `src/arch/aarch64/device/irqchip/mod.rs`, `src/arch/aarch64/device/irqchip/gicv3.rs`, `src/arch/aarch64/device/cpu/boot.rs`, `src/arch/aarch64/ipi.rs`
+
+The port ran on the BSP only: `start_secondaries()` required a GICv2 target mask and printed `CPU activation unavailable: BSP has no directed-SGI target mask`. On a GICv3 system nothing needs a target mask — SGIs are addressed by MPIDR affinity through `ICC_SGI1R_EL1` — so the whole secondary-CPU path is routed through the interrupt controller:
+
+- **Trait** (`src/dtb/irqchip.rs`): `init_ap_local()`, `send_sgi_to_mpidr(sgi, mpidr)`, `send_sgi_all_but_self(sgi)` and `smp_cpu_capacity()`, all defaulting to an error/`None` so controllers without a per-CPU part keep the old behaviour.
+- **GICv3** (`gicv3.rs`): the local interface (`ICC_SRE_EL1`, `ICC_CTLR_EL1`, `ICC_IGRPEN1_EL1`, `ICC_PMR_EL1`) plus the redistributor frame are initialized per CPU, SGIs (0–15) are enabled in `GICR_ISENABLER0`, SGIs are sent by writing `ICC_SGI1R_EL1` (target list for one CPU, `IRM = 1` for all-but-self), and the redistributor stride is the fixed 128 KiB pair — **not** `region_len / GICD_TYPER.CPUNumber`: on GICv3 that field is not authoritative (QEMU reports 1 with 4 CPUs and every frame above CPU 0 lands outside the region).
+- **Dispatcher** (`irqchip/mod.rs`): `init_ap`, `cpu_capacity`, `smp_ready`, `send_sgi_to_cpu`, `send_sgi_all_but_self`, and `enable_local_irq` (which now routes the timer PPI through the root controller for GICv3, so the AP enables its own PPI in its own redistributor).
+- **Per-CPU state** (`device/mod.rs`): `ArchPercpuMisc.mpidr`, stored when the local GIC is initialized; `ipi_single()` uses it to address the target CPU, `ipi()` uses the all-but-self SGI.
+- **Boot handshake** (`cpu/boot.rs`): the guards check `smp_ready()`/`cpu_capacity()` instead of the GICv2 mask, and the wakeup SGI goes through `send_sgi_to_cpu`.
+
+Second bug found on the way: `GicV3CpuIf::irq_ack()` masked the IAR with `0x1ff` instead of the 10-bit INTID mask `0x3ff` and panicked on the spurious id 1023. On hardware the 9-bit mask folded a real interrupt into INTID 511 and the AP aborted its self-test with `unexpected local IRQ 511`; a spurious read would have panicked the kernel. The patch uses `0x3ff` and returns 1023 to the caller, which already ignores ids ≥ 1020 without an EOI.
+
+Verified in QEMU (`-M virt,gic-version=3 -smp 4`): `CPU logical #1..#3: local SGI/timer self-test passed`, `CPU activation complete: 4 CPUs online`, `BSP: 4 CPUs`, and the rig keeps delivering keyboard reports afterwards. Hardware verification pending (experiment 14).
