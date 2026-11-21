@@ -30,6 +30,7 @@ file is new and is copied verbatim (see `../README.md`).
 - `Cargo.lock`
 - `Cargo.toml`
 - `Makefile`
+- `bootstrap/src/procmgr.rs`
 - `drivers/graphics/vesad/src/main.rs`
 - `drivers/graphics/vesad/src/scheme.rs`
 - `drivers/hwd/src/main.rs`
@@ -45,6 +46,28 @@ Files: `Cargo.toml`, `Cargo.lock`, `Makefile`
 `debugsh`, `dwmmcd` and `ohcid` become workspace members. `Makefile` adds
 `debugsh` to `INITFS_BINS` (all architectures) and `dwmmcd`/`ohcid` to the
 aarch64-only part of the initfs list next to `bcm2835-sdhcid`.
+
+## `procmgr` — kernel-generated signals bypass the sender check
+
+Files: `bootstrap/src/procmgr.rs`
+
+When a process exits, procmgr notifies the parent with SIGCHLD; the same code
+path relays a child's stop/continue to its parent and sends SIGHUP to a
+newly-orphaned process group. All of these were routed through the generic
+`kill(2)` sender-credential check with the _exiting process_ as the caller, so
+they failed with EPERM whenever parent and child had different user IDs. On the
+Pinebook Pro that is every session: `orblogin` runs as root and spawns the
+session as `user`, and the desktop log ended with
+
+```
+[src/procmgr.rs:2071 ERROR] failed to send SIGCHLD to parent PID ProcessId(34): Operation not permitted
+```
+
+`on_send_sig` gained a `kernel_generated: bool` parameter; the check becomes
+`if !kernel_generated && caller_euid != 0 && …`. Only the five
+procmgr-originated call sites pass `true`; everything that forwards a userspace
+`kill`/`send_signal` request keeps `false`, so the userspace permission model is
+unchanged. Details: experiment 15.
 
 ## `debugsh` — interim serial console
 
