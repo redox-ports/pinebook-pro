@@ -444,7 +444,7 @@ exact stack: `relibc_crt0 → main → daemon → enumerate_at_zero → control_
 `cache_clean_range(ed_phys(0), size_of::<Ed>())` = `(0x3299000, 0x10)`.
 
 Root cause: **`dc cvac` translates its operand**. The ED pool address was
-passed as the *physical* address (`ed_phys()`), which is not a mapped VA of the
+passed as the _physical_ address (`ed_phys()`), which is not a mapped VA of the
 ohcid context — on real hardware the translation fails and the CPU raises a
 data abort at EL0 ("Lacks grant" in the kernel dump). The kernel kills the
 driver; the boot continues without input devices. The companion TD-page clean
@@ -465,7 +465,7 @@ both `control_transfer` and `arm_interrupt` (`ohci.rs`). Every other cache call
 site already used the virtual address (HCCA, TD page, data buffers).
 
 Note on the 11:04 run (iteration 5's image `8839c619…`): it executed the same
-first transfer *without* faulting, which means that image was built from a
+first transfer _without_ faulting, which means that image was built from a
 mid-session tree that predates the `cache_clean_range(ed_phys())` lines —
 the "cache hypothesis" test image and the committed a4d2672 state were not
 identical. The `Halted`/`Timeout` results of that run still correctly
@@ -644,6 +644,7 @@ does exactly this on this SoC during its own scans.
 
 Diagnostics added for the next run: a poll-loop heartbeat
 (`ohcid: alive, N report(s)` every 5 s). On the next freeze it separates:
+
 - heartbeats continue, reports continue -> driver and kernel alive, freeze
   is downstream (inputd / vesad / console scheme);
 - heartbeats continue, reports stall at 0 -> the interrupt ED stopped
@@ -740,7 +741,7 @@ answering together at the first touch, with the bus healthy.
 Interpretation: the touchpad MCU (and the keyboard MCU with it) wedges on
 the first physical touch — both sit on shared input-device power/board
 resources. Why Manjaro survives this is still open (it polls the touchpad
-too, but also configures it as a *mouse* fully; our drain is byte-identical
+too, but also configures it as a _mouse_ fully; our drain is byte-identical
 transport-wise, so the difference is not in the USB-level polling).
 
 Mitigation implemented (test + workaround): when a root-port device that
@@ -818,3 +819,32 @@ the same way; the real touchpad data may travel through the keyboard chip's
 0x82. PINE64 also ships a `pinebook-pro-keyboard-updater` firmware utility
 for the keyboard/touchpad chip — a separate, riskier path, documented on
 the PINE64 Touchpad page; not attempted.)
+
+## Iteration 16 — the touchpad endpoint as a boot mouse (2026-11-21)
+
+The drain keeps the keyboard alive, but the touchpad still produces no input.
+Because the touchpad interface of the chip advertises protocol 0 (generic
+HID), the reports are raw HID, not the fixed 3-byte boot layout — unless the
+chip honours `SET_PROTOCOL(boot)` anyway. Many HID devices do.
+
+Change (uncommitted when written, in this experiment's commit): after the
+keyboard endpoint is armed, every other interrupt endpoint of the same device
+is probed with `SET_PROTOCOL(boot, wValue 0)` on its interface:
+
+- accepted → the endpoint is armed as `HidKind::Mouse`: 3-byte reports
+  `[buttons, dx, dy]` (HID appendix B.2) become `MouseRelativeEvent` and
+  `ButtonEvent` through the same `inputd::ProducerHandle` the keyboard uses;
+- stalled → the endpoint is armed as `HidKind::Drain`, exactly as in
+  iteration 15 — the keyboard safety net is preserved.
+
+The first build of the change failed with
+`error[E0004]: non-exhaustive patterns: 'HidKind::Mouse' not covered` (a
+logging `match kind`); fixed, base rebuilt and published.
+
+QEMU rig (two `pci-ohci`, keyboard on the first controller, hub + tablet on
+the second): the desktop image boots, the keyboard reports flow after
+`sendkey` (report counter 0 → 2 → 6), the tablet's `mouse_move` reports are
+read and dropped by the 8-byte keyboard guard, and no ED stalls or port reset
+fires — no regression from the new code. The _Mouse_ branch itself cannot be
+reached in the rig: QEMU has no two-interface keyboard chip, so the probe and
+the boot-mouse parsing need the hardware (see experiment 13 for the run).

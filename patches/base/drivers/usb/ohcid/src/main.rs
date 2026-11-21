@@ -25,7 +25,9 @@ use std::{process, thread};
 
 use fdt::Fdt;
 use inputd::ProducerHandle;
+use orbclient::ButtonEvent as OrbButtonEvent;
 use orbclient::KeyEvent as OrbKeyEvent;
+use orbclient::MouseRelativeEvent as OrbMouseRelativeEvent;
 
 use crate::log::Logger;
 use crate::ohci::{Error, Ohci};
@@ -669,14 +671,26 @@ impl<'a> Enumeration<'a> {
                 continue;
             }
             // Every other interrupt endpoint on the device (the touchpad
-            // interface of the keyboard chip) is armed as a drain target —
-            // see find_hid_endpoints. No boot protocol is requested for it:
-            // the raw reports are read and dropped.
-            self.start_hid_kind(addr, low_speed, *info, HidKind::Drain)?;
-            self.log.log(format_args!(
-                "ohcid:   draining extra endpoint 0x{:02x} of the keyboard device",
-                info.ep_address
-            ));
+            // interface of the keyboard chip) must be polled. Try the boot
+            // protocol first: when the chip supports it, the reports become
+            // the fixed 3-byte mouse layout and feed the input scheme;
+            // otherwise (STALL) keep draining the raw reports.
+            if self
+                .hid_set_boot_protocol(addr, low_speed, mps0, info.interface)
+                .is_ok()
+            {
+                self.start_hid_kind(addr, low_speed, *info, HidKind::Mouse)?;
+                self.log.log(format_args!(
+                    "ohcid:   boot mouse on endpoint 0x{:02x} of the keyboard device",
+                    info.ep_address
+                ));
+            } else {
+                self.start_hid_kind(addr, low_speed, *info, HidKind::Drain)?;
+                self.log.log(format_args!(
+                    "ohcid:   draining extra endpoint 0x{:02x} of the keyboard device",
+                    info.ep_address
+                ));
+            }
         }
         let info = eps[kb_index];
         if info.protocol == 2 {
@@ -893,6 +907,24 @@ impl<'a> Enumeration<'a> {
         Ok(())
     }
 
+    /// SET_PROTOCOL(boot, wValue 0) on an interface. For the touchpad
+    /// interface of the Pinebook Pro keyboard chip this is what turns its
+    /// reports into the fixed 3-byte boot mouse layout (buttons/dx/dy) —
+    /// if the chip supports it. A device that does not stalls the request,
+    /// which the caller treats as "keep draining".
+    fn hid_set_boot_protocol(
+        &mut self,
+        addr: u8,
+        low_speed: bool,
+        mps0: u8,
+        interface: u8,
+    ) -> Result<(), Error> {
+        let setup = build_setup(0x21, 0x0b, 0, u32::from(interface), 0);
+        self.hc
+            .control_transfer(addr, low_speed, u16::from(mps0), setup, None, false)?;
+        Ok(())
+    }
+
     fn hid_set_idle(
         &mut self,
         addr: u8,
@@ -991,7 +1023,8 @@ impl<'a> Enumeration<'a> {
             "ohcid:   polling {} addr {} endpoint {} via periodic slot {}",
             match kind {
                 HidKind::Keyboard => "keyboard",
-                HidKind::Drain => "mouse",
+                HidKind::Mouse => "mouse",
+                HidKind::Drain => "drain",
             },
             addr,
             info.ep_number,
@@ -1014,6 +1047,7 @@ impl<'a> Enumeration<'a> {
             root_port: self.root_port,
             prev_modifiers: 0,
             prev_keys: [0; 6],
+            prev_buttons: 0,
             reports: 0,
             last_report_ms: ohci::now_ms(),
         });
@@ -1097,10 +1131,13 @@ fn find_hid_endpoints(config: &[u8]) -> Vec<HidInfo> {
 #[derive(Clone, Copy, PartialEq)]
 enum HidKind {
     Keyboard,
+    /// Boot mouse: 3-byte reports (buttons/dx/dy) turned into input events.
+    Mouse,
     /// Reports are read and dropped: for the touchpad interface of the
-    /// keyboard chip (endpoint 0x82, generic HID) and for boot mice — an
-    /// unread report waiting there wedges the whole keyboard chip (Tow-Boot
-    /// issue #57, experiment 8, iteration 15).
+    /// keyboard chip (endpoint 0x82, generic HID) and any other endpoint
+    /// that refuses the boot protocol — an unread report waiting there
+    /// wedges the whole keyboard chip (Tow-Boot issue #57, experiment 8,
+    /// iteration 15).
     Drain,
 }
 
@@ -1122,6 +1159,8 @@ struct HidDevice {
     root_port: Option<usize>,
     prev_modifiers: u8,
     prev_keys: [u8; 6],
+    /// Last boot-mouse button state (bit 0/1/2 = left/right/middle).
+    prev_buttons: u8,
     /// Completed interrupt transfers (heartbeat diagnostics).
     reports: u64,
     /// Timestamp of the last completed report (stall detection).
@@ -1145,10 +1184,12 @@ impl HidDevice {
                 HidKind::Keyboard if len >= 8 => {
                     self.handle_report(&report, input, log);
                 }
-                // Draining the touchpad is the point: the reports are read
-                // and dropped so the device never accumulates undelivered
-                // data (see HidKind::Drain).
-                HidKind::Drain => {}
+                HidKind::Mouse if len >= 3 => {
+                    self.handle_mouse_report(&report, input, log);
+                }
+                // Draining is the point for HidKind::Drain: the reports are
+                // read and dropped so the device never accumulates
+                // undelivered data (see HidKind::Drain).
                 _ => {}
             }
         } else {
@@ -1217,6 +1258,34 @@ impl HidDevice {
 
         self.prev_modifiers = modifiers;
         self.prev_keys = keys;
+    }
+
+    /// Boot mouse report: [buttons, dx, dy] (HID spec appendix B.2).
+    /// Relative motion goes out as `MouseRelativeEvent`, button changes as
+    /// `ButtonEvent` — the same shapes the upstream `usbhidd` uses.
+    fn handle_mouse_report(&mut self, report: &[u8], input: &mut ProducerHandle, log: &Logger) {
+        let buttons = report[0] & 0x07;
+        let dx = report[1] as i8 as i32;
+        let dy = report[2] as i8 as i32;
+
+        if dx != 0 || dy != 0 {
+            let event = OrbMouseRelativeEvent { dx, dy };
+            if let Err(err) = input.write_event(event.to_event()) {
+                log.log(format_args!("ohcid: failed to send mouse motion: {}", err));
+            }
+        }
+
+        if buttons != self.prev_buttons {
+            self.prev_buttons = buttons;
+            let event = OrbButtonEvent {
+                left: buttons & 0x1 != 0,
+                right: buttons & 0x2 != 0,
+                middle: buttons & 0x4 != 0,
+            };
+            if let Err(err) = input.write_event(event.to_event()) {
+                log.log(format_args!("ohcid: failed to send mouse button: {}", err));
+            }
+        }
     }
 }
 
