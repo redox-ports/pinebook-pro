@@ -574,12 +574,28 @@ impl<'a> Enumeration<'a> {
         let mut hub = [0u8; 9];
         let got =
             self.get_class_descriptor(addr, low_speed, u16::from(mps0), DESC_HUB, 0, &mut hub)?;
-        if got < 3 {
+        if got < 6 {
             return Err(Error::Protocol("short hub descriptor"));
         }
         let ports = hub[2];
-        self.log
-            .log(format_args!("ohcid:   hub with {} port(s)", ports));
+        // Hub descriptor byte 5: bPwrOn2PwrGood in 2 ms units — how long the
+        // port needs after power-on before the connection status is valid
+        // (U-Boot waits max(100 ms, 2*bPwrOn2PwrGood)).
+        let pgood_ms = u32::from(hub[5].saturating_mul(2)).max(100);
+        self.log.log(format_args!(
+            "ohcid:   hub with {} port(s), power-on {} ms",
+            ports, pgood_ms
+        ));
+
+        // U-Boot `usb_hub_power_on`: power every port first, wait for the
+        // power-good time, only then ask for connections — a port without
+        // power reports nothing connected (the Genesys hub measured in
+        // experiment 8, iteration 9 keeps all four ports unpowered until
+        // PORT_POWER is set).
+        for port in 1..=ports {
+            let _ = self.hub_set_feature(addr, low_speed, mps0, port, FEAT_PORT_POWER);
+        }
+        self.hc.delay_ms(u64::from(pgood_ms));
 
         for port in 1..=ports {
             let (status, change) = self.hub_port_status(addr, low_speed, mps0, port)?;
@@ -589,9 +605,6 @@ impl<'a> Enumeration<'a> {
             if status & PORT_CONNECTION == 0 {
                 continue;
             }
-
-            let _ = self.hub_set_feature(addr, low_speed, mps0, port, FEAT_PORT_POWER);
-            self.hc.delay_ms(100);
 
             self.hub_set_feature(addr, low_speed, mps0, port, FEAT_PORT_RESET)?;
             // The hub clears PORT_RESET when its 10 ms sequence finishes.

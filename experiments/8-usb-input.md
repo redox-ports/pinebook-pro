@@ -569,3 +569,46 @@ Next step, built into the next image: retry the first get_descriptor up to
 three times with 150 ms pauses, and keep the original buffer content in the
 diagnostics (the iteration-7 pattern write destroyed it before it could be
 read).
+
+## Iteration 9 — the hub wakes up: retry works, port power order fixed
+
+(2026-11-21)
+
+The retry image (sha256 `394e3d71…`, log `logs/serial-20261121-141101.log`)
+**enumerates the Genesys hub on `fe3e0000`**:
+
+```
+[   0.799] first get_descriptor attempt 1 failed Timeout("transfer descriptor"), retrying after 150 ms
+[   1.354] step1 ok (first [12, 01, 00, 02, 09, 00, 00, 40]), mps0 64
+[   1.368] root device addr 1 id 05e3:0608 class 09/00/00 mps0 64 full-speed
+[   1.370] hub with 4 port(s)
+```
+
+- The settle theory was right: the first attempt now fails with a **Timeout**
+  (the td dump shows untouched TDs — CC never accessed, the device simply did
+  not answer while its firmware booted), and 150 ms later the hub responds
+  normally. The earlier `Halted` + setup-buffer-zeros signature was the same
+  unreadiness seen through the old ED-direction bug and is now moot.
+- The hub identifies as `05e3:0608` — the internal Genesys hub from the U-Boot
+  scans, MPS0 64, 4 downstream ports.
+
+But the four hub ports reported nothing connected, and the reason is in the
+driver's port loop: it checked PORT_CONNECTION **before** powering the port.
+With all four ports unpowered (the hub implements individual power
+switching), CCS reads 0 for every port and the enumeration loop skips them
+all. U-Boot does the opposite — `usb_hub_power_on()` powers **every** port
+first, waits `max(100 ms, 2*bPwrOn2PwrGood)`, and only then polls for
+connections (plus a 1 s connect window).
+
+Fix (same shape as U-Boot): after reading the hub descriptor, power all ports
+up front, wait `max(100 ms, 2*hub[5])` (bPwrOn2PwrGood), then walk the ports
+and enumerate whatever is attached. The hub-descriptor length check was
+raised from 3 to 6 bytes so `hub[5]` is really there.
+
+QEMU rig: unchanged behaviour (`hub with 8 port(s), power-on 100 ms` — the
+emulated hub reports bPwrOn2PwrGood 0 — keyboard behind the hub still
+enumerates, `polling 2 keyboard(s)`).
+
+Expected on the next hardware run: devices behind the Genesys hub (touchpad
+and whatever else U-Boot sees there) finally appear; the keyboard polling
+path is already proven on `fe3a0000`.
