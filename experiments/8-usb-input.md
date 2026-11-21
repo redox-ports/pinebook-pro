@@ -332,6 +332,49 @@ The QEMU-side anomaly is left open (report upstream with this protocol if it kee
 blocking emulation work). The hardware side needs its own answer — see the next
 iteration.
 
+## Iteration 5 — root cause found: the control ED direction field (2026-11-21)
+
+With the QEMU rig frozen mid-enumeration (trace + monitor + serial cross-checks) the
+cause of every failure finally surfaced — a one-bit difference from U-Boot/Linux:
+
+1. **The control ED carried a direction (D = IN/OUT).** U-Boot's `ed_fill` sets
+   `D = 0` for control endpoints (the direction belongs to each TD, and SETUP only
+   exists as TD_DP_SETUP). Our ED had D = IN for GET_DESCRIPTOR. The QEMU model —
+   `ohci_service_td` — uses `ED_D` as the transaction direction whenever it is
+   non-zero, so an IN-ED with a SETUP TD transmitted **an IN token instead of
+   SETUP**; the hub answered STALL (the `Halted`), the low-speed device never
+   answered (the `Timeout`). The real RK3399 OHCI behaves the same way. Fixed:
+   control EDs get `D = 0`.
+2. **The hub descriptor was requested with bmRequestType 0x80.** Hub descriptors
+   are a _class_ request: bmRequestType must be 0xA0. Spec-compliant hubs STALL a
+   standard GET_DESCRIPTOR aimed at type 0x29 (the QEMU hub does; the Genesys hub
+   on the laptop would too). Fixed: `get_class_descriptor` (0xA0).
+3. **The periodic ED registration wrote the HCCA through its physical address**
+   (`hcca.physical() as *mut u32`) — userspace cannot dereference that; the fault
+   (`Lacks grant`, FAULT at the HCCA physical address) only surfaced after the
+   enumeration finally reached `start_hid`. Fixed: write through the virtual
+   mapping (`hcca.virt_addr()`).
+4. **The shared buffer arena was never reused** — control transfers allocate
+   setup/data buffers from a finite pool marked "allocated once, never reused", so
+   enumeration ran out of buffer space (`OutOfMemory`) after a few requests.
+   Fixed: the arena restarts after each completed transfer (single-threaded, one
+   transfer at a time, list stopped).
+5. **DC IVAC is EL1-restricted** (SCTLR_EL1.UCT): the data-cache invalidate added
+   in iteration 4 faulted from userspace. Switched to `dc civac` (clean+
+   invalidate), which is EL0-accessible.
+
+With all five fixes the QEMU rig **enumerates the whole tree** and reaches the
+poll loop: hub descriptor via the class request (`hub with 8 port(s)`), port
+status/reset cycles, keyboard behind the hub (`id 0627:0001`), boot protocol set,
+interrupt ED armed, `polling 1 keyboard(s)` — in ~0.5 s after init, no crashes.
+
+Hardware check pending (one flash). The QEMU DMA anomaly of iteration 3 (RAM shows
+the packet, the trace shows a zero-read) is still unexplained — it vanished as a
+_symptom_ once the ED direction was fixed: with D = 0 the SETUP transaction is
+correct and the trace shows the real packet bytes, so the anomaly was part of the
+wrong-direction path (the model services the ED with a mismatched direction in a
+way that leaves usb_buf stale), not a memory-model bug.
+
 ## Iteration 4 — cache maintenance in the driver, and the decisive hardware test
 
 (2026-11-21)

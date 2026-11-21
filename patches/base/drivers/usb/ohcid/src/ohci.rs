@@ -49,6 +49,9 @@ fn cache_clean_range(_virt: usize, _len: usize) {}
 
 /// Invalidate the data cache over a virtual range so the CPU reads the data
 /// a non-snooping controller wrote back instead of its own stale lines.
+///
+/// Uses DC CIVAC (clean + invalidate): plain DC IVAC is EL1-restricted
+/// (SCTLR_EL1.UCT) and faults from userspace.
 #[cfg(target_arch = "aarch64")]
 fn cache_invalidate_range(virt: usize, len: usize) {
     unsafe {
@@ -58,7 +61,7 @@ fn cache_invalidate_range(virt: usize, len: usize) {
         let mut a = virt & !(dline - 1);
         let end = (virt + len + dline - 1) & !(dline - 1);
         while a < end {
-            core::arch::asm!("dc ivac, {}", in(reg) a, options(nostack));
+            core::arch::asm!("dc civac, {}", in(reg) a, options(nostack));
             a += dline;
         }
         core::arch::asm!("dsb sy", "isb", options(nostack));
@@ -633,10 +636,14 @@ impl Ohci {
         {
             let ed = self.ed_mut(ed_index);
             ed.info = ed_info(
-                addr,
-                0,
-                low_speed,
-                if data_in { ED_IN } else { ED_OUT },
+                addr, 0, low_speed,
+                // Control-ED direction field must be 0 (U-Boot/Linux: the
+                // direction is carried by each TD, and the SETUP token only
+                // exists as TD_DP_SETUP). A non-zero ED.D makes the transaction
+                // direction come from the ED — an IN-ed pair with a SETUP TD
+                // sends an IN token instead of SETUP and the device STALLs
+                // (experiment 8, iteration 4).
+                0, /* direction comes from the TDs */
                 mps,
             );
             ed.head = head;
@@ -648,20 +655,46 @@ impl Ohci {
         // ED page, and the TD page (the TDs live in its first KiB, the
         // shared buffers in its tail).
         cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
-        cache_clean_range(self.tds.virt() as usize, 4096);
+        cache_clean_range(self.tds.virt_addr(), 4096);
 
         self.start_control(ed_index);
-        // DIAGNOSTIC (experiment 8, iteration 2): the HC read stale zeros
-        // from the setup buffer although the CPU view showed the packet;
-        // long pause between the CPU write and the list start so the VM can
-        // be frozen and the RAM inspected before the DMA read happens.
-        self.delay_ms(5000);
         let result = self.wait_td(ed_index, td_status, 500);
+        if result.is_err() {
+            // Dump the retired TDs and the ED: the condition code in the
+            // retired TD tells what the transaction ended with (STALL vs
+            // data-toggle mismatch vs device-not-responding) — the closest
+            // thing to a bus trace on real hardware.
+            let ed_snapshot = self.ed(ed_index);
+            println!(
+                "ohcid:   dbg: td dump: setup {:#x}/{:#x}/{:#x}/{:#x} data {:#x}/{:#x}/{:#x}/{:#x} status {:#x}/{:#x}/{:#x}/{:#x}; ed {:#x} h {:#x} t {:#x}",
+                self.tds[td_setup].info,
+                self.tds[td_setup].cbp,
+                self.tds[td_setup].next,
+                self.tds[td_setup].be,
+                self.tds[td_data].info,
+                self.tds[td_data].cbp,
+                self.tds[td_data].next,
+                self.tds[td_data].be,
+                self.tds[td_status].info,
+                self.tds[td_status].cbp,
+                self.tds[td_status].next,
+                self.tds[td_status].be,
+                ed_snapshot.info,
+                ed_snapshot.head,
+                ed_snapshot.tail,
+            );
+        }
         self.stop_control();
 
         // Clear a possible halt so the ED can be reused.
         let ed_head = self.ed(ed_index).head;
         self.ed_mut(ed_index).head = ed_head & !0x3;
+
+        // The list is stopped and the transfer is complete: the buffer arena
+        // can be reused from the start (single-threaded driver, one transfer
+        // at a time). Without this the never-reused arena runs out after a
+        // handful of control transfers (OutOfMemory during enumeration).
+        self.next_buf = 0;
 
         result?;
 
@@ -669,7 +702,7 @@ impl Ohci {
             if let (Some(off), Some(dst)) = (data_off, data) {
                 // The controller may have written the data through DMA; drop
                 // our possibly stale cache lines before reading it back.
-                cache_invalidate_range(self.tds.virt() as usize + 1024 + off, data_len.max(1));
+                cache_invalidate_range(self.tds.virt_addr() + 1024 + off, data_len.max(1));
                 let len = dst.len().min(data_len);
                 let copy = self.buf_slice(off, len).to_vec();
                 dst[..len].copy_from_slice(&copy);
@@ -744,13 +777,13 @@ impl Ohci {
         // Put the ED into the periodic list. A 32-entry table is walked one
         // entry per frame, so one slot polls every ~32 ms — plenty for a
         // keyboard and far simpler than the interval tree Linux builds.
-        let entry = self.hcca.physical() as *mut u32;
+        let entry = self.hcca.virt_addr() as *mut u32;
         unsafe { ptr::write_volatile(entry.add(slot), self.ed_phys(ed_index) as u32) };
         // The HC reads the periodic table and the ED/TDs through DMA; clean
         // the cache lines it will touch.
         cache_clean_range(self.hcca.virt() as usize, 256);
         cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
-        cache_clean_range(self.tds.virt() as usize, 4096);
+        cache_clean_range(self.tds.virt_addr(), 4096);
 
         let control = self.read(REG_CONTROL);
         if control & CTRL_PLE == 0 {

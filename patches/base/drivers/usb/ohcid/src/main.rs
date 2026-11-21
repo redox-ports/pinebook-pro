@@ -421,14 +421,22 @@ impl<'a> Enumeration<'a> {
                 8
             }
         };
+        self.log.log(format_args!(
+            "ohcid:   dbg: step1 ok (first {:02x?}), mps0 {}",
+            first, mps0
+        ));
 
         let addr = self.alloc_addr()?;
         self.set_address(0, low_speed, 8, addr)?;
         // USB 2.0, 9.2.6.3: 2 ms of recovery.
         self.hc.delay_ms(10);
+        self.log
+            .log(format_args!("ohcid:   dbg: step2 ok (addr {})", addr));
 
         let mut dev = [0u8; 18];
         self.get_descriptor(addr, low_speed, u16::from(mps0), DESC_DEVICE, 0, &mut dev)?;
+        self.log
+            .log(format_args!("ohcid:   dbg: step3 ok (dev {:02x?})", dev));
 
         let vid = u16::from_le_bytes([dev[8], dev[9]]);
         let pid = u16::from_le_bytes([dev[10], dev[11]]);
@@ -501,14 +509,21 @@ impl<'a> Enumeration<'a> {
         }
         if info.protocol == 1 {
             // Boot protocol: fixed 8-byte keyboard reports.
+            self.log
+                .log(format_args!("ohcid:   dbg: before set_protocol"));
             self.hid_set_protocol(addr, low_speed, mps0, info.interface)?;
+            self.log
+                .log(format_args!("ohcid:   dbg: after set_protocol"));
         } else {
             self.log.log(format_args!(
                 "ohcid:   device uses report protocol, assuming boot layout"
             ));
         }
+        self.log.log(format_args!("ohcid:   dbg: before set_idle"));
         let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
+        self.log.log(format_args!("ohcid:   dbg: before start_hid"));
         self.start_hid(addr, low_speed, info)?;
+        self.log.log(format_args!("ohcid:   dbg: start_hid ok"));
         Ok(())
     }
 
@@ -527,7 +542,8 @@ impl<'a> Enumeration<'a> {
         self.set_configuration(addr, low_speed, u16::from(mps0), 1)?;
 
         let mut hub = [0u8; 9];
-        let got = self.get_descriptor(addr, low_speed, u16::from(mps0), DESC_HUB, 0, &mut hub)?;
+        let got =
+            self.get_class_descriptor(addr, low_speed, u16::from(mps0), DESC_HUB, 0, &mut hub)?;
         if got < 3 {
             return Err(Error::Protocol("short hub descriptor"));
         }
@@ -618,6 +634,24 @@ impl<'a> Enumeration<'a> {
     ) -> Result<usize, Error> {
         let value = (u32::from(desc_type) << 8) | u32::from(index);
         let setup = build_setup(0x80, 6, value, 0, buf.len() as u16);
+        self.hc
+            .control_transfer(addr, low_speed, mps, setup, Some(buf), true)
+    }
+
+    /// Class-specific GET_DESCRIPTOR (bmRequestType 0xA0): hub descriptors
+    /// are requested with a class request, a standard 0x80 request is
+    /// answered with STALL by spec-compliant hubs.
+    fn get_class_descriptor(
+        &mut self,
+        addr: u8,
+        low_speed: bool,
+        mps: u16,
+        desc_type: u8,
+        index: u8,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
+        let value = (u32::from(desc_type) << 8) | u32::from(index);
+        let setup = build_setup(0xa0, 6, value, 0, buf.len() as u16);
         self.hc
             .control_transfer(addr, low_speed, mps, setup, Some(buf), true)
     }
