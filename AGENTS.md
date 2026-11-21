@@ -100,9 +100,15 @@ fix(ci): prune runner disk before redox build
 - Internal keyboard/touchpad are USB2 HID (`258a:001e`) behind a Genesys hub
   (`05e3:0608`) → an **OHCI** USB2 host is required for input (measured in
   experiment 8; DWC2 and xHCI are not involved). The `ohcid` CRU/PHY bring-up is
-  **hardware-verified (23:07 boot)**: no SoC freeze, both controllers operational;
-  enumeration fails at the protocol level (`Halted` on the hub port `fe3e0000`, TD
-  timeout on `fe3a0000`) — logic debugging, QEMU `pci-ohci` rig in progress.
+  **hardware-verified (23:07 boot)**: no SoC freeze, both controllers operational.
+  Enumeration protocol bugs fixed against the U-Boot 2021.07 driver (control-ED
+  direction must be 0, class-descriptor bmRequestType 0xA0, HCCA write via
+  `virt_addr()`, per-transfer buffer arena reset) and verified in the QEMU
+  `pci-ohci` rig. **`dc cvac` translates its operand** (experiment 8, iteration 6):
+  passing a DMA _physical_ address to cache maintenance faults at EL0 on real
+  hardware ("Lacks grant", driver killed) and is **invisible in QEMU** (TCG does
+  no translation for CM-by-VA) — always clean through the Dma virtual mapping.
+  Hardware re-test of the fixed enumeration pending.
 - **Redox bring-up status (2026-11-20, experiments 4–6):** the kernel boots to initfs
   userspace — GICv3, generic timer (virq 27), serial (virq 132), `init`, drivers,
   `vesad` 1920x1080 + `fbbootlogd` (framebuffer works, kernel `graphical_debug` visible on

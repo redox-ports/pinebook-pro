@@ -420,3 +420,59 @@ living in the TD page tail (all marked DIAGNOSTIC in the source).
   buffer mapping device-typed.
 - The keyboard stays deferred until enumeration works; everything else in the
   deliverable image is hardware-verified (iteration 2 of experiment 12).
+
+## Iteration 6 — hardware crash in cache maintenance, phys-as-virt
+
+(2026-11-21)
+
+The image with all five fixes (sha256 `972c4c46…`, log
+`logs/serial-20261121-123248.log`) reached `redox login:` with the whole root
+filesystem working, but ohcid died on the **first control transfer** of
+`fe3a0000`:
+
+```
+ohcid:   dbg: setup phys 0x0329a400 bytes [80, 06, 00, 01, 00, 00, 08, 00]
+kernel::context::memory:DEBUG -- Lacks grant
+FATAL: Not an SVC induced synchronous exception
+FAR_EL1: 0x3299000   X0: 0x3299000  X1: 0x10
+```
+
+Symbolising the crash against the built binary (`readelf`: ET_EXEC at vaddr
+`0x400000`, so runtime PCs are ELF vaddrs; `addr2line` on `0x409060`) gives an
+exact stack: `relibc_crt0 → main → daemon → enumerate_at_zero → control_transfer
+→ cache_clean_range → FAULT`. X0/X1 match the call
+`cache_clean_range(ed_phys(0), size_of::<Ed>())` = `(0x3299000, 0x10)`.
+
+Root cause: **`dc cvac` translates its operand**. The ED pool address was
+passed as the *physical* address (`ed_phys()`), which is not a mapped VA of the
+ohcid context — on real hardware the translation fails and the CPU raises a
+data abort at EL0 ("Lacks grant" in the kernel dump). The kernel kills the
+driver; the boot continues without input devices. The companion TD-page clean
+in the same function correctly used the Dma `virt_addr()`; only the two ED
+cleans (control path and `arm_interrupt`) passed `ed_phys()`.
+
+Why the QEMU rig never caught it: **QEMU TCG does not perform a translation for
+cache-maintenance-by-VA instructions** — `dc cvac` to an unmapped address is
+silently ignored. The rig enumerates the whole tree with the broken address, so
+this bug class (phys-as-virt in cache maintenance) is invisible in emulation.
+Only the real SoC walks the page tables for the operand. (This also explains
+why the kernel-side trap surfaces as a data abort with FAR = the phys address
+rather than anything USB-related.)
+
+Fix: clean the ED through its Dma virtual mapping,
+`cache_clean_range(self.eds.virt_addr() + ed_index * size_of::<Ed>(), …)`, in
+both `control_transfer` and `arm_interrupt` (`ohci.rs`). Every other cache call
+site already used the virtual address (HCCA, TD page, data buffers).
+
+Note on the 11:04 run (iteration 5's image `8839c619…`): it executed the same
+first transfer *without* faulting, which means that image was built from a
+mid-session tree that predates the `cache_clean_range(ed_phys())` lines —
+the "cache hypothesis" test image and the committed a4d2672 state were not
+identical. The `Halted`/`Timeout` results of that run still correctly
+identified the ED-direction bugs (the direction fix made the new fault
+reachable on the first transfer).
+
+Hardware check pending (one flash, image rebuilt with the fix): expected
+`root device …`, `hub with N port(s)` on `fe3e0000` and `polling N
+keyboard(s)`; the low-speed device on `fe3a0000` may still fail enumeration
+(for it, any timeout now reflects the device, not the driver).

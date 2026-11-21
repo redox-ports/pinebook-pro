@@ -653,8 +653,15 @@ impl Ohci {
 
         // Push every byte the controller will read out of the caches: the
         // ED page, and the TD page (the TDs live in its first KiB, the
-        // shared buffers in its tail).
-        cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
+        // shared buffers in its tail). DC CVAC translates its operand: the
+        // address must be the Dma *virtual* mapping — passing the physical
+        // address faults on real hardware (unmapped VA, "Lacks grant",
+        // experiment 8 iteration 6; QEMU TCG skips the translation, which is
+        // why the rig never caught it).
+        cache_clean_range(
+            self.eds.virt_addr() + ed_index * size_of::<Ed>(),
+            size_of::<Ed>(),
+        );
         cache_clean_range(self.tds.virt_addr(), 4096);
 
         self.start_control(ed_index);
@@ -782,7 +789,10 @@ impl Ohci {
         // The HC reads the periodic table and the ED/TDs through DMA; clean
         // the cache lines it will touch.
         cache_clean_range(self.hcca.virt() as usize, 256);
-        cache_clean_range(self.ed_phys(ed_index), size_of::<Ed>());
+        cache_clean_range(
+            self.eds.virt_addr() + ed_index * size_of::<Ed>(),
+            size_of::<Ed>(),
+        );
         cache_clean_range(self.tds.virt_addr(), 4096);
 
         let control = self.read(REG_CONTROL);
