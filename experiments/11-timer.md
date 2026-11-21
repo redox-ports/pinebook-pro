@@ -105,9 +105,10 @@ CPU), and `nanosleep` returns on time. Before the fix the same probe never
 returned.
 
 The boot still reaches the initfs console (`scripts/qemu-smoke.sh` passes), and
-the probe was removed before the image was rebuilt. **Hardware result:
-`FILL IN`** — the expectation is a VT that updates without keystrokes, a
-working `sleep`, and no more busy-waiting workarounds in drivers.
+the probe was removed before the image was rebuilt. **Hardware result
+(experiment 12):** verified — kernel log timestamps tick on UART, `dwmmcd`
+reports `card ready` at `[   0.115]`, `sleep`-based timeouts behave, and no
+driver busy-waits on the serial interrupt any more.
 
 ## Follow-ups
 

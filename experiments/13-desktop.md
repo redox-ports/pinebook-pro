@@ -238,9 +238,14 @@ correct the layout from the serial log alone.
 Rig smoke (both images): boot + keyboard reports unchanged; the
 two-interface touchpad path is not reproducible in QEMU.
 
-`FILL IN` — hardware run of the third image: the `measured Pinebook Pro
-touchpad layout` line, cursor behaviour, and whether the ~50 s port resets
-are gone.
+Hardware run (2026-11-21, iterations after the image `98918225…` line):
+the touchpad moves the pointer in the desktop with the measured layout
+(`[report id 1, buttons, dx, dy]`, signed 8-bit relative); the ~50 s port
+resets are gone after the DMA arena split (control vs interrupt buffers), and
+the liveness heartbeat stopped reading healthy devices as dead. Cursor axes
+and buttons behave as expected; the absolute-mode gesture collection of the
+chip (report id `0x1e`) is ignored. Keyboard and touchpad verified together
+with the desktop and 6-CPU SMP (experiment 14).
 
 ## Open questions
 

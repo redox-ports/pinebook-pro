@@ -8,6 +8,132 @@ We are porting **Redox OS (aarch64)** to the **PINE64 Pinebook Pro** (Rockchip R
 
 `README.md` is the source of truth for the **research summary, target image layout, and the implementation checklist**. Keep it current.
 
+## Where the port stands (end of session, 2026-11-21)
+
+Read this before planning work. Details and evidence live in the linked
+experiments; this section is the map.
+
+### Hardware-verified (boot the card, it works)
+
+- **Full chain to a usable desktop:** eMMC U-Boot (EFI distro boot from the
+  microSD ESP) → Redox UEFI bootloader → kernel (DTB via EFI config table,
+  `FRAMEBUFFER_*` env) → initfs → `dwmmcd` → redoxfs root → `redox login:` on
+  UART2 (1500000 8N1) → orbital desktop at 1920×1080 RGB565 on the panel.
+- **Input:** internal keyboard (`258a:001e`, low-speed, boot protocol, on
+  `fe3a0000`) and touchpad (interface 1, endpoint `0x82` of the same chip,
+  measured `[report id 1, buttons, dx, dy]` relative layout) both work in the
+  desktop; first-keystroke loss fixed (`SET_IDLE 0`); Super key works; `reboot`
+  from the login power menu works (PSCI).
+- **SMP:** all 6 CPUs online (GICv3 redistributors + `ICC_SGI1R_EL1`).
+- **Clocks:** little cluster raised /2 → /1 (300 → 600 MHz, APLL 600), big
+  cluster 800 MHz (BPLL). No cpufreq driver; nothing ramps.
+- **Serial console is the debug channel:** kernel log, initfs daemon logs and
+  rootfs daemon logs (inherited from init) all land on UART.
+
+### Pending hardware verification
+
+- **Experiment 15 (session exit):** image `c4aaa209…` (sha256
+  `c4aaa2095be7f32b69cca1d1596c1af75be81d55e7df35bbcfb246e70e769de0`,
+  512 MiB) carries the `kernel_generated` SIGCHLD fix. **Test:** log in, press
+  Super-Q on the session window, the login window must come back. If it does
+  not, see the experiment's "Open question" — the next step is a temporary
+  `/scheme/debug` write in `orblogin` (VT3 stdout is invisible on UART).
+
+### Open threads, in the order they should be picked up
+
+1. **Confirm experiment 15 on hardware** (above). Cheap, closes the session
+   lifecycle.
+2. **Desktop performance — measure before optimizing.** The little-cluster
+   doubling (300→600 MHz) gave almost nothing, so the desktop is **not
+   A53-frequency-bound**. Candidate bottlenecks, unmeasured: per-frame IPC
+   (every `orbclient` window sync is a scheme round-trip), `vesad` damage
+   sync + RGB565 conversion, scheduler placement (Redox has no per-CPU
+   capacity model, so daemons land on A53s and A72s alike), memory bandwidth.
+   Add timing counters to `vesad`/`orbital` writing to `/scheme/debug` first.
+   Big levers after that: RK808 core voltage over I2C (PMIC) to raise
+   600/800 MHz, or a GPU driver (none exists). See README §7 risks 17/18.
+3. **RTC + entropy:** no PL031 exists on RK3399 — the RTC is in the **RK808
+   PMIC over I2C** (same driver unlocks both). Today the clock starts at
+   1970 and every boot logs `randd: Seeding failed, no entropy source`.
+4. **Connectivity/peripherals not started:** Wi-Fi AP6256 (SDIO), BT (UART),
+   audio ES8316, battery CW2015, eMMC SDHCI (must stay read-only), USB3/xHCI
+   (USB-A/USB-C ports; not needed for the internal input), PCIe/NVMe.
+5. **CI/reproducibility:** pin recipe revisions (risk 16), repack
+   (`scripts/repack-pbp.sh`, target layout in README §3), GitHub Actions
+   workflow.
+
+### Rebuild / flash / serial loop (exact, copy-paste)
+
+```sh
+# 0. sources in the state we verify (after any online cook, reset + re-apply):
+#    kernel e7f1d423  relibc b83feabc  uutils-grep 6f048c6  base 8f576d27
+bash scripts/apply-patches.sh            # idempotent
+pkill -f "repo cook" || true             # never two cooks; a failed one waits forever
+
+# 1. rebuild (base = bootstrap/procmgr/drivers; use r.kernel for the kernel):
+cd build/redox && env CI=1 COOKBOOK_OFFLINE=true CARGO_NET_OFFLINE=true \
+  TARGET=aarch64-unknown-redox \
+  REDOXER_TOOLCHAIN=/home/shamil/devel/redox-ports/pinebook-pro/build/redox/prefix/aarch64-unknown-redox/sysroot \
+  COOKBOOK_HOST_SYSROOT=/home/shamil/devel/redox-ports/pinebook-pro/build/redox/prefix/aarch64-unknown-redox/sysroot/ \
+  PATH=/home/shamil/devel/redox-ports/pinebook-pro/build/redox/prefix/aarch64-unknown-redox/sysroot/bin:/home/shamil/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  nohup make r.base image CONFIG_NAME=desktop-minimal \
+    FILESYSTEM_CONFIG=config/aarch64/pinebook-pro/desktop-minimal.toml \
+    > ../build-rebuild.log 2>&1 &
+```
+
+`$HOME/.cargo/bin` **must** stay on `PATH` — `mk/depends.mk` checks `rustup`
+and dies with `rustup not found` otherwise (the sysroot bin alone is not
+enough). Success check: the log ends with
+`mv build/aarch64/desktop-minimal/harddrive.img.partial …` and contains
+`Compiling <the recipe you touched>`; then:
+
+```sh
+scripts/flash-sd.sh --config desktop-minimal   # dd + sync + cmp, mounts nothing
+scripts/serial-log.sh                          # start BEFORE powering on
+```
+
+The wrapper `scripts/build-image.sh --config desktop-minimal` does the same
+make invocation for you (it runs `make all`).
+
+### QEMU quick check (no hardware)
+
+`scripts/qemu-smoke.sh --image build/redox/build/aarch64/desktop-minimal/harddrive.img`
+boots to initfs. The **driver/SMP rig** (what `ohcid` was developed against)
+needs the packaged U-Boot, `-smp 4` and a DTB with four CPU nodes plus two
+`generic-ohci` nodes. The known-good source is committed as
+`scripts/qemu-rig-virt-smp4.dts`; compile it when `build/` was wiped:
+
+```sh
+# dtc without root: apt-get download device-tree-compiler && dpkg-deb -x <deb> build/dtc-root
+build/dtc-root/usr/bin/dtc -I dts -O dtb -o build/qemu-virt-smp4.dtb scripts/qemu-rig-virt-smp4.dts
+```
+
+```sh
+LD_LIBRARY_PATH=build/qemu82-root/usr/lib/x86_64-linux-gnu \
+build/qemu82-root/usr/bin/qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 \
+  -m 4G -smp 4 -bios build/qemu-uboot/usr/lib/u-boot/qemu_arm64/u-boot.bin \
+  -machine dtb=build/qemu-virt-smp4.dtb \
+  -drive if=none,id=d0,file=build/redox/build/aarch64/desktop-minimal/harddrive.img,format=raw,readonly=on \
+  -device virtio-blk-device,drive=d0 \
+  -device pci-ohci,id=ohci0 -device usb-kbd,bus=ohci0.0,port=1 \
+  -display none -serial file:build/qrig.log \
+  -monitor unix:build/qmon.sock,server,nowait -no-reboot
+# keyboard injection: python3 build/qmon.py build/qmon.sock "sendkey a"
+```
+
+The rig **cannot** exercise: RK3399 CRU/PHY and the two-interface touchpad
+chip, the rootfs (no virtio-blk driver in this kernel → orbital never starts),
+and therefore the SIGCHLD/session-exit path.
+
+### Known noise (do not chase)
+
+- `kernel::syscall::fs:WARN -- funmap passed length 0x… instead of 0x…` when a
+  rootfs process exits — cosmetic, upstream rounding in `funmap`.
+- `randd: Seeding failed` (no entropy source — thread 3 above).
+- `ohcid: alive, N report(s)` every 5 s — the liveness heartbeat.
+- `no driver for interrupt controller "rockchip,gpio-bank"` — expected, no
+  GPIO irqchip driver is needed so far.
+
 ## Ground rules
 
 - **Language:** all repository content (docs, comments, commit messages, workflow names, log messages) is written in **English**.
@@ -67,9 +193,10 @@ fix(ci): prune runner disk before redox build
 - Board config template: `config/aarch64/raspi3bp/minimal.toml` → copy as `config/aarch64/pinebook-pro/minimal.toml`, adjust `include = ["../../minimal.toml"]`, `filesystem_size`, `efi_partition_size`. Desktop: `config/aarch64/pinebook-pro/desktop-minimal.toml` (`include = ["../../desktop-minimal.toml"]` + sizes); `scripts/build-image.sh --config desktop-minimal` / `scripts/flash-sd.sh --config desktop-minimal`, image at `build/redox/build/aarch64/desktop-minimal/harddrive.img`.
 - **Recipe sources drift on every online `repo cook`** (experiment 13): cookbook fetches each recipe's branch head before cooking. Measured 2026-11-21: `kernel e7f1d423→f64a8163`, `relibc b83feabc→74b5e7e3`, `uutils-grep 6f048c6→00e7bec` — an unverified newer kernel ships silently, and new crates.io deps break the offline cook (`uutils-grep@00e7bec` needs `uucore ^0.13.0`). Verified baseline: kernel `e7f1d423`, relibc `b83feabc`, uutils-grep `6f048c6`, base `8f576d27` (local clone, does not move); uutils `0.11.0` and uutils-procps `ee98c0a` are pinned checkouts. Build with `COOKBOOK_OFFLINE=true CARGO_NET_OFFLINE=true`; after an accidental online cook reset the moved sources (`git -C <src> reset --hard <baseline>`) and re-run `scripts/apply-patches.sh` (idempotent).
 - Cookbook pitfalls: `repo cook` with `--filesystem` runs a TUI that needs a pty ≥ 40x120 (`script -qec "stty rows 40 cols 120; …"`); a failure opens a `[Skip][Inspect][Exit][Retry]` dialog and waits forever, and parallel cooks lock each other — always one cook at a time, `pkill -f "repo cook"` first. Single `repo cook <recipe>` (like `make r.<recipe>`) is plain output. `make image` still cooks any recipe whose source ident changed, so it fails on a drifted source even though it only assembles.
-- GitLab vs GitHub: recipe sources clone from GitHub mirrors where they exist; `base.git` and `redox-log.git` have no mirror and are served from the local clone via `~/.gitconfig` `url … insteadOf` (git CLI only — cargo git deps ignore `insteadOf`, rely on `CARGO_NET_OFFLINE=true` + the cached `~/.cargo/git/checkouts`). crates.io works online; the gitlab SSL timeouts otherwise stall cooks.
+- GitLab vs GitHub: recipe sources clone from GitHub mirrors where they exist; `base.git` and `redox-log.git` have no mirror and are served from the local clone via `~/.gitconfig` `url … insteadOf` (git CLI only — cargo git deps ignore `insteadOf`, rely on `CARGO_NET_OFFLINE=true` + the cached `~/.cargo/git/checkouts`). crates.io works online; the gitlab SSL timeouts otherwise stall cooks. `scripts/github-mirrors.sh` rewrites the build-tree remotes to `github.com/redox-os/*` (same SHAs, idempotent, called by `scripts/bootstrap-redox.sh`) — run it once on a fresh tree before any cook.
+- **GUI stack versions** (read from the build tree, 2026-11-21): `orbital` uses winit `0.31.0-beta.2` from `rust-windowing/winit` @ `f5e20bd`; its Redox backend is the `winit-orbital` crate. Facts that matter for session-lifecycle work: `EventLoop::new()` succeeds **once per process** (static `AtomicBool`, second call → `EventLoopError::RecreationAttempt`); `run_app_on_demand` resets `exit` and **can be re-run** after `event_loop.exit()` (verified from source, not yet on hardware); `softbuffer::Context` is created once and reused across runs. `orblogin` (root) loops: login window → `apply_login_schemes` + `setns` into the user namespace → spawn `launcher` as `user` → `child.wait()` → `setns` back → login window again.
 - QEMU smoke test path: `mk/qemu.mk` aarch64 = `-M virt` + UEFI (AAVMF/edk2) + ramfb; disk default `nvme`.
-- **SMP in the QEMU rig** (experiment 14): `-smp 4` needs a DTB with four CPU nodes — regenerate with `-machine dumpdtb=…` under `-smp 4`, then insert the two `generic-ohci` nodes **at the end of the root node** (dtc rejects subnodes before properties; `build/qemu-virt-smp4.dts`). Expect `CPU activation complete: 4 CPUs online` and `BSP: 4 CPUs`.
+- **SMP in the QEMU rig** (experiment 14): `-smp 4` needs a DTB with four CPU nodes — the known-good source is `scripts/qemu-rig-virt-smp4.dts` (QEMU `dumpdtb` under `-smp 4` with two `generic-ohci` nodes appended **at the end of the root node**; dtc rejects subnodes before properties). Compile with `dtc -I dts -O dtb -o build/qemu-virt-smp4.dtb scripts/qemu-rig-virt-smp4.dts`. Expect `CPU activation complete: 4 CPUs online` and `BSP: 4 CPUs`.
 - Build profiles: every recipe builds with `--release`; the base recipe sets `CARGO_PROFILE_RELEASE_OPT_LEVEL=s` (size) for the initfs drivers, userspace crates keep the default release `-O3`.
 - **CPU frequency (measured 2026-11-21, experiment 14):** U-Boot leaves APLL at 600 MHz and **divides the little cluster by 2 → 300 MHz** (`CLKSEL_CON1 = 0x501`, divider field `[4:0] = 1`); the big cluster is undivided (`CLKSEL_CON0 = 0x100`, BPLL 800 MHz). Redox has no cpufreq driver, so nothing ramps. `ohcid` now logs the CRU PLL/CLKSEL registers and raises the little divider to /1 (600 MHz) with a hiword-masked write — no PLL relock, no voltage change. Anything above that (816 MHz–1.2 GHz) needs APLL/BPLL retuning **and** the RK808 core voltage over I2C.
 - Podman build is the "always works" mode; native build requires the Ubuntu package list from `native_bootstrap.sh`.
@@ -200,7 +327,8 @@ LICENSE
 experiments/         # chronological hardware experiment logs (append-only)
 .github/workflows/   # build.yml (Phase 1+)
 scripts/             # local loop: bootstrap-redox.sh, build-image.sh, flash-sd.sh, serial-log.sh,
-                     # qemu-smoke.sh, apply-patches.sh; later: repack-pbp.sh
+                     # qemu-smoke.sh, apply-patches.sh, github-mirrors.sh; later: repack-pbp.sh
+                     # qemu-rig-virt-smp4.dts: known-good QEMU driver/SMP rig DTB source
 config/              # filesystem config overlay for the redox build (Phase 2+)
 patches/             # upstream additions/fixes, upstream tree preserved:
                      #   <repo>/<upstream path>       new file, copied verbatim

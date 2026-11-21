@@ -28,7 +28,7 @@ separate file named `<number>-<slug>.md`, numbered in execution order.
 | Kernel version (`uname -r`)                                   | `5.13.4-1-MANJARO-ARM`                                    |
 | microSD card model / capacity                                 | `SU32G`, 29.7 GiB (SDHC)                                  |
 | USB-UART adapter model (chip: CH340 / CP2102 / FT232 / other) | `FILL IN`                                                 |
-| Host OS used for the serial console (macOS / Linux)           | `FILL IN`                                                 |
+| Host OS used for the serial console (macOS / Linux)           | Linux (Ubuntu; `picocom`, see `scripts/serial-log.sh`)    |
 
 ## Index
 

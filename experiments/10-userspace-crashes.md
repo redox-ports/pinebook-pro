@@ -178,8 +178,10 @@ and the aarch64 syscall epilogue calls it immediately after
   `ELR_EL1` that used to point into `relibc_start_v1` no longer appears. All
   applets then panic at exit with `panicked at src/cxa.rs:93:11: RefCell
 already borrowed`, which is what step 2 above addresses.
-- **Hardware result of step 2: `FILL IN`** — log in and run `ls`, `pwd`,
-  `rm -rf /tmp`, `mkdir -m a=rwxt /tmp`, then `ls /usr/bin | head`.
+- **Hardware result of step 2 (experiment 12):** verified — root login works,
+  `ls /bin` and `ls /usr/bin | head` print complete listings (uutils applets
+  run and exit cleanly), and the `brk #1` / `RefCell already borrowed` panics
+  are gone from the log.
 - QEMU cannot exercise the fix end to end: it has no root filesystem (no
   virtio-mmio block driver), and the initfs contains only static binaries, so
   no dynamic `libc.so` startup happens there.

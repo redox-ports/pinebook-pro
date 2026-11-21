@@ -479,14 +479,16 @@ PASTE HERE OR WRITE "not needed"
 | Framebuffer / display working?                                                | **Yes** — `vesad: 1920x1080 stride 1920 at 0xF7800000`, `fbbootlogd: mapped display`                                     |
 | Serial login prompt reached?                                                  | No — root RedoxFS mount fails (no microSD storage driver), then `switchroot` fails                                       |
 | Where did the chain stop (last visible line before silence)?                  | `init: switchroot to /usr /etc`; the capture then repeats the kernel startup (reboot loop or manual reboot — to confirm) |
-| Log file path                                                                 | `FILL IN`                                                                                                                |
+| Log file path                                                                 | `logs/serial-20261120-00*.log` (first boot night; `logs/` is local-only and gitignored)                                  |
 
 ### Verdict
 
-`FILL IN` — but the hardware bring-up has moved well past the original goal: the
-kernel, initfs userspace, UART and the 1920x1080 display all work. The remaining
-blockers for a usable system are storage (root RedoxFS mount) and x86-centric
-userspace bits (`pcid`).
+**Goal achieved — and long since surpassed.** The kernel, initfs userspace,
+UART and the 1920×1080 display worked from this first boot; the remaining
+blockers named here (storage, x86-centric userspace) were closed by
+experiments 6 (`dwmmcd`, root mount, login) and 10/12 (userspace crashes), and
+the port has since reached the orbital desktop (experiment 13), 6-CPU SMP
+(experiment 14) and the session-lifecycle fix (experiment 15).
 
 ### Follow-up (next milestone): storage and console
 
