@@ -752,3 +752,31 @@ devices behind a hub are skipped, reviving them needs a hub-port reset
 instead). If the keyboard comes back after `revive`, the wedge is soft and
 the system self-heals; if not, the MCU is hard-hung and needs a power
 cycle.
+
+## Iteration 14 — revive works; idle-vs-dead discrimination by control probe
+
+(2026-11-21)
+
+The self-healing image (sha256 `109a2ce5…`, log `logs/serial-20261121-150708.log`)
+**revives the keyboard on hardware**: after the touch-induced death the
+driver resets the root port and re-enumerates — `revive port reset` (11 ms)
+→ full control dance → `revived keyboard addr 1` — and the keyboard delivers
+input again (6/10/2 reports per window after the first revive, then dies on
+the next touch and revives again, ~30 s cycle). The MCU wedge is soft; a
+port reset recovers it in under 50 ms total.
+
+Side effect found in the same log: the trigger "15 s without reports" also
+fires on a healthy keyboard that is simply **idle** — the reset itself is
+harmless (the keyboard survives re-enumeration and keeps typing), but it
+made the driver reset the device on every idle interval forever.
+
+Fix: before resetting, probe the device's control endpoint with
+GET_DESCRIPTOR(device, 8). A live-but-idle device answers immediately (its
+interrupt endpoint NAKs, its control endpoint still works); a wedged one
+times out, and only then the port is reset. Rig-verified: `sendkey user`
+made the emulated keyboard deliver reports, then 25 s of plain idle produced
+**no revive lines** — the probe keeps the device marked alive.
+
+The touchpad itself stays dead after the first touch (behind the hub, no
+revive path yet, and it never delivered a report even while being stroked);
+the keyboard recovery is the working input path for now.

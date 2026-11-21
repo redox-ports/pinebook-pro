@@ -343,8 +343,32 @@ impl Driver {
                 {
                     continue;
                 }
+                // Before resetting: an idle (but healthy) device also has
+                // no reports — its interrupt endpoint just NAKs until a key
+                // is pressed. Probe the control endpoint instead: a live
+                // device answers GET_DESCRIPTOR immediately, a wedged one
+                // times out. Without this the driver would reset the
+                // keyboard on every 15 s of plain idle (measured, iteration
+                // 14).
+                let probe = build_setup(0x80, 0x06, 0x0100, 0x0000, 8);
+                let hc = &mut hcs[hid.hc_index];
+                let alive = hc
+                    .control_transfer(
+                        hid.addr,
+                        hid.low_speed,
+                        u16::from(hid.mps),
+                        probe,
+                        None,
+                        false,
+                    )
+                    .is_ok();
+                if alive {
+                    // Healthy idle: forget the stall, do not touch the port.
+                    hid.last_report_ms = now2;
+                    continue;
+                }
                 log.log(format_args!(
-                    "ohcid: input addr {} silent for 15 s, resetting its port",
+                    "ohcid: input addr {} silent and unresponsive, resetting its port",
                     hid.addr
                 ));
                 let hc = &mut hcs[hid.hc_index];
