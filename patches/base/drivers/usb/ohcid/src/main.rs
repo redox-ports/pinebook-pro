@@ -158,6 +158,9 @@ impl Driver {
                 // One-shot CPU clock dump: the desktop speed depends on the
                 // rate U-Boot left the clusters at (experiment 14).
                 cru::log_cpu_clocks(&self.log);
+                // U-Boot leaves the little cluster divided down (measured
+                // 300 MHz); raise it to the PLL rate (600 MHz).
+                cru::raise_cpu_clocks(&self.log);
                 if !cru::enable_usb_host_clocks(&self.log) {
                     return;
                 }

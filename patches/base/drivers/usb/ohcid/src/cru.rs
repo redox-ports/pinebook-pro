@@ -82,6 +82,55 @@ pub fn log_cpu_clocks(log: &Logger) {
 /// precondition for touching an OHCI register window. A `false` return means
 /// the caller must not probe the controllers (the machine would stall on the
 /// first access to an unclocked peripheral).
+/// Raise the little cluster from the divided-down rate U-Boot left it at.
+///
+/// Measured on the Pinebook Pro (experiment 14): `CLKSEL_CON1 = 0x501`, i.e.
+/// the armclk divider field `[4:0] = 1` — the little cluster runs at half its
+/// PLL rate (600 MHz / 2 = **300 MHz**), while the big cluster is undivided
+/// (`CLKSEL_CON0 = 0x100`). Redox has no cpufreq driver, so the rate never
+/// ramps; the single-threaded desktop (orbital, vesad) ends up on a 300 MHz
+/// core and feels slow.
+///
+/// The divider is glitch-free hardware (it is the runtime-DVFS divider), so
+/// writing /1 needs no PLL relock and no voltage change: the same PLLs already
+/// run the big cluster at their full rate, which puts the CPU rails at or
+/// above what 600 MHz A53 needs. The write is hiword-masked, like every other
+/// CRU field on this SoC.
+pub fn raise_cpu_clocks(log: &Logger) {
+    const CLKSEL_CON1: usize = 0x104;
+    let base = match unsafe {
+        common::physmap(
+            CRU_BASE,
+            CRU_LEN,
+            common::Prot::RW,
+            common::MemoryType::DeviceMemory,
+        )
+    } {
+        Ok(ptr) => ptr as usize,
+        Err(_) => return,
+    };
+    let con1 = unsafe { read32(base, CLKSEL_CON1) };
+    let divider = con1 & 0x1f;
+    if divider == 0 {
+        log.log(format_args!(
+            "ohcid: cru armclk little already undivided (clksel_con1 {:#010x})",
+            con1
+        ));
+        return;
+    }
+    // Bits [4:0] are the armclk divider (value + 1); the hiword carries the
+    // write mask so the unrelated dividers in the same register survive.
+    unsafe { write32(base, CLKSEL_CON1, 0x1f << 16) };
+    let after = unsafe { read32(base, CLKSEL_CON1) };
+    log.log(format_args!(
+        "ohcid: cru armclk little /{} -> /{} (clksel_con1 {:#010x} -> {:#010x})",
+        divider + 1,
+        (after & 0x1f) + 1,
+        con1,
+        after
+    ));
+}
+
 pub fn enable_usb_host_clocks(log: &Logger) -> bool {
     let base = match unsafe {
         common::physmap(

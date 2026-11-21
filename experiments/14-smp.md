@@ -82,24 +82,70 @@ produces keyboard reports (4 reports for two keys). No panics, no stalls.
 ## Image and hardware run
 
 Image `build/aarch64/desktop-minimal/harddrive.img`,
-sha256 `24b72c200b6989950948b707f7913c38be08eafce42889af7e42e9635e604fc9`
-(local build 2026-11-21 19:52; includes the experiment 13 touchpad layout and
-a one-shot CRU clock dump in `ohcid` — `ohcid: cru pll …` / `cru clksel_con0
-…` — so the serial log answers the frequency question directly).
+sha256 `bc82a60b9f506b581a18304ca6be45b030c85789e3e846a0f20dbfb2a3e88c36`
+(local build 2026-11-21 20:35; includes the experiment 13 touchpad layout, the
+one-shot CRU clock dump in `ohcid` — `ohcid: cru pll …` / `cru clksel_con0 …`
+— and the little-cluster divider fix).
 
-Expected on hardware (`RK3399`, six CPUs: MPIDR 0x0–0x3 little, 0x100/0x101
-big):
+**Hardware result (2026-11-21, `logs/serial-20261121-201622.log`):** all six
+cores come online, including the two A72s (`MPIDR=0x100`, `0x101`):
 
 ```
-CPU logical #1..#5: PSCI CPU_ON MPIDR=0x…
-CPU logical #N: local SGI/timer self-test passed
+CPU logical #1..#5: local SGI/timer self-test passed
+CPU logical #5: online
 CPU activation complete: 6 CPUs online
 BSP: 6 CPUs
 ```
 
-`FILL IN` — hardware result: how many CPUs come online, whether the desktop
-is faster, and whether the touchpad/keyboard still behave (they did on one
-core; SMP changes the IPI and timer paths).
+The touchpad and keyboard keep working (37 reports while moving the finger),
+but the desktop is **not noticeably faster** — see the next section for why.
+
+## Why it is still slow: the little cluster runs at half rate
+
+The first hardware run with six CPUs online was **not** faster. The CRU dump
+`ohcid` prints at boot gives the answer (`CLKSEL_CON0/1` and the PLL blocks):
+
+- `CLKSEL_CON0 = 0x100` — the big cluster is undivided (`[4:0] = 0`);
+- `CLKSEL_CON1 = 0x501` — the little cluster divider is `[4:0] = 1`, i.e.
+  **÷2**, and the PLLs are APLL 600 MHz (`0x32`/`0x1201`: 24 MHz × 50 / 1 / 2)
+  and BPLL 800 MHz (`0x64`/`0x1301`: 24 × 100 / 1 / 3), so the four A53 cores
+  run at **300 MHz** while the two A72s run at 800 MHz.
+
+On a desktop that is single-threaded per process (orbital, vesad, inputd),
+the scheduler lands the work on a 300 MHz core, so six cores buy little.
+
+Redox has no cpufreq driver and never ramps; the fix is a single glitch-free
+divider write: `CLKSEL_CON1[4:0] = 0` → the little cluster runs at its PLL
+rate, 600 MHz. It needs no PLL relock and no voltage change — the same PLLs
+already clock the big cluster at full rate, so the rails are at least what a
+600 MHz A53 needs. The write is hiword-masked (every CRU field on this SoC
+is) and the driver logs before/after:
+
+```
+ohcid: cru armclk little /2 -> /1 (clksel_con0 ...)
+```
+
+What is still missing for "fast": ramping the little cluster above 600 MHz
+(or the big cluster above 800) needs APLL/BPLL retuning **and** the RK808
+core voltage over I2C — a PMIC driver, and a thermal/voltage risk we have not
+taken yet (README §7 risk 17). The APLL is at 600 MHz because U-Boot left it
+there; 816 MHz–1.2 GHz would need the voltage to follow.
+
+Hardware run (2026-11-21 20:52, `logs/serial-20261121-205243.log`): the driver
+logged the write and the register read back as expected, and the boot stayed
+stable through login and the desktop:
+
+```
+[   0.020] ohcid: cru armclk little /2 -> /1 (clksel_con1 0x00000501 -> 0x00000500)
+```
+
+No hang, no panel glitch, no reset — the little rail tolerates 600 MHz.
+**Speed:** the user reports only a marginal, hard-to-notice gain. That is the
+expected order of magnitude: doubling 300 → 600 MHz on the four A53s does not
+touch the big cluster (800 MHz, unchanged) and does not change the real
+bottlenecks — software rendering of 1920×1080 RGB565 through `vesad`, plus a
+scheduler that spreads each single-threaded daemon over whichever core it
+picks. The divider write is kept: it is free and strictly better.
 
 ## What this does _not_ fix
 
