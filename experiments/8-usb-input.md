@@ -679,3 +679,41 @@ frame counter at the spec offset 128 (advancing = the HC keeps arbitrating
 and sending SOFs). QEMU-verified: the frame counter advances at 1 kHz, the
 fields show the idle state as expected (ed head without halt, cc 0xf, port
 0x103).
+
+## Iteration 12 — the keyboard dies from unpolled touchpad reports; drain it
+
+(2026-11-21)
+
+The extended heartbeat (sha256 `af624c60…`, log `logs/serial-20261121-144406.log`)
+pinned the wedge precisely. At the moment the keyboard stops (after ~26 s of
+working input):
+
+```
+kb ed head 0x329a040  <- no halt, no carry; head points at the armed TD
+td cc 0xf             <- never retired again
+port 0x303            <- CCS=1 PES=1 power on: the keyboard is attached
+frame advancing       <- the HC is alive and arbitrating (SOF every 1 ms)
+```
+
+So the bus, the host controller and the port are all healthy — the keyboard
+**device itself** stops producing reports. The owner narrowed the trigger:
+merely **swiping the touchpad** (no clicking) is enough.
+
+The touchpad (`046d:c52f`, boot mouse) is on the other controller, was
+configured by our enumeration and then **never polled** — USB devices cannot
+push, so its reports accumulate in the device. The theory: the touchpad MCU
+chokes on its undelivered FIFO and (the PBP input devices share power/board
+resources) drags the keyboard controller down with it. Manjaro never sees
+this because it actually reads the touchpad.
+
+Fix: treat a boot mouse as a polled device — set boot protocol, SET_IDLE 0,
+arm its interrupt ED and **drain the reports without producing events** (a
+report parser/mouse events are a separate follow-up). The hub-port loop now
+also keeps scanning past mice instead of stopping at the first found device
+("one keyboard is enough" checked the wrong predicate once mice counted).
+
+QEMU rig with an added `usb-mouse`: the mouse arms and polls
+(`polling mouse addr 2 endpoint 1 via periodic slot 1`), no regressions.
+
+Hardware check pending: swipe the touchpad extensively with the keyboard
+working — if the keyboard survives, the drain theory holds.

@@ -567,8 +567,11 @@ impl<'a> Enumeration<'a> {
         ));
         if info.protocol == 2 {
             self.log.log(format_args!(
-                "ohcid:   boot mouse interface, report parser not implemented yet"
+                "ohcid:   boot mouse interface, polling to drain reports"
             ));
+            self.hid_set_protocol(addr, low_speed, mps0, info.interface)?;
+            let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
+            self.start_hid_kind(addr, low_speed, info, HidKind::Mouse)?;
             return Ok(());
         }
         if info.protocol == 1 {
@@ -586,7 +589,7 @@ impl<'a> Enumeration<'a> {
         self.log.log(format_args!("ohcid:   dbg: before set_idle"));
         let _ = self.hid_set_idle(addr, low_speed, mps0, info.interface);
         self.log.log(format_args!("ohcid:   dbg: before start_hid"));
-        self.start_hid(addr, low_speed, info)?;
+        self.start_hid_kind(addr, low_speed, info, HidKind::Keyboard)?;
         self.log.log(format_args!("ohcid:   dbg: start_hid ok"));
         Ok(())
     }
@@ -690,8 +693,9 @@ impl<'a> Enumeration<'a> {
                     port, err
                 ));
             }
-            // One keyboard is enough for the bring-up milestone.
-            if !self.found.is_empty() {
+            // One keyboard is enough for the bring-up milestone, but keep
+            // scanning past mice: the touchpad must be drained (iteration 12).
+            if self.found.iter().any(|d| d.kind == HidKind::Keyboard) {
                 break;
             }
         }
@@ -838,7 +842,13 @@ impl<'a> Enumeration<'a> {
         Ok(())
     }
 
-    fn start_hid(&mut self, addr: u8, low_speed: bool, info: HidInfo) -> Result<(), Error> {
+    fn start_hid_kind(
+        &mut self,
+        addr: u8,
+        low_speed: bool,
+        info: HidInfo,
+        kind: HidKind,
+    ) -> Result<(), Error> {
         let ed = self.next_ed;
         let td = self.next_td;
         let dummy = self.next_td + 1;
@@ -862,8 +872,14 @@ impl<'a> Enumeration<'a> {
         )?;
 
         self.log.log(format_args!(
-            "ohcid:   polling keyboard addr {} endpoint {} via periodic slot {}",
-            addr, info.ep_number, slot
+            "ohcid:   polling {} addr {} endpoint {} via periodic slot {}",
+            match kind {
+                HidKind::Keyboard => "keyboard",
+                HidKind::Mouse => "mouse",
+            },
+            addr,
+            info.ep_number,
+            slot
         ));
 
         self.found.push(HidDevice {
@@ -878,6 +894,7 @@ impl<'a> Enumeration<'a> {
             addr,
             ep: info.ep_number,
             low_speed,
+            kind,
             prev_modifiers: 0,
             prev_keys: [0; 6],
             reports: 0,
@@ -962,6 +979,17 @@ fn find_hid_keyboard(config: &[u8]) -> Option<HidInfo> {
     fallback
 }
 
+/// What kind of boot-protocol device a polled interrupt endpoint belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum HidKind {
+    Keyboard,
+    /// Boot mouse: reports are read and drained so the device never stalls
+    /// on uncollected data (its MCU wedging takes the laptop keyboard down
+    /// with it — measured in experiment 8, iteration 12), but no events are
+    /// produced yet.
+    Mouse,
+}
+
 struct HidDevice {
     hc_index: usize,
     ed: usize,
@@ -974,6 +1002,7 @@ struct HidDevice {
     addr: u8,
     ep: u8,
     low_speed: bool,
+    kind: HidKind,
     prev_modifiers: u8,
     prev_keys: [u8; 6],
     /// Completed interrupt transfers (heartbeat diagnostics).
@@ -992,8 +1021,15 @@ impl HidDevice {
         let report = hc.buf_slice(self.buf_off, len).to_vec();
 
         if cc == ohci::TD_CC_NOERROR || cc == ohci::TD_CC_DATAUNDERRUN {
-            if len >= 8 {
-                self.handle_report(&report, input, log);
+            match self.kind {
+                HidKind::Keyboard if len >= 8 => {
+                    self.handle_report(&report, input, log);
+                }
+                // Draining the touchpad is the point: the reports are read
+                // and dropped so the device never accumulates undelivered
+                // data (see HidKind::Mouse).
+                HidKind::Mouse => {}
+                _ => {}
             }
         } else {
             log.log(format_args!(
