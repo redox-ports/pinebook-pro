@@ -355,9 +355,23 @@ impl Driver {
                 // keyboard on every 15 s of plain idle (measured, iteration
                 // 14).
                 let probe = build_setup(0x80, 0x06, 0x0100, 0x0000, 8);
-                let alive = hcs[hc_index]
-                    .control_transfer(addr, low_speed, u16::from(mps), probe, None, false)
-                    .is_ok();
+                let alive = match hcs[hc_index].control_transfer(
+                    addr,
+                    low_speed,
+                    u16::from(mps),
+                    probe,
+                    None,
+                    false,
+                ) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        log.log(format_args!(
+                            "ohcid: liveness probe of addr {} failed: {:?}",
+                            addr, err
+                        ));
+                        false
+                    }
+                };
                 if alive {
                     // Healthy idle: forget the stall, do not touch the port.
                     for h in hids
@@ -695,18 +709,33 @@ impl<'a> Enumeration<'a> {
             }
             // Every other interrupt endpoint on the device (the touchpad
             // interface of the keyboard chip) must be polled. Prefer the
-            // report descriptor: the chip keeps its own report format
-            // (`[report id, buttons, dx, dy]`) even though it answers
-            // `SET_PROTOCOL(boot)` without a stall, so the boot layout must
-            // not be assumed. Without a usable descriptor fall back to the
-            // boot-protocol probe, and without that keep draining.
-            let layout = self.hid_report_layout(addr, low_speed, mps0, info.interface);
-            if let Some(layout) = layout.filter(ReportLayout::usable) {
+            // report descriptor; the Pinebook Pro chip stalls every request
+            // shape, so for that chip the measured layout is used
+            // (`[report id, buttons, dx, dy]`, experiment 13). Without
+            // either, fall back to the boot-protocol probe, and without
+            // that keep draining.
+            let described = self
+                .hid_report_layout(addr, low_speed, mps0, info.interface)
+                .filter(ReportLayout::usable);
+            let layout = match described {
+                Some(layout) => {
+                    self.log.log(format_args!(
+                        "ohcid:   mouse on endpoint 0x{:02x} of the keyboard device (report descriptor layout)",
+                        info.ep_address
+                    ));
+                    Some(layout)
+                }
+                None if vid == 0x258a && pid == 0x001e => {
+                    self.log.log(format_args!(
+                        "ohcid:   mouse on endpoint 0x{:02x} of the keyboard device (measured Pinebook Pro touchpad layout)",
+                        info.ep_address
+                    ));
+                    Some(ReportLayout::pinebook_touchpad())
+                }
+                None => None,
+            };
+            if let Some(layout) = layout {
                 self.start_hid_kind(addr, low_speed, *info, HidKind::Mouse, layout)?;
-                self.log.log(format_args!(
-                    "ohcid:   mouse on endpoint 0x{:02x} of the keyboard device (report descriptor layout)",
-                    info.ep_address
-                ));
             } else if self
                 .hid_set_boot_protocol(addr, low_speed, mps0, info.interface)
                 .is_ok()
@@ -982,8 +1011,13 @@ impl<'a> Enumeration<'a> {
     }
 
     /// Fetch and log the HID report descriptor of an interface and parse the
-    /// field layout out of it. Returns None when the request fails or the
-    /// descriptor does not describe X/Y/buttons.
+    /// field layout out of it. Returns None when every request variant is
+    /// stalled or the descriptor does not describe X/Y/buttons.
+    ///
+    /// Three request shapes exist in the wild: HID 1.11 7.1.1 says standard
+    /// request, interface recipient (`0x81`); Linux `usb_get_descriptor`
+    /// uses the device recipient (`0x80`); some chips only answer the class
+    /// request (`0xa1`). The Pinebook Pro chip stalls all three.
     fn hid_report_layout(
         &mut self,
         addr: u8,
@@ -992,24 +1026,38 @@ impl<'a> Enumeration<'a> {
         interface: u8,
     ) -> Option<ReportLayout> {
         let mut buf = [0u8; 128];
-        let setup = build_setup(0xa1, 0x06, 0x2200, u32::from(interface), buf.len() as u16);
-        let len = match self.hc.control_transfer(
-            addr,
-            low_speed,
-            u16::from(mps0),
-            setup,
-            Some(&mut buf),
-            true,
-        ) {
-            Ok(n) => n,
-            Err(err) => {
-                self.log.log(format_args!(
-                    "ohcid:   report descriptor of interface {} unavailable: {:?}",
-                    interface, err
-                ));
-                return None;
+        let mut len = 0usize;
+        for (request_type, index, what) in [
+            (0x81u8, u32::from(interface), "standard/interface"),
+            (0x80, 0, "standard/device"),
+            (0xa1, u32::from(interface), "class/interface"),
+        ] {
+            let setup = build_setup(request_type, 0x06, 0x2200, index, buf.len() as u16);
+            match self.hc.control_transfer(
+                addr,
+                low_speed,
+                u16::from(mps0),
+                setup,
+                Some(&mut buf),
+                true,
+            ) {
+                Ok(n) => {
+                    self.log.log(format_args!(
+                        "ohcid:   report descriptor of interface {} via {}: {} bytes",
+                        interface, what, n
+                    ));
+                    len = n;
+                    break;
+                }
+                Err(err) => self.log.log(format_args!(
+                    "ohcid:   report descriptor of interface {} via {}: {:?}",
+                    interface, what, err
+                )),
             }
-        };
+        }
+        if len == 0 {
+            return None;
+        }
         let bytes = &buf[..len.min(buf.len())];
         let mut line = String::new();
         for (n, chunk) in bytes.chunks(16).enumerate() {
@@ -1120,7 +1168,8 @@ impl<'a> Enumeration<'a> {
         self.next_slot += 1;
 
         let mps = info.ep_mps;
-        let (buf_off, buf_phys) = self.hc.alloc_buf(usize::from(mps))?;
+        // Fixed slot per ED (see Ohci::endpoint_buf): survives re-enumeration.
+        let (buf_off, buf_phys) = self.hc.endpoint_buf(ed - 4, usize::from(mps))?;
         self.hc.arm_interrupt(
             ed,
             td,
@@ -1215,6 +1264,25 @@ impl ReportLayout {
             buttons_bits: 3,
             x_byte: Some(1),
             y_byte: Some(2),
+            x_absolute: false,
+            y_absolute: false,
+        }
+    }
+
+    /// The measured layout of the Pinebook Pro touchpad interface
+    /// (`258a:001e` interface 1): `[report id 1, buttons, dx, dy]`, both
+    /// axes signed 8-bit relative deltas. The chip answers the class
+    /// `GET_DESCRIPTOR(0x22)` with a stall, so the layout cannot be read
+    /// from the device; it was reconstructed from 130 raw reports
+    /// (experiment 13): byte 0 constant 1, byte 1 zero until a click,
+    /// bytes 2/3 change with the finger in both directions.
+    fn pinebook_touchpad() -> Self {
+        Self {
+            report_id: Some(1),
+            buttons_byte: Some(1),
+            buttons_bits: 3,
+            x_byte: Some(2),
+            y_byte: Some(3),
             x_absolute: false,
             y_absolute: false,
         }

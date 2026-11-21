@@ -491,14 +491,43 @@ impl Ohci {
     /// from the TD page correctly, but saw stale zeros in the separate
     /// phys_contiguous buffer page; if transfers work from this page, the
     /// separate allocation is the problem.
-    pub fn alloc_buf(&mut self, len: usize) -> Result<(usize, usize)> {
+    /// Buffers for interrupt endpoints: one fixed slot per ED beyond the
+    /// four reserved for the control pipe (stride 32 bytes, 1 KiB total).
+    ///
+    /// Fixed slots matter on two counts (experiment 13): a re-enumeration
+    /// after the 15 s revive restarts the ED indices, so reusing the same
+    /// memory keeps repeated revives from exhausting the page; and control
+    /// transfers must never land in a live interrupt buffer — they used to
+    /// share one bump arena that every control transfer reset to zero, so
+    /// the setup packet could overwrite the buffer of an armed endpoint (and
+    /// the controller could DMA a report over the setup packet), which made
+    /// the liveness probe read a healthy device as "unresponsive" and reset
+    /// its port every ~50 s on hardware.
+    pub fn endpoint_buf(&self, index: usize, len: usize) -> Result<(usize, usize)> {
         const TD_BUF_OFF: usize = 1024; // 64 TDs x 16 bytes
-        let off = self.next_buf;
-        let end = off + len.max(1);
-        if TD_BUF_OFF + end > 4096 {
+        const STRIDE: usize = 32;
+        const END: usize = 1024;
+        let off = index * STRIDE;
+        if off + len.max(1) > END {
             return Err(Error::OutOfMemory);
         }
-        self.next_buf = TD_BUF_OFF + ((end + 15) & !15);
+        Ok((off, self.tds.physical() + TD_BUF_OFF + off))
+    }
+
+    /// Buffers for control transfers: a separate region after the interrupt
+    /// slots, bumped per transfer and reset when the transfer completes
+    /// (single-threaded driver, one control transfer at a time).
+    pub fn alloc_buf(&mut self, len: usize) -> Result<(usize, usize)> {
+        const TD_BUF_OFF: usize = 1024; // 64 TDs x 16 bytes
+        const CONTROL_BASE: usize = 1024;
+        const CONTROL_END: usize = 3072;
+        let off = self.next_buf.max(CONTROL_BASE);
+        let end = off + len.max(1);
+        let aligned = (end + 15) & !15;
+        if aligned > CONTROL_END {
+            return Err(Error::OutOfMemory);
+        }
+        self.next_buf = aligned;
         Ok((off, self.tds.physical() + TD_BUF_OFF + off))
     }
 
@@ -768,11 +797,10 @@ impl Ohci {
         let ed_head = self.ed(ed_index).head;
         self.ed_mut(ed_index).head = ed_head & !0x3;
 
-        // The list is stopped and the transfer is complete: the buffer arena
-        // can be reused from the start (single-threaded driver, one transfer
-        // at a time). Without this the never-reused arena runs out after a
-        // handful of control transfers (OutOfMemory during enumeration).
-        self.next_buf = 0;
+        // The list is stopped and the transfer is complete: the control
+        // buffer region can be reused from its base (interrupt endpoint
+        // buffers live below it and are never touched by control traffic).
+        self.next_buf = 1024;
 
         result?;
 

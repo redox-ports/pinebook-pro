@@ -130,10 +130,14 @@ input only.
   first desktop image (hardware run: desktop and keyboard work, touchpad
   misparsed, freeze);
 - `98918225ccec40f112717e50582270f5ab55ef7512ce46a7d8a954fb69e4f66b` — the
-  same tree with the report-descriptor layout parser and the revive fix
-  (2026-11-21 18:55); hardware run pending.
+  same tree with the report-descriptor layout parser and the first revive fix
+  (hardware run: no freeze, Super key works, descriptor stalls so the layout
+  fell back to boot; ~50 s port resets);
+- `d8b403bb7379b185d73229837c2417f7a56c669daa732dfd1d713dab680f5216` — adds
+  the measured Pinebook Pro touchpad layout and the split control/interrupt
+  DMA arenas (2026-11-21 19:10); hardware run pending.
 
-Both are local builds (`build/aarch64/desktop-minimal/harddrive.img`), not
+All are local builds (`build/aarch64/desktop-minimal/harddrive.img`), not
 committed.
 
 ## Actions (hardware)
@@ -164,11 +168,14 @@ through to the desktop on the first try. One defect: the touchpad.
 - pressing the left button moves the cursor slightly **right**;
 - after a few touches/clicks everything froze.
 
-## The touchpad report layout (after the first hardware run, 2026-11-21)
+**Iteration 2 (2026-11-21, image `98918225…`):** no more freeze, the Super key
+reaches the desktop, the cursor still does not follow the finger. The log
+shows why the descriptor-driven fix did not take effect.
 
-The symptoms pin the report layout exactly. Our parser assumed the boot
-layout `[buttons, dx, dy]`, i.e. `dx = byte 1`, `dy = byte 2`. The observed
-behaviour means:
+## The touchpad report layout (2026-11-21)
+
+Our parser assumed the boot layout `[buttons, dx, dy]`, i.e. `dx = byte 1`,
+`dy = byte 2`. The iteration-1 symptoms already pinned the real layout:
 
 - horizontal finger motion changed **byte 2** (our `dy`) → the cursor moved
   vertically;
@@ -179,42 +186,66 @@ behaviour means:
 
 That is the layout `[report id, buttons, dx, dy]`: the chip **acknowledges
 `SET_PROTOCOL(boot)` but keeps its own report protocol**, which is legal
-(read-only HID devices may ignore protocol changes they do not implement).
+(a device may accept the request and only apply it if it implements boot
+reports).
 
-The fix no longer guesses. `ohcid` fetches the interface's **HID report
-descriptor** (`GET_DESCRIPTOR(0x22)`, class request to the interface) and
-parses it (`parse_report_descriptor`): report ID, button byte and bit count,
-X/Y byte offsets, and whether the axes are relative or absolute (a digitizer
-would be absolute — consecutive positions are then diffed into relative
-motion). Reports whose ID does not match are ignored. Without a usable
-descriptor the driver falls back to the `SET_PROTOCOL(boot)` probe and the
-boot layout; without that it keeps draining.
+The iteration-2 log confirmed it byte for byte: **130 raw reports, all
+`01 00 XX YY`** — byte 0 constant `01` (report id), byte 1 zero (buttons;
+no click in that capture), bytes 2/3 change with the finger **in both
+directions** (29 and 64 values ≥ 0x80, i.e. negative as `i8`): signed 8-bit
+relative deltas.
 
-Also fixed in the same change: the 15 s self-healing path replaced only the
+The descriptor could not settle the question: the chip **stalls every
+request shape** — `0x81` (HID 1.11 7.1.1, standard/interface), `0x80` (Linux
+`usb_get_descriptor`, standard/device) and `0xa1` (class/interface, the
+previous attempt) all logged `report descriptor of interface 1 via …: Halted`.
+So the driver uses the **measured layout for this chip** (`258a:001e`, vendor
+and product read from the device descriptor during enumeration) as the second
+fallback: `ReportLayout::pinebook_touchpad()` — report id 1, buttons in byte
+1 (3 bits), X in byte 2, Y in byte 3, both relative. The descriptor path stays
+first for devices that do serve it, and the boot-protocol probe with the
+3-byte boot layout stays as the last resort before draining.
+
+### A second bug the log exposed: control and interrupt buffers shared an arena
+
+The 15 s liveness probe (experiment 8, iteration 14) started failing on a
+**live** device: `input addr 1 silent and unresponsive, resetting its port`
+at 35.7 s, 92.9 s, 126.4 s — a disruptive port reset about once a minute
+(the keyboard chip is re-enumerated each time). Root cause: `control_transfer`
+and the interrupt endpoints allocated from **one bump arena** that every
+control transfer reset to offset 0. The setup packet of a control transfer
+could therefore overwrite the buffer of an already-armed interrupt endpoint,
+and the controller could DMA a report over the setup packet — a corrupt
+SETUP makes the device stall, which the probe reads as "device dead".
+
+Fix in `ohci.rs`: interrupt endpoints get **fixed slots** (`endpoint_buf`,
+indexed by ED, stride 32 bytes, 1 KiB) that re-enumeration reuses, and control
+transfers use their own region above them (`alloc_buf`, 1 KiB, reset per
+transfer). The probe failure now logs its error (`liveness probe of addr N
+failed: …`) so a future repeat is attributable.
+
+Also fixed earlier in the same iteration: the revive path replaced only the
 keyboard `HidDevice` after a port reset, leaving the touchpad entry pointing
 at an ED that the new enumeration had rewritten (two entries polling one ED
-is a wedge candidate — likely the freeze). A revive now replaces **every**
-root-port endpoint of that controller with the fresh enumeration results.
+is a wedge candidate — likely the iteration-1 freeze). A revive now replaces
+**every** root-port endpoint of that controller.
 
-Diagnostics kept in the image (cheap, bounded): the report descriptor is
-hex-dumped when fetched, and the first 40 reports of non-keyboard endpoints
-are logged as `ohcid: raw ep 0x82 len N: …` — enough to verify or correct the
-parsed layout from the serial log alone.
+Diagnostics kept in the image (cheap, bounded): the descriptor request result
+is logged per request shape, and the first 40 reports of non-keyboard
+endpoints are logged as `ohcid: raw ep 0x82 len N: …` — enough to verify or
+correct the layout from the serial log alone.
 
-Image: sha256 `98918225ccec40f112717e50582270f5ab55ef7512ce46a7d8a954fb69e4f66b`
-(local build 2026-11-21 18:55). Rig smoke: boot + keyboard reports unchanged;
-the two-interface touchpad path is not reproducible in QEMU.
+Rig smoke (both images): boot + keyboard reports unchanged; the
+two-interface touchpad path is not reproducible in QEMU.
 
-`FILL IN` — hardware run of the iteration-2 image: the parsed layout line,
-the raw report bytes, cursor behaviour, and whether the freeze is gone.
+`FILL IN` — hardware run of the third image: the `measured Pinebook Pro
+touchpad layout` line, cursor behaviour, and whether the ~50 s port resets
+are gone.
 
 ## Open questions
 
-- Does the keyboard chip accept `SET_PROTOCOL(boot)` on interface 1? Its
-  interface descriptor says protocol 0 (no boot protocol), but many HID
-  devices still honour the request. If it stalls, the touchpad stays a drain
-  target and the cursor needs a different path (raw report parser for the
-  generic HID interface).
+- The chip stalls the report descriptor on all three request shapes. If a
+  future firmware honours one, the descriptor path takes over automatically.
 - `orbital` on RGB565: `vesad` exports the framebuffer format from
-  `FRAMEBUFFER_BPP`; the desktop has never run on this board yet, so colour
-  mapping is unverified.
+  `FRAMEBUFFER_BPP`; colour mapping on the panel matches the VT, but fine
+  gradients in the desktop theme have not been checked.
