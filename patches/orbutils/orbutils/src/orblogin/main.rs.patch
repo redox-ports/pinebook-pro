@@ -1,0 +1,128 @@
+diff --git a/orbutils/src/orblogin/main.rs b/orbutils/src/orblogin/main.rs
+index cb64226..ae59203 100644
+--- a/orbutils/src/orblogin/main.rs
++++ b/orbutils/src/orblogin/main.rs
+@@ -1020,6 +1020,36 @@ fn handle_event(
+     ControlFlow::Continue(())
+ }
+ 
++/// Session-lifecycle logging for bring-up.
++///
++/// `init` starts the desktop as `nowait VT=3 orbital …`, so stdout/stderr of
++/// orblogin and orbital go to VT3 and never reach the serial console. The
++/// kernel `debug` scheme writes straight to UART; open it once, before the
++/// first login switches namespaces, so the fd stays valid afterwards.
++static SERIAL_CONSOLE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
++
++fn serial(msg: impl AsRef<str>) {
++    use std::io::Write;
++    if let Ok(mut guard) = SERIAL_CONSOLE.lock() {
++        if let Some(file) = guard.as_mut() {
++            let _ = writeln!(file, "orblogin: {}", msg.as_ref());
++            let _ = file.flush();
++        }
++    }
++}
++
++fn open_serial_console() {
++    use std::os::unix::fs::OpenOptionsExt;
++    let file = std::fs::OpenOptions::new()
++        .write(true)
++        .custom_flags(libredox::flag::O_WRONLY | libredox::flag::O_CLOEXEC)
++        .open("/scheme/debug")
++        .ok();
++    if let Ok(mut guard) = SERIAL_CONSOLE.lock() {
++        *guard = file;
++    }
++}
++
+ fn main() -> io::Result<()> {
+     // Ignore possible errors while enabling logging
+     let _ = RedoxLogger::new()
+@@ -1040,17 +1070,28 @@ fn main() -> io::Result<()> {
+     ))?;
+     let launcher_args: Vec<String> = args.collect();
+ 
++    // Panics normally go to VT3; mirror them to the serial console.
++    open_serial_console();
++    let default_panic_hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        serial(format!("PANIC: {info}"));
++        default_panic_hook(info);
++    }));
++
+     let mut event_loop = EventLoop::new().unwrap();
+     let context = softbuffer::Context::new(event_loop.owned_display_handle()).unwrap();
+ 
+     loop {
++        serial("login window: opening");
+         match login_window(&launcher_cmd, &launcher_args, &mut event_loop, &context) {
+             Ok(Some((mut command, username))) => {
++                serial(format!("login: user '{username}', applying schemes"));
+                 #[cfg(target_os = "redox")]
+                 let before_ns_fd = {
+                     let Ok(before_ns_fd) =
+                         redox::apply_login_schemes(username, &redox::DEFAULT_SCHEMES)
+                     else {
++                        serial("login: apply_login_schemes failed");
+                         continue;
+                     };
+                     let _ = libredox::call::fcntl(
+@@ -1061,23 +1102,46 @@ fn main() -> io::Result<()> {
+                     before_ns_fd
+                 };
+                 match command.spawn() {
+-                    Ok(mut child) => match child.wait() {
+-                        Ok(_) => (),
+-                        Err(err) => error!("failed to wait for '{}': {}", launcher_cmd, err),
+-                    },
+-                    Err(err) => error!("failed to execute '{}': {}", launcher_cmd, err),
++                    Ok(mut child) => {
++                        let pid = child.id();
++                        serial(format!("session '{launcher_cmd}' started, pid {pid}"));
++                        match child.wait() {
++                            Ok(status) => {
++                                serial(format!("session pid {pid} ended: {status:?}"));
++                            }
++                            Err(err) => {
++                                serial(format!("session pid {pid} wait failed: {err}"));
++                                error!("failed to wait for '{}': {}", launcher_cmd, err);
++                            }
++                        }
++                    }
++                    Err(err) => {
++                        serial(format!("session '{launcher_cmd}' spawn failed: {err}"));
++                        error!("failed to execute '{}': {}", launcher_cmd, err);
++                    }
+                 }
+                 #[cfg(target_os = "redox")]
+                 {
+                     let _ = libredox::call::fcntl(before_ns_fd.raw(), syscall::F_SETFD, 0);
+-                    let _ = libredox::call::close(
+-                        libredox::call::setns(before_ns_fd.into_raw())
+-                            .expect("failed to restore namespace"),
+-                    );
++                    match libredox::call::setns(before_ns_fd.into_raw()) {
++                        Ok(fd) => {
++                            let _ = libredox::call::close(fd);
++                            serial("login: namespace restored");
++                        }
++                        Err(err) => {
++                            serial(format!("login: namespace restore failed: {err}"));
++                        }
++                    }
+                 }
+             }
+-            Ok(None) => info!("login completed without a command"),
+-            Err(e) => error!("{}", e),
++            Ok(None) => {
++                serial("login window: closed without a command");
++                info!("login completed without a command");
++            }
++            Err(e) => {
++                serial(format!("login window: error: {e}"));
++                error!("{}", e);
++            }
+         }
+     }
+ }

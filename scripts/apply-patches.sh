@@ -4,7 +4,7 @@
 # The port does not fork upstream repositories: everything we add or change
 # lives in this repository and is injected into the Redox build tree.
 #
-# Layout of patches/<repo>/ (repo = the recipe name under recipes/core):
+# Layout of patches/<repo>/ (repo = the recipe name under recipes/<category>):
 #   * a path that does NOT end in .patch is a NEW file, copied verbatim with its
 #     directory tree preserved (e.g. a driver that mainline Redox does not have);
 #   * "<path>.patch" is a unified diff against the upstream file "<path>" in the
@@ -70,7 +70,17 @@ hand=()
 
 for repo in "${WANTED[@]}"; do
     pdir="$PATCH_DIR/$repo"
-    src="$REDOX_DIR/recipes/core/$repo/source"
+    # The recipe category is not fixed (core/gui/libs/...), so find the
+    # checkout by recipe name instead of assuming recipes/core.
+    src=""
+    for cand in "$REDOX_DIR"/recipes/*/"$repo"/source; do
+        if [ -d "$cand/.git" ] || [ -f "$cand/.git" ]; then
+            src="$cand"
+            break
+        fi
+    done
+    # Keep a predictable path for the error messages when nothing matched.
+    [ -n "$src" ] || src="$REDOX_DIR/recipes/core/$repo/source"
 
     [ -d "$pdir" ] || die "no such patch set: $pdir"
     if [ ! -d "$src/.git" ] && [ ! -f "$src/.git" ]; then

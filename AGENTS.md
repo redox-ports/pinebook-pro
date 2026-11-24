@@ -32,12 +32,15 @@ experiments; this section is the map.
 
 ### Pending hardware verification
 
-- **Experiment 15 (session exit):** image `c4aaa209…` (sha256
-  `c4aaa2095be7f32b69cca1d1596c1af75be81d55e7df35bbcfb246e70e769de0`,
-  512 MiB) carries the `kernel_generated` SIGCHLD fix. **Test:** log in, press
-  Super-Q on the session window, the login window must come back. If it does
-  not, see the experiment's "Open question" — the next step is a temporary
-  `/scheme/debug` write in `orblogin` (VT3 stdout is invisible on UART).
+- **Experiment 15 (session exit), iteration 2:** image `b555a690…` (sha256
+  `b555a690f74a3428d7dc64811ce67973ed79a529bb45a44de02ad3a6bf7698bb`,
+  512 MiB) carries the `kernel_generated` SIGCHLD fix **plus** temporary
+  session-lifecycle logging in `orblogin`. The EPERM is already gone on
+  hardware (2026-11-24) but the login window still did not return, so the next
+  run pinpoints where the loop stops: log in, press Super-Q, then read the
+  `orblogin:` lines in the serial capture (`login window: opening` / `session
+pid … ended` / `namespace restored` / `PANIC: …`). Remove the orbutils patch
+  once the cause is known.
 
 ### Open threads, in the order they should be picked up
 

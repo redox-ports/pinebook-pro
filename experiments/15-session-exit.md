@@ -27,7 +27,7 @@ follow-up activity at the login layer.
 
 When a process exits, procmgr runs the `AwaitingThreadsTermination` state for
 it (`bootstrap/src/procmgr.rs`). After the last thread is gone it reports the
-exit to the *parent*:
+exit to the _parent_:
 
 ```rust
 if let Some(parent_rc) = self.processes.get(&ppid) {
@@ -113,24 +113,52 @@ again". The EPERM desynchronised that loop from the session lifetime.
   no warnings from the new parameter, image assembled.
 - QEMU smoke (`-M virt,gic-version=3 -smp 4`, U-Boot + `qemu-virt-smp4.dtb`,
   PCI OHCI with `usb-kbd`): boots to initfs, `CPU activation complete: 4 CPUs
-  online`, `BSP: 4 CPUs`, `debugsh` console, `ohcid: alive` — no regression in
+online`, `BSP: 4 CPUs`, `debugsh` console, `ohcid: alive` — no regression in
   the exit path initfs uses heavily (every service exit goes through it).
-- **Hardware run: pending** — log in, press Super-Q on the session window and
-  check that the login window comes back.
+- **Hardware run (2026-11-24): the EPERM is gone, the login window still does
+  not return** (`logs/serial-20261124-231046.log`). No `failed to send
+SIGCHLD` line appears any more, the panel (`launcher`) and the session exit
+  normally (`funmap` warnings at `[65–70]`), `ohcid` keeps ticking — but the
+  desktop stays at the wallpaper. So the credential bug was real and is fixed,
+  yet it was not the (only) reason the login window fails to come back. See
+  "Iteration 2" below.
 
-## Open question
+## Iteration 2 — the login window still does not return
 
-procmgr wakes the parent's blocked `waitpid` through `waitpid_waiting`
-independently of the signal: the exit path inserts the status into the parent's
-`waitpid` map and drains its waiter queue, and `work_on`/`on_waitpid` then
-resolve the blocked request. That means the EPERM alone does not explain a
-`child.wait()` that never returns, and `orblogin` may instead fail *after* the
-wait returns — the namespace restore (`setns(...).expect(...)`) or the winit
-event-loop reuse in `login_window`. Both paths log only to stdout, which
-`init`'s `nowait VT=3 orbital …` sends to VT3, i.e. **not** to the serial
-console, so the log cannot tell us which happened.
+After the credential fix the serial log shows no procmgr error at all, so the
+remaining failure is inside `orblogin` — and `orblogin` cannot tell us: `init`
+starts the desktop with `nowait VT=3 orbital …`, so its stdout and stderr go
+to VT3. A panic, a `login_window` error and a blocked `child.wait()` all look
+the same from UART: silence.
 
-If the login window still does not return with this fix, the next step is a
-temporary `/scheme/debug` write in `orblogin` (the kernel debug scheme *is*
-serial, and `debug` is in `DEFAULT_SCHEMES`) so the next hardware run shows
+Two candidate causes were read out of the sources before instrumenting
+(neither is confirmed):
+
+- the namespace restore (`setns(...).expect("failed to restore namespace")`)
+  panicking, which would kill the login manager; or
+- the second `run_app_on_demand` in `login_window` failing, which the
+  `Err(e) => error!(...)` arm would swallow into an endless retry with no
+  window.
+
+A blocked `child.wait()` is the third possibility. Note that procmgr wakes the
+parent's `waitpid` through `waitpid_waiting` independently of the signal — the
+exit path inserts the status into the parent's `waitpid` map and drains its
+waiter queue, and `work_on`/`on_waitpid` then resolve the blocked request — so
+an EPERM there would not by itself hang the waiter. That is why the credential
+fix alone was unlikely to be the whole story.
+
+`winit-orbital` at least looks re-entrant: `run_app_on_demand` resets `exit`,
+`pump_app_events` re-runs `single_iteration(StartCause::Init)` when
+`loop_running` is false (so `can_create_surfaces` runs again),
+`Window::drop` queues the destroy id and the post-run prune removes the stale
+socket from `self.windows`.
+
+`patches/orbutils/orbutils/src/orblogin/main.rs.patch` therefore adds a
+`/scheme/debug` writer (opened once before the first namespace switch) plus a
+panic hook, and one line per lifecycle step: window opening, user + scheme
+switch, session pid started/ended/wait-failed, namespace restored/failed, and
+the login-window error path. Image `b555a690…` (512 MiB) carries it.
+
+**Test:** log in, press Super-Q on the panel (the `launcher` bar) or on the
+session window, then read the serial log: the `orblogin:` lines say exactly
 where the loop stops.
